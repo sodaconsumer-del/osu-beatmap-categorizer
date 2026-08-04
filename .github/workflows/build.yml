@@ -1,0 +1,90 @@
+name: Build standalone executables
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            build_name: osu-beatmap-categorizer
+            exe_suffix: ".exe"
+            zip_name: osu-beatmap-categorizer-windows.zip
+            dotnet_rid: win-x64
+          - os: macos-latest
+            build_name: osu-beatmap-categorizer
+            exe_suffix: ""
+            zip_name: osu-beatmap-categorizer-macos.zip
+            dotnet_rid: osx-x64
+          - os: ubuntu-latest
+            build_name: osu-beatmap-categorizer
+            exe_suffix: ""
+            zip_name: osu-beatmap-categorizer-linux.zip
+            dotnet_rid: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Install tkinter (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Build main GUI executable
+        run: pyinstaller --onefile --windowed --name ${{ matrix.build_name }} gui.py
+
+      - name: Build realm-reader helper
+        # Not required for the tool to work - if this step fails or is
+        # skipped, classify_maps.py falls back to its filesystem scan.
+        continue-on-error: true
+        run: >
+          dotnet publish realm-reader/RealmReader.csproj -c Release
+          -r ${{ matrix.dotnet_rid }} --self-contained true
+          -p:PublishSingleFile=true -o realm-reader-dist
+
+      - name: Assemble release folder
+        shell: bash
+        run: |
+          mkdir -p release
+          cp dist/${{ matrix.build_name }}${{ matrix.exe_suffix }} release/
+          if [ -f realm-reader-dist/realm-reader${{ matrix.exe_suffix }} ]; then
+            cp realm-reader-dist/realm-reader${{ matrix.exe_suffix }} release/
+          fi
+          cp README.md release/ || true
+
+      - name: Zip release folder
+        shell: bash
+        run: |
+          cd release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path * -DestinationPath ../${{ matrix.zip_name }}"
+          else
+            zip -r ../${{ matrix.zip_name }} .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip_name }}
+          path: ${{ matrix.zip_name }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.zip_name }}
