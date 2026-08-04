@@ -33,6 +33,7 @@ class ClassifierGUI(tk.Tk):
         self.msg_queue = queue.Queue()
         self.worker_thread = None
         self.running = False
+        self.cancel_event = None
 
         self._build_widgets()
         self.after(100, self._poll_queue)
@@ -123,6 +124,8 @@ class ClassifierGUI(tk.Tk):
         frame_run.pack(fill="x", **pad)
         self.run_button = ttk.Button(frame_run, text="Run classification", command=self._start_run)
         self.run_button.pack(side="left")
+        self.cancel_button = ttk.Button(frame_run, text="Cancel", command=self._cancel_run, state="disabled")
+        self.cancel_button.pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(frame_run, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=10)
         self.progress_label = ttk.Label(frame_run, text="")
@@ -202,14 +205,22 @@ class ClassifierGUI(tk.Tk):
         self.progress["value"] = 0
         self.progress_label.config(text="Starting...")
         self.run_button.config(state="disabled")
+        self.cancel_button.config(state="normal")
         self.running = True
+        self.cancel_event = threading.Event()
 
         self.worker_thread = threading.Thread(
-            target=self._worker, args=(folder, output, csv_path, params), daemon=True
+            target=self._worker, args=(folder, output, csv_path, params, self.cancel_event), daemon=True
         )
         self.worker_thread.start()
 
-    def _worker(self, folder, output, csv_path, params):
+    def _cancel_run(self):
+        if self.running and self.cancel_event is not None:
+            self.cancel_event.set()
+            self.cancel_button.config(state="disabled")
+            self.progress_label.config(text="Cancelling...")
+
+    def _worker(self, folder, output, csv_path, params, cancel_event):
         def progress_cb(done, total):
             self.msg_queue.put(("progress", done, total))
 
@@ -219,9 +230,11 @@ class ClassifierGUI(tk.Tk):
         try:
             result = cm.run_pipeline(
                 folder, output=output, csv_path=csv_path, write_db=output is not None,
-                params=params, progress_cb=progress_cb, log_cb=log_cb,
+                params=params, progress_cb=progress_cb, log_cb=log_cb, cancel_event=cancel_event,
             )
             self.msg_queue.put(("done", result))
+        except cm.ScanCancelled:
+            self.msg_queue.put(("cancelled", None))
         except Exception:
             self.msg_queue.put(("error", traceback.format_exc()))
 
@@ -244,11 +257,20 @@ class ClassifierGUI(tk.Tk):
                         self._log("Note: each diff lands in exactly one collection, named for its exact tag combination (e.g. 'Streams, Bursts, Jumps') - no duplicates across collections.")
                         self._log("Back up your existing collection.db before replacing it, or merge with a tool like Piotrekol's CollectionManager.")
                     self.run_button.config(state="normal")
+                    self.cancel_button.config(state="disabled")
+                    self.progress_label.config(text="")
+                    self.running = False
+                elif kind == "cancelled":
+                    self._log("\nCancelled - no CSV or collection.db was written for this run.")
+                    self.run_button.config(state="normal")
+                    self.cancel_button.config(state="disabled")
+                    self.progress_label.config(text="Cancelled")
                     self.running = False
                 elif kind == "error":
                     self._log("\nERROR:\n" + item[1])
                     messagebox.showerror("Error", "Something went wrong - see the log for details.")
                     self.run_button.config(state="normal")
+                    self.cancel_button.config(state="disabled")
                     self.running = False
         except queue.Empty:
             pass

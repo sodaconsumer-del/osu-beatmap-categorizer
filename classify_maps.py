@@ -271,10 +271,15 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.30,
 # Scanning
 # --------------------------------------------------------------------------
 
+class ScanCancelled(Exception):
+    """Raised to unwind out of a scan/classify run when the user cancels it."""
+    pass
+
+
 _OSU_MAGIC = b"osu file format"
 
 
-def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None):
+def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_event=None):
     """
     Recursively scans `root` for beatmap data. Handles three source types
     in a single pass, auto-detected per file:
@@ -306,6 +311,8 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None):
     in memory at once until a separate classification pass runs later -
     that held-everything-in-memory pattern is what causes out-of-memory
     crashes on very large (100k+ diff) libraries.
+    cancel_event, if given, is checked periodically (a threading.Event) -
+    if set, raises ScanCancelled to unwind out of the scan promptly.
     """
     import zipfile
     import time
@@ -319,12 +326,17 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None):
             on_parsed(diff)
         return diff
 
+    def check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
+
     t_start = time.time()
     log(f"Walking directory tree under {root} ...")
     osu_paths = []
     osz_paths = []
     peek_candidates = []
     for dirpath, _, filenames in os.walk(root):
+        check_cancel()
         for fn in filenames:
             low = fn.lower()
             full = os.path.join(dirpath, fn)
@@ -349,6 +361,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None):
     if osu_paths:
         log(f"Parsing {len(osu_paths)} .osu files...")
     for full in osu_paths:
+        check_cancel()
         try:
             diff = parse_osu_file(full)
             if diff is not None and diff.objs:
@@ -364,6 +377,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None):
     if osz_paths:
         log(f"Reading {len(osz_paths)} .osz archives...")
     for full in osz_paths:
+        check_cancel()
         try:
             with zipfile.ZipFile(full, "r") as z:
                 for name in z.namelist():
@@ -391,6 +405,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None):
     t_peek_start = time.time()
     matched = 0
     for full in peek_candidates:
+        check_cancel()
         try:
             with open(full, "rb") as f:
                 head = f.read(24)
@@ -454,7 +469,7 @@ def default_realm_reader_path():
     return None
 
 
-def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, helper_path=None):
+def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, helper_path=None, cancel_event=None):
     """
     Fast path for osu!lazer libraries: uses the realm-reader helper (if
     available) to resolve every .osu file's on-disk path directly from
@@ -526,6 +541,8 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
     results = []
     errors = []
     for i, full in enumerate(paths):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
         try:
             diff = parse_osu_file(full)
             if diff is not None and diff.objs:
@@ -654,7 +671,7 @@ DEFAULT_PARAMS = dict(
 
 
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
-                  params=None, progress_cb=None, log_cb=None):
+                  params=None, progress_cb=None, log_cb=None, cancel_event=None):
     """
     Core pipeline used by both the CLI and the GUI:
       1. scan_folder() over .osu/.osz files
@@ -664,6 +681,10 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
     progress_cb(done, total) is forwarded from scan_folder for a live progress bar.
     log_cb(str) receives human-readable status lines (what main() would otherwise print).
+    cancel_event, if given, is checked periodically during the scan/classify
+    phase - if set, raises ScanCancelled to stop promptly without writing
+    a CSV or collection.db (a partial/interrupted run isn't something you'd
+    want to trust as the actual output).
     Returns a dict: {diffs, errors, groups, counts}
     """
     p = dict(DEFAULT_PARAMS)
@@ -681,6 +702,8 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     classify_count = [0]
 
     def classify_and_free(d):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
         classify_diff(
             d,
             snap_ratio=p["snap_ratio"],
@@ -708,10 +731,29 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
             log(f"  ... {classify_count[0]} classified so far")
 
     diffs = errors = None
+
+    # Figure out where client.realm actually is: either the given folder
+    # directly, or one level up if the given folder is itself a files/
+    # subfolder (a very natural thing to point at, so worth handling rather
+    # than silently skipping the fast path with no explanation).
+    realm_data_dir = None
     if os.path.isfile(os.path.join(songs_folder, "client.realm")):
-        fast_result = scan_lazer_realm(songs_folder, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free)
+        realm_data_dir = songs_folder
+    else:
+        parent = os.path.dirname(os.path.normpath(songs_folder))
+        if os.path.basename(os.path.normpath(songs_folder)).lower() == "files" and \
+                os.path.isfile(os.path.join(parent, "client.realm")):
+            realm_data_dir = parent
+            log(f"Detected you're pointed at a files/ subfolder - found client.realm in the parent folder "
+                f"({parent}), trying the fast path from there.")
+
+    if realm_data_dir:
+        fast_result = scan_lazer_realm(realm_data_dir, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event)
         if fast_result is not None:
             diffs, errors = fast_result
+    else:
+        log("No client.realm found (not pointed at a lazer data folder or files/ subfolder) - "
+            "skipping the realm fast path.")
 
     if diffs is None:
         scan_root = songs_folder
@@ -720,9 +762,9 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         # subfolder rather than the whole data dir (which also has scores,
         # skins, etc. we don't need to touch).
         files_subdir = os.path.join(songs_folder, "files")
-        if os.path.isfile(os.path.join(songs_folder, "client.realm")) and os.path.isdir(files_subdir):
+        if realm_data_dir == songs_folder and os.path.isdir(files_subdir):
             scan_root = files_subdir
-        diffs, errors = scan_folder(scan_root, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free)
+        diffs, errors = scan_folder(scan_root, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event)
     log(f"Classified {len(diffs)} difficulties.")
 
     groups = derive_collections(diffs)

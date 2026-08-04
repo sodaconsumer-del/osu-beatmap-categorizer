@@ -9,6 +9,13 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
+    <!-- Realm ships a native (non-.NET) library alongside its managed DLL.
+         Without this, single-file publish leaves the native library behind,
+         and the first call into Realm throws a TypeInitializationException
+         on SharedRealmHandle (the managed wrapper can't find its native
+         counterpart). This flag makes the single-file bundle include native
+         libraries too, so they get extracted alongside the exe at runtime. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>

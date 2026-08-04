@@ -63,7 +63,7 @@ jobs:
           mkdir -p release
           cp dist/${{ matrix.build_name }}${{ matrix.exe_suffix }} release/
           if [ -f realm-reader-dist/realm-reader${{ matrix.exe_suffix }} ]; then
-            cp realm-reader-dist/realm-reader${{ matrix.exe_suffix }} release/
+            cp -r realm-reader-dist/. release/
           fi
           cp README.md release/ || true
 
