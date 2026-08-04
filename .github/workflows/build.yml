@@ -55,7 +55,7 @@ jobs:
         run: >
           dotnet publish realm-reader/RealmReader.csproj -c Release
           -r ${{ matrix.dotnet_rid }} --self-contained true
-          -p:PublishSingleFile=true -o realm-reader-dist
+          -o realm-reader-dist
 
       - name: Assemble release folder
         shell: bash
@@ -67,7 +67,18 @@ jobs:
           fi
           cp README.md release/ || true
 
-      - name: Zip release folder
+      - name: Upload artifact
+        # actions/upload-artifact zips whatever path is given when you
+        # download it from the Actions UI - pointing this at the raw
+        # release/ folder (rather than a zip we made ourselves) means you
+        # get a single zip on download, not a zip-inside-a-zip.
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip_name }}
+          path: release/
+
+      - name: Zip release folder for GitHub Release attachment
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           cd release
@@ -76,12 +87,6 @@ jobs:
           else
             zip -r ../${{ matrix.zip_name }} .
           fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.zip_name }}
-          path: ${{ matrix.zip_name }}
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')

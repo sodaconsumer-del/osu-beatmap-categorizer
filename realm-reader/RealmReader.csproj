@@ -7,15 +7,16 @@
     <Nullable>enable</Nullable>
     <AssemblyName>realm-reader</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
-    <!-- Realm ships a native (non-.NET) library alongside its managed DLL.
-         Without this, single-file publish leaves the native library behind,
-         and the first call into Realm throws a TypeInitializationException
-         on SharedRealmHandle (the managed wrapper can't find its native
-         counterpart). This flag makes the single-file bundle include native
-         libraries too, so they get extracted alongside the exe at runtime. -->
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- Deliberately NOT using PublishSingleFile: Realm's native interop
+         library has documented compatibility issues with single-file
+         publishing (the native library either isn't extracted correctly at
+         runtime or fails to load), which is exactly the
+         'TypeInitializationException on SharedRealmHandle' failure this
+         caused in testing. Publishing as a normal folder (exe + its
+         supporting managed/native DLLs sitting together) is the
+         conventional, well-supported way to deploy a .NET app with native
+         dependencies, and avoids that whole class of problem. -->
   </PropertyGroup>
 
   <ItemGroup>
