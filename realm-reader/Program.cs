@@ -79,13 +79,42 @@ class Program
 
         using (realm)
         {
+            // Diagnostic: list every class actually present in the schema
+            // this realm file resolved to. If BeatmapSetInfo isn't in this
+            // list, the fix is to use whatever name IS here instead of
+            // assuming - schema class names can differ across osu! versions.
+            var schemaNames = realm.Schema.Select(s => s.Name).OrderBy(n => n).ToList();
+            Console.Error.WriteLine($"realm-reader: schema contains {schemaNames.Count} classes: {string.Join(", ", schemaNames)}");
+
+            if (!schemaNames.Contains("BeatmapSet"))
+            {
+                Console.Error.WriteLine("ERROR: BeatmapSet not found in this realm's schema (see class list above) - "
+                    + "falling back to filesystem scan.");
+                return 4;
+            }
+
+            // Diagnostic: print the actual property names for the classes
+            // we're about to use, in case those don't match assumptions
+            // either (same issue as the class-name mismatch above).
+            foreach (var className in new[] { "BeatmapSet", "RealmNamedFileUsage", "File" })
+            {
+                var objSchema = realm.Schema.FirstOrDefault(s => s.Name == className);
+                if (objSchema != null)
+                {
+                    var propNames = objSchema.Select(p => p.Name);
+                    Console.Error.WriteLine($"realm-reader: {className} properties: {string.Join(", ", propNames)}");
+                }
+            }
+
             var writer = outputPath != null ? new StreamWriter(outputPath) : Console.Out;
             try
             {
                 int written = 0;
                 int missing = 0;
 
-                dynamic beatmapSets = realm.DynamicApi.All("BeatmapSetInfo");
+                dynamic beatmapSets = realm.DynamicApi.All("BeatmapSet");
+                bool loggedFilesError = false;
+                bool loggedFileInfoError = false;
                 foreach (dynamic set in beatmapSets)
                 {
                     IEnumerable<dynamic> files;
@@ -93,9 +122,14 @@ class Program
                     {
                         files = set.Files;
                     }
-                    catch (Exception)
+                    catch (Exception e)
                     {
-                        continue; // schema surprise on this object - skip it, don't crash the whole run
+                        if (!loggedFilesError)
+                        {
+                            Console.Error.WriteLine($"realm-reader: couldn't read .Files on BeatmapSet ({e.Message}) - skipping affected sets.");
+                            loggedFilesError = true;
+                        }
+                        continue;
                     }
 
                     foreach (dynamic namedFileUsage in files)
@@ -107,8 +141,13 @@ class Program
                             filename = (string)namedFileUsage.Filename;
                             hash = (string)namedFileUsage.File.Hash;
                         }
-                        catch (Exception)
+                        catch (Exception e)
                         {
+                            if (!loggedFileInfoError)
+                            {
+                                Console.Error.WriteLine($"realm-reader: couldn't read Filename/File.Hash on a file entry ({e.Message}) - skipping affected entries.");
+                                loggedFileInfoError = true;
+                            }
                             continue;
                         }
 
