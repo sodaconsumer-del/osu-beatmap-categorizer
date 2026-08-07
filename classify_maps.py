@@ -57,6 +57,14 @@ class DiffInfo:
     max_stream_len: int = 0
     jump_pct: float = 0.0
 
+    # Total notes covered by burst runs (not just run count) and total note
+    # count for the diff - used to compare burst coverage against jump
+    # coverage proportionally, rather than treating "any burst run at all"
+    # as equally significant regardless of how small it is relative to the
+    # rest of the map.
+    burst_note_total: int = 0
+    total_note_count: int = 0
+
     # multi-label - a diff can be any combination of these, not mutually exclusive
     has_bursts: bool = False
     has_streams: bool = False
@@ -68,6 +76,13 @@ class DiffInfo:
     # has no way to know a beatmap's online ranked status, since that's
     # tracked separately by osu! servers, not stored in the .osu file itself)
     ranked_status: object = None
+
+    # Star rating (float), or None if unknown. Same lazer-realm-only
+    # availability caveat as ranked_status - a plain filesystem scan has no
+    # way to compute this (it needs osu!'s full difficulty calculator,
+    # which this tool doesn't reimplement), so it's only populated when the
+    # data came from a cached value already stored in client.realm.
+    star_rating: object = None
 
 
 def parse_osu_file(path):
@@ -297,6 +312,8 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
     diff.max_burst_len = max(bursts, default=0)
     diff.max_stream_len = max(streams, default=0)
     diff.jump_pct = (jump_count / total_gaps * 100) if total_gaps else 0.0
+    diff.burst_note_total = sum(bursts)
+    diff.total_note_count = len(objs)
 
     diff.has_bursts = len(bursts) > 0
     diff.has_streams = len(streams) > 0
@@ -315,10 +332,27 @@ class ScanCancelled(Exception):
     pass
 
 
+def wait_if_paused(pause_event, cancel_event):
+    """
+    Blocks the calling thread while paused, without blocking forever if a
+    cancel comes in during the pause. pause_event uses "set = running,
+    cleared = paused" semantics - the same Event can just be flipped by a
+    Pause/Resume button. Polls rather than doing a plain blocking wait() so
+    a cancel request during a pause is still honored promptly.
+    """
+    if pause_event is None:
+        return
+    import time as _time
+    while not pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
+        _time.sleep(0.1)
+
+
 _OSU_MAGIC = b"osu file format"
 
 
-def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_event=None):
+def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_event=None, pause_event=None):
     """
     Recursively scans `root` for beatmap data. Handles three source types
     in a single pass, auto-detected per file:
@@ -368,6 +402,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
     def check_cancel():
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
+        wait_if_paused(pause_event, cancel_event)
 
     t_start = time.time()
     log(f"Walking directory tree under {root} ...")
@@ -508,7 +543,7 @@ def default_realm_reader_path():
     return None
 
 
-def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, helper_path=None, cancel_event=None):
+def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, helper_path=None, cancel_event=None, pause_event=None):
     """
     Fast path for osu!lazer libraries: uses the realm-reader helper (if
     available) to resolve every .osu file's on-disk path directly from
@@ -580,13 +615,19 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                # New format: "path\tranked_status". Old format (backward
-                # compat with an older compiled helper): just a bare path.
-                if "\t" in line:
-                    path_part, status_part = line.split("\t", 1)
-                    entries.append((path_part, status_part.strip() or None))
-                else:
-                    entries.append((line, None))
+                # Current format: "path\tranked_status\tstar_rating".
+                # Older compiled helpers may only emit "path\tranked_status"
+                # or just a bare path - handled for backward compatibility.
+                parts = line.split("\t")
+                path_part = parts[0]
+                status_part = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+                star_part = None
+                if len(parts) > 2 and parts[2].strip() and parts[2].strip().lower() != "unknown":
+                    try:
+                        star_part = float(parts[2].strip())
+                    except ValueError:
+                        star_part = None
+                entries.append((path_part, status_part, star_part))
     except OSError:
         entries = []
     finally:
@@ -608,13 +649,15 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     results = []
     errors = []
-    for i, (full, ranked_status) in enumerate(entries):
+    for i, (full, ranked_status, star_rating) in enumerate(entries):
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
+        wait_if_paused(pause_event, cancel_event)
         try:
             diff = parse_osu_file(full)
             if diff is not None and diff.objs:
                 diff.ranked_status = ranked_status
+                diff.star_rating = star_rating
                 results.append(emit(diff))
         except Exception as e:
             errors.append((full, str(e)))
@@ -702,40 +745,68 @@ def derive_collections(diffs):
     Groups diffs by DOMINANT pattern, not by presence of every tag. A map
     that's mostly streams with a jump section thrown in is still a stream
     map - a small secondary pattern doesn't change what the map fundamentally
-    is. Priority order: Streams > Bursts > Jumps > Misc.
+    is.
 
-      - Streams : has any genuine stream run (10+ notes, tight/fast).
-                  Cutstreams (a stream with a minority of wider-spaced notes)
-                  count as streams here too, not a separate category - a
-                  cutstream is still a stream.
-      - Bursts  : has burst run(s) but no full streams.
-      - Jumps   : jump-heavy, no bursts or streams at all (a "pure" jump map).
-      - Misc    : none of the above (low-density / normal play).
+      - Streams            : has any genuine stream run (10+ notes, tight/
+                              fast). Cutstreams (a stream with a minority of
+                              wider-spaced notes) count as streams here too,
+                              not a separate category - a cutstream is still
+                              a stream.
+      - Bursts             : has burst run(s), no streams, and burst note
+                              coverage is greater than or equal to jump
+                              coverage of the map.
+      - Jumps with bursts  : has jumps AND bursts, no streams, but JUMP
+                              coverage is greater than burst coverage - the
+                              map is still fundamentally a jump map, bursts
+                              are secondary.
+      - Jumps (no bursts)  : jump-heavy, no bursts or streams at all.
+      - Misc               : none of the above (low-density / normal play).
 
-    This mirrors how the osu! community actually talks about maps - "this
-    is a stream map" even if it has a jump section, "this is a jump map"
-    only when it's not also a burst/stream map.
+    Bursts vs. Jumps is decided by comparing how much of the map each
+    pattern actually covers (burst note count / total notes vs. jump_pct),
+    not just whether a burst run exists at all - a map that's 90% jumps
+    with one small incidental burst thrown in is still fundamentally a jump
+    map, not a burst map. This mirrors how the osu! community actually
+    talks about maps - "this is a stream map" even if it has a jump
+    section, but a map isn't relabeled a "burst map" just because it has
+    one short burst somewhere in an otherwise pure jump map.
     """
-    groups = {"Streams": [], "Bursts": [], "Jumps": [], "Misc": []}
+    groups = {"Streams": [], "Bursts": [], "Jumps with bursts": [], "Jumps (no bursts)": [], "Misc": []}
     for d in diffs:
         if d.has_streams:
             groups["Streams"].append(d)
+            continue
+
+        if d.has_jumps and d.has_bursts:
+            burst_coverage = (d.burst_note_total / d.total_note_count) if d.total_note_count else 0.0
+            jump_coverage = d.jump_pct / 100.0
+            if jump_coverage > burst_coverage:
+                groups["Jumps with bursts"].append(d)
+            else:
+                groups["Bursts"].append(d)
         elif d.has_bursts:
             groups["Bursts"].append(d)
         elif d.has_jumps:
-            groups["Jumps"].append(d)
+            groups["Jumps (no bursts)"].append(d)
         else:
             groups["Misc"].append(d)
     return groups
 
 
-def build_output_collections(groups, include_categories=None, ranked_mode="all_together", log_cb=None):
+def build_output_collections(groups, include_categories=None, ranked_mode="all_together",
+                              min_star=None, max_star=None, log_cb=None):
     """
-    Applies category selection and ranked-status handling on top of the
-    dominant-pattern groups from derive_collections(). This is what actually
-    controls what ends up in the output collection.db - e.g. an aim-only
-    player could pass include_categories=["Jumps"] to get just a Jumps
-    collection and nothing else.
+    Applies category selection, star rating range, and ranked-status
+    handling on top of the dominant-pattern groups from derive_collections().
+    This is what actually controls what ends up in the output collection.db -
+    e.g. an aim-only player could pass include_categories=["Jumps (no bursts)"]
+    to get just that one collection and nothing else.
+
+    min_star / max_star filter by star rating (inclusive), supporting
+    decimals (e.g. max_star=6.5). Only meaningful when star rating is
+    available (currently only the osu!lazer realm fast path provides it) -
+    diffs with unknown star rating are excluded from a star-filtered output
+    rather than guessed at, with a warning logged.
 
     ranked_mode:
       - "all_together" : ignore ranked status entirely (default)
@@ -753,7 +824,32 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
             log_cb(msg)
 
     if include_categories:
+        valid_categories = set(groups.keys())
+        unknown = [c for c in include_categories if c not in valid_categories]
+        if unknown:
+            log(f"WARNING: these requested categories don't match any known category and will be ignored: "
+                f"{', '.join(unknown)}. Valid categories are: {', '.join(sorted(valid_categories))}.")
         groups = {label: members for label, members in groups.items() if label in include_categories}
+        if not any(groups.values()):
+            log("WARNING: after category filtering, nothing matched - collection.db will be empty. "
+                "Check --categories against the valid category names above.")
+
+    if min_star is not None or max_star is not None:
+        any_known = any(d.star_rating is not None for members in groups.values() for d in members)
+        if not any_known:
+            log("Note: star rating isn't available for this scan (only the osu!lazer realm fast path "
+                "provides it) - nothing will match this star rating filter.")
+
+        def in_range(d):
+            if d.star_rating is None:
+                return False
+            if min_star is not None and d.star_rating < min_star:
+                return False
+            if max_star is not None and d.star_rating > max_star:
+                return False
+            return True
+
+        groups = {label: [d for d in members if in_range(d)] for label, members in groups.items()}
 
     if ranked_mode == "all_together":
         return groups
@@ -796,7 +892,8 @@ DEFAULT_PARAMS = dict(
 
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                   params=None, progress_cb=None, log_cb=None, cancel_event=None,
-                  include_categories=None, ranked_mode="all_together"):
+                  include_categories=None, ranked_mode="all_together",
+                  min_star=None, max_star=None, pause_event=None):
     """
     Core pipeline used by both the CLI and the GUI:
       1. scan_folder() over .osu/.osz files
@@ -841,6 +938,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     def classify_and_free(d):
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
+        wait_if_paused(pause_event, cancel_event)
         classify_diff(
             d,
             snap_ratio=p["snap_ratio"],
@@ -886,7 +984,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                 f"({parent}), trying the fast path from there.")
 
     if realm_data_dir:
-        fast_result = scan_lazer_realm(realm_data_dir, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event)
+        fast_result = scan_lazer_realm(realm_data_dir, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event, pause_event=pause_event)
         if fast_result is not None:
             diffs, errors = fast_result
     else:
@@ -902,7 +1000,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         files_subdir = os.path.join(songs_folder, "files")
         if realm_data_dir == songs_folder and os.path.isdir(files_subdir):
             scan_root = files_subdir
-        diffs, errors = scan_folder(scan_root, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event)
+        diffs, errors = scan_folder(scan_root, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event, pause_event=pause_event)
     log(f"Classified {len(diffs)} difficulties.")
 
     groups = derive_collections(diffs)
@@ -919,11 +1017,13 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                 w = csv.writer(f)
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
-                            "max_stream_len", "jump_pct", "ranked_status", "path"])
+                            "max_stream_len", "jump_pct", "burst_note_total", "total_note_count",
+                            "ranked_status", "star_rating", "path"])
                 for d in diffs:
                     w.writerow([d.title, d.diff_name, round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
-                                d.max_stream_len, round(d.jump_pct, 1), d.ranked_status or "unknown", d.path])
+                                d.max_stream_len, round(d.jump_pct, 1), d.burst_note_total, d.total_note_count,
+                                d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown", d.path])
             log(f"Full per-diff results written to {csv_path}")
         except Exception:
             import traceback
@@ -933,8 +1033,12 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     if write_db and output:
         try:
             output_groups = build_output_collections(groups, include_categories=include_categories,
-                                                       ranked_mode=ranked_mode, log_cb=log)
+                                                       ranked_mode=ranked_mode, min_star=min_star,
+                                                       max_star=max_star, log_cb=log)
             collections = {label: [d.version_hash for d in members] for label, members in output_groups.items() if members}
+            if not collections:
+                log("WARNING: no maps matched your combined filters (categories/ranked/star range) - "
+                    "collection.db will be written but empty.")
             write_collection_db(output, collections)
             log(f"collection.db written to {output}")
         except Exception:
@@ -945,7 +1049,8 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     return {"diffs": diffs, "errors": errors, "groups": groups, "counts": counts}
 
 
-def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=None, ranked_mode="all_together"):
+def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=None, ranked_mode="all_together",
+                         min_star=None, max_star=None):
     """
     Rebuilds a collection.db from a previously-generated report.csv, without
     rescanning the library. Useful if a run produced the CSV successfully
@@ -972,7 +1077,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
         if log_cb:
             log_cb(msg)
 
-    groups = {"Streams": [], "Bursts": [], "Jumps": [], "Misc": []}
+    groups = {"Streams": [], "Bursts": [], "Jumps with bursts": [], "Jumps (no bursts)": [], "Misc": []}
     total = 0
     skipped = 0
 
@@ -997,14 +1102,35 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
             ranked_status = row.get("ranked_status")
             if ranked_status in (None, "", "unknown"):
                 ranked_status = None
-            entry = (h, ranked_status)
+            star_rating_str = row.get("star_rating")
+            star_rating = None
+            if star_rating_str and star_rating_str.lower() != "unknown":
+                try:
+                    star_rating = float(star_rating_str)
+                except ValueError:
+                    star_rating = None
+            entry = (h, ranked_status, star_rating)
 
             if s:
                 groups["Streams"].append(entry)
+            elif j and b:
+                try:
+                    burst_note_total = int(row.get("burst_note_total") or 0)
+                    total_note_count = int(row.get("total_note_count") or 0)
+                    jump_pct = float(row.get("jump_pct") or 0)
+                except ValueError:
+                    burst_note_total = total_note_count = 0
+                    jump_pct = 0
+                burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
+                jump_coverage = jump_pct / 100.0
+                if jump_coverage > burst_coverage:
+                    groups["Jumps with bursts"].append(entry)
+                else:
+                    groups["Bursts"].append(entry)
             elif b:
                 groups["Bursts"].append(entry)
             elif j:
-                groups["Jumps"].append(entry)
+                groups["Jumps (no bursts)"].append(entry)
             else:
                 groups["Misc"].append(entry)
 
@@ -1012,23 +1138,49 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                 log(f"  ... {total} rows processed")
 
     if include_categories:
+        valid_categories = set(groups.keys())
+        unknown = [c for c in include_categories if c not in valid_categories]
+        if unknown:
+            log(f"WARNING: these requested categories don't match any known category and will be ignored: "
+                f"{', '.join(unknown)}. Valid categories are: {', '.join(sorted(valid_categories))}.")
         groups = {label: entries for label, entries in groups.items() if label in include_categories}
+        if not any(groups.values()):
+            log("WARNING: after category filtering, nothing matched - collection.db will be empty. "
+                "Check --categories against the valid category names above.")
+
+    if min_star is not None or max_star is not None:
+        any_known = any(sr is not None for entries in groups.values() for _, _, sr in entries)
+        if not any_known:
+            log("Note: star rating isn't available in this CSV (only present when the original scan "
+                "used the osu!lazer realm fast path) - nothing will match this star rating filter.")
+
+        def in_range(entry):
+            _, _, sr = entry
+            if sr is None:
+                return False
+            if min_star is not None and sr < min_star:
+                return False
+            if max_star is not None and sr > max_star:
+                return False
+            return True
+
+        groups = {label: [e for e in entries if in_range(e)] for label, entries in groups.items()}
 
     if ranked_mode != "all_together":
-        any_known = any(status is not None for entries in groups.values() for _, status in entries)
+        any_known = any(status is not None for entries in groups.values() for _, status, _ in entries)
         if not any_known:
             log("Note: ranked status isn't available in this CSV (only present when the original scan "
                 "used the osu!lazer realm fast path) - all diffs are being treated as unranked for this filter/split.")
 
         if ranked_mode == "ranked_only":
-            groups = {label: [(h, s) for h, s in entries if s == "ranked"] for label, entries in groups.items()}
+            groups = {label: [(h, s, sr) for h, s, sr in entries if s == "ranked"] for label, entries in groups.items()}
         elif ranked_mode == "unranked_only":
-            groups = {label: [(h, s) for h, s in entries if s != "ranked"] for label, entries in groups.items()}
+            groups = {label: [(h, s, sr) for h, s, sr in entries if s != "ranked"] for label, entries in groups.items()}
         elif ranked_mode == "split":
             split_groups = {}
             for label, entries in groups.items():
-                ranked = [h for h, s in entries if s == "ranked"]
-                unranked = [h for h, s in entries if s != "ranked"]
+                ranked = [h for h, s, _ in entries if s == "ranked"]
+                unranked = [h for h, s, _ in entries if s != "ranked"]
                 if ranked:
                     split_groups[f"{label} - Ranked"] = ranked
                 if unranked:
@@ -1036,9 +1188,12 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
             groups = split_groups
 
     if ranked_mode != "split":
-        groups = {label: [h for h, _ in entries] for label, entries in groups.items()}
+        groups = {label: [h for h, _, _ in entries] for label, entries in groups.items()}
 
     collections = {label: hashes for label, hashes in groups.items() if hashes}
+    if not collections:
+        log("WARNING: no maps matched your combined filters (categories/ranked/star range) - "
+            "collection.db will be written but empty.")
     write_collection_db(output_db, collections)
     log(f"Processed {total} rows ({skipped} skipped - missing file or inside an unreadable .osz entry).")
     log(f"collection.db written to {output_db}")
@@ -1084,13 +1239,19 @@ def main():
                      help="How ranked status factors into collections - only meaningful when ranked "
                           "status is available (currently only the osu!lazer realm fast path provides it). "
                           "'split' makes separate 'X - Ranked' / 'X - Unranked' collections per category.")
+    ap.add_argument("--min-star", type=float, default=None,
+                     help="Only include diffs with star rating >= this value (decimals OK, e.g. 4.5). "
+                          "Only meaningful when star rating is available (osu!lazer realm fast path only).")
+    ap.add_argument("--max-star", type=float, default=None,
+                     help="Only include diffs with star rating <= this value (decimals OK, e.g. 6.5).")
     args = ap.parse_args()
 
     include_categories = [c.strip() for c in args.categories.split(",")] if args.categories else None
 
     if args.from_csv:
         collection_from_csv(args.from_csv, args.output, log_cb=print,
-                             include_categories=include_categories, ranked_mode=args.ranked_mode)
+                             include_categories=include_categories, ranked_mode=args.ranked_mode,
+                             min_star=args.min_star, max_star=args.max_star)
         return
 
     if not args.songs_folder:
@@ -1127,11 +1288,14 @@ def main():
         log_cb=print,
         include_categories=include_categories,
         ranked_mode=args.ranked_mode,
+        min_star=args.min_star,
+        max_star=args.max_star,
     )
 
     if not args.no_db:
-        print("\nNote: each diff is classified by its DOMINANT pattern (Streams > Bursts > Jumps > Misc) -")
-        print("a stream map with a jump section is still a stream map, not split across collections.")
+        print("\nNote: each diff is classified by its DOMINANT pattern - a stream map with a jump")
+        print("section is still a stream map. Jumps vs. Bursts is decided by which one actually")
+        print("covers more of the map, not just whether a burst run exists at all.")
         print("Back up your existing collection.db before replacing it, or merge with a tool")
         print("like Piotrekol's CollectionManager rather than overwriting directly.")
 

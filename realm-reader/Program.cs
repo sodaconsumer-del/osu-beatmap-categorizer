@@ -24,6 +24,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using Realms;
 
 class Program
@@ -96,7 +97,7 @@ class Program
             // Diagnostic: print the actual property names for the classes
             // we're about to use, in case those don't match assumptions
             // either (same issue as the class-name mismatch above).
-            foreach (var className in new[] { "BeatmapSet", "RealmNamedFileUsage", "File" })
+            foreach (var className in new[] { "BeatmapSet", "RealmNamedFileUsage", "File", "Beatmap" })
             {
                 var objSchema = realm.Schema.FirstOrDefault(s => s.Name == className);
                 if (objSchema != null)
@@ -112,6 +113,46 @@ class Program
             {
                 int written = 0;
                 int missing = 0;
+
+                // Star rating lives on the individual difficulty ("Beatmap")
+                // object, not the file itself, so build a hash -> star
+                // rating lookup first. Beatmap.Hash is assumed to be the
+                // same MD5-of-file-content hash used everywhere else in
+                // osu! (collections, score matching) - we compute each
+                // resolved file's MD5 further down and join against this
+                // table, rather than trying to match filenames, which
+                // would be far more fragile.
+                var starRatingByHash = new Dictionary<string, double>();
+                bool loggedStarRatingError = false;
+                try
+                {
+                    dynamic beatmaps = realm.DynamicApi.All("Beatmap");
+                    foreach (dynamic beatmap in beatmaps)
+                    {
+                        try
+                        {
+                            string bHash = (string)beatmap.Hash;
+                            double sr = (double)beatmap.StarRating;
+                            if (!string.IsNullOrEmpty(bHash))
+                                starRatingByHash[bHash] = sr;
+                        }
+                        catch (Exception e)
+                        {
+                            if (!loggedStarRatingError)
+                            {
+                                Console.Error.WriteLine($"realm-reader: couldn't read Hash/StarRating on a Beatmap ({e.Message}) - star rating won't be available.");
+                                loggedStarRatingError = true;
+                            }
+                        }
+                    }
+                    Console.Error.WriteLine($"realm-reader: loaded star ratings for {starRatingByHash.Count} difficulties.");
+                }
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine($"realm-reader: couldn't read Beatmap class at all ({e.Message}) - star rating won't be available.");
+                }
+
+                using var md5 = MD5.Create();
 
                 dynamic beatmapSets = realm.DynamicApi.All("BeatmapSet");
                 bool loggedFilesError = false;
@@ -183,8 +224,21 @@ class Program
                         string resolved = Path.Combine(filesDir, hash.Substring(0, 1), hash.Substring(0, 2), hash);
                         if (File.Exists(resolved))
                         {
-                            // Tab-separated: path, then ranked status
-                            writer.WriteLine($"{resolved}\t{rankedStatus}");
+                            string starRatingStr = "unknown";
+                            try
+                            {
+                                byte[] fileBytes = File.ReadAllBytes(resolved);
+                                byte[] hashBytes = md5.ComputeHash(fileBytes);
+                                string fileMd5 = Convert.ToHexString(hashBytes).ToLowerInvariant();
+                                if (starRatingByHash.TryGetValue(fileMd5, out double sr))
+                                    starRatingStr = sr.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+                            }
+                            catch (Exception)
+                            {
+                                // leave as "unknown" - not fatal, just means this one file's star rating is unavailable
+                            }
+                            // Tab-separated: path, ranked status, star rating
+                            writer.WriteLine($"{resolved}\t{rankedStatus}\t{starRatingStr}");
                             written++;
                         }
                         else

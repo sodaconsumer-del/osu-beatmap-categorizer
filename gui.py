@@ -34,6 +34,7 @@ class ClassifierGUI(tk.Tk):
         self.worker_thread = None
         self.running = False
         self.cancel_event = None
+        self.pause_event = None
 
         self._build_widgets()
         self.after(100, self._poll_queue)
@@ -96,7 +97,7 @@ class ClassifierGUI(tk.Tk):
         row_cat = ttk.Frame(frame_cat)
         row_cat.pack(fill="x", padx=10, pady=8)
         self.category_vars = {}
-        for cat in ["Streams", "Bursts", "Jumps", "Misc"]:
+        for cat in ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]:
             var = tk.BooleanVar(value=True)
             ttk.Checkbutton(row_cat, text=cat, variable=var).pack(side="left", padx=(0, 16))
             self.category_vars[cat] = var
@@ -124,8 +125,24 @@ class ClassifierGUI(tk.Tk):
                        "Other scan methods (Songs folder, files/ folder, .osz) can't tell ranked from unranked.",
                   foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
+        # --- Star rating filter ---
+        frame_star = ttk.LabelFrame(self, text="5. Star rating filter (osu!lazer fast path only)")
+        frame_star.pack(fill="x", **pad)
+        row_star = ttk.Frame(frame_star)
+        row_star.pack(fill="x", padx=10, pady=8)
+        ttk.Label(row_star, text="Min Star:").pack(side="left")
+        self.min_star_var = tk.StringVar(value="")
+        ttk.Entry(row_star, textvariable=self.min_star_var, width=8).pack(side="left", padx=(4, 20))
+        ttk.Label(row_star, text="Max Star:").pack(side="left")
+        self.max_star_var = tk.StringVar(value="")
+        ttk.Entry(row_star, textvariable=self.max_star_var, width=8).pack(side="left", padx=(4, 4))
+        ttk.Label(frame_star,
+                  text="Leave blank for no limit. Decimals OK (e.g. Max Star: 6.5). Same lazer-only "
+                       "availability as ranked status - a filter here matches nothing on other scan methods.",
+                  foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
         # --- Advanced thresholds (collapsible-ish via a simple frame) ---
-        frame_adv = ttk.LabelFrame(self, text="5. Thresholds (defaults match osu!'s official tag definitions)")
+        frame_adv = ttk.LabelFrame(self, text="6. Thresholds (defaults match osu!'s official tag definitions)")
         frame_adv.pack(fill="x", **pad)
 
         self.param_vars = {}
@@ -138,9 +155,11 @@ class ClassifierGUI(tk.Tk):
             ("stream_min", "Stream min notes", cm.DEFAULT_PARAMS["stream_min"]),
             ("snap_ratio", "Snap speed ratio", cm.DEFAULT_PARAMS["snap_ratio"]),
             ("tight_diam_ratio", "Tight spacing ratio", cm.DEFAULT_PARAMS["tight_diam_ratio"]),
+            ("spaced_diam_ratio", "Spaced stream ratio", cm.DEFAULT_PARAMS["spaced_diam_ratio"]),
             ("jump_velocity_ratio", "Jump velocity ratio", cm.DEFAULT_PARAMS["jump_velocity_ratio"]),
             ("jump_pct_threshold", "Jump %% threshold", cm.DEFAULT_PARAMS["jump_pct_threshold"]),
             ("run_wide_fraction_max", "Max wide fraction in run", cm.DEFAULT_PARAMS["run_wide_fraction_max"]),
+            ("mean_diam_ratio_max", "Max avg spacing ratio", cm.DEFAULT_PARAMS["mean_diam_ratio_max"]),
         ]
         for i, (key, label, default) in enumerate(fields):
             r, c = divmod(i, 2)
@@ -158,6 +177,8 @@ class ClassifierGUI(tk.Tk):
         frame_run.pack(fill="x", **pad)
         self.run_button = ttk.Button(frame_run, text="Run classification", command=self._start_run)
         self.run_button.pack(side="left")
+        self.pause_button = ttk.Button(frame_run, text="Pause", command=self._toggle_pause, state="disabled")
+        self.pause_button.pack(side="left", padx=(6, 0))
         self.cancel_button = ttk.Button(frame_run, text="Cancel", command=self._cancel_run, state="disabled")
         self.cancel_button.pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(frame_run, mode="determinate")
@@ -241,19 +262,35 @@ class ClassifierGUI(tk.Tk):
             return
         ranked_mode = self.ranked_mode_var.get()
 
+        min_star_str = self.min_star_var.get().strip()
+        max_star_str = self.max_star_var.get().strip()
+        try:
+            min_star = float(min_star_str) if min_star_str else None
+            max_star = float(max_star_str) if max_star_str else None
+        except ValueError:
+            messagebox.showerror("Invalid star rating", "Min Star / Max Star must be numbers (decimals OK).")
+            return
+        if min_star is not None and max_star is not None and min_star > max_star:
+            messagebox.showerror("Invalid star rating range", "Min Star can't be greater than Max Star.")
+            return
+
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
         self.progress["value"] = 0
         self.progress_label.config(text="Starting...")
         self.run_button.config(state="disabled")
+        self.pause_button.config(state="normal", text="Pause")
         self.cancel_button.config(state="normal")
         self.running = True
         self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # start unpaused
 
         self.worker_thread = threading.Thread(
             target=self._worker,
-            args=(folder, output, csv_path, params, self.cancel_event, include_categories, ranked_mode),
+            args=(folder, output, csv_path, params, self.cancel_event, self.pause_event,
+                  include_categories, ranked_mode, min_star, max_star),
             daemon=True,
         )
         self.worker_thread.start()
@@ -261,10 +298,25 @@ class ClassifierGUI(tk.Tk):
     def _cancel_run(self):
         if self.running and self.cancel_event is not None:
             self.cancel_event.set()
+            if self.pause_event is not None:
+                self.pause_event.set()  # release a pause so cancel takes effect immediately
             self.cancel_button.config(state="disabled")
+            self.pause_button.config(state="disabled")
             self.progress_label.config(text="Cancelling...")
 
-    def _worker(self, folder, output, csv_path, params, cancel_event, include_categories, ranked_mode):
+    def _toggle_pause(self):
+        if not self.running or self.pause_event is None:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.pause_button.config(text="Resume")
+            self.progress_label.config(text="Paused")
+        else:
+            self.pause_event.set()
+            self.pause_button.config(text="Pause")
+
+    def _worker(self, folder, output, csv_path, params, cancel_event, pause_event,
+                include_categories, ranked_mode, min_star, max_star):
         def progress_cb(done, total):
             self.msg_queue.put(("progress", done, total))
 
@@ -275,7 +327,8 @@ class ClassifierGUI(tk.Tk):
             result = cm.run_pipeline(
                 folder, output=output, csv_path=csv_path, write_db=output is not None,
                 params=params, progress_cb=progress_cb, log_cb=log_cb, cancel_event=cancel_event,
-                include_categories=include_categories, ranked_mode=ranked_mode,
+                pause_event=pause_event, include_categories=include_categories, ranked_mode=ranked_mode,
+                min_star=min_star, max_star=max_star,
             )
             self.msg_queue.put(("done", result))
         except cm.ScanCancelled:
@@ -299,15 +352,17 @@ class ClassifierGUI(tk.Tk):
                 elif kind == "done":
                     self._log("\nDone.")
                     if self.write_db_var.get():
-                        self._log("Note: each diff is classified by its DOMINANT pattern (Streams > Bursts > Jumps > Misc) - a stream map with a jump section is still a stream map, not split across collections.")
+                        self._log("Note: each diff is classified by its DOMINANT pattern - a stream map with a jump section is still a stream map. Jumps vs. Bursts is decided by which one actually covers more of the map, not just whether a burst run exists at all.")
                         self._log("Back up your existing collection.db before replacing it, or merge with a tool like Piotrekol's CollectionManager.")
                     self.run_button.config(state="normal")
+                    self.pause_button.config(state="disabled", text="Pause")
                     self.cancel_button.config(state="disabled")
                     self.progress_label.config(text="")
                     self.running = False
                 elif kind == "cancelled":
                     self._log("\nCancelled - no CSV or collection.db was written for this run.")
                     self.run_button.config(state="normal")
+                    self.pause_button.config(state="disabled", text="Pause")
                     self.cancel_button.config(state="disabled")
                     self.progress_label.config(text="Cancelled")
                     self.running = False
@@ -315,6 +370,7 @@ class ClassifierGUI(tk.Tk):
                     self._log("\nERROR:\n" + item[1])
                     messagebox.showerror("Error", "Something went wrong - see the log for details.")
                     self.run_button.config(state="normal")
+                    self.pause_button.config(state="disabled", text="Pause")
                     self.cancel_button.config(state="disabled")
                     self.running = False
         except queue.Empty:
