@@ -231,6 +231,11 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
         # counts against a run - non-overlapping-but-readable spacing is
         # normal stream/burst/finger-control content, not a jump.
         is_jump_wide = dist > diam * spaced_diam_ratio
+        # Tight = stacked/near-overlapping. Used to detect cutstreams: a
+        # stream where most notes are tight but a minority are noticeably
+        # wider (but still under the jump-wide cutoff) - matching osu!'s own
+        # "cutstreams" tag definition.
+        is_tight = dist <= diam * tight_diam_ratio
 
         norm_dist = dist / diam
         norm_time = max(gap / bl, 0.05)
@@ -242,14 +247,14 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
         if is_jump_wide and (norm_dist / norm_time) > jump_velocity_ratio:
             jump_count += 1
 
-        transitions.append((is_fast, is_jump_wide, norm_dist))
+        transitions.append((is_fast, is_jump_wide, is_tight, norm_dist))
 
     # Group consecutive fast transitions into runs (timing-only)
-    runs = []  # list of list[(is_jump_wide, norm_dist)]
+    runs = []  # list of list[(is_jump_wide, is_tight, norm_dist)]
     cur = []
-    for is_fast, is_jump_wide, norm_dist in transitions:
+    for is_fast, is_jump_wide, is_tight, norm_dist in transitions:
         if is_fast:
-            cur.append((is_jump_wide, norm_dist))
+            cur.append((is_jump_wide, is_tight, norm_dist))
         else:
             if cur:
                 runs.append(cur)
@@ -264,8 +269,9 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
         length = len(run) + 1  # transitions -> note count
         if length < burst_min:
             continue
-        wide_fraction = sum(1 for w, _ in run if w) / len(run) if run else 0
-        mean_dist_ratio = sum(nd for _, nd in run) / len(run) if run else 0
+        wide_fraction = sum(1 for w, _, _ in run if w) / len(run) if run else 0
+        not_tight_fraction = sum(1 for _, t, _ in run if not t) / len(run) if run else 0
+        mean_dist_ratio = sum(nd for _, _, nd in run) / len(run) if run else 0
         if wide_fraction > run_wide_fraction_max:
             continue  # too much genuinely jump-wide spacing - this is a jump run, not a burst/stream
         if mean_dist_ratio > mean_diam_ratio_max:
@@ -282,7 +288,7 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
             bursts.append(length)
         elif length >= stream_min:
             streams.append(length)
-            if wide_fraction > 0:
+            if not_tight_fraction > 0:
                 cutstreams += 1
 
     diff.burst_count = len(bursts)
@@ -515,6 +521,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
     """
     import subprocess
     import tempfile
+    import time
 
     def log(msg):
         if log_cb:
@@ -534,8 +541,24 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
     with tempfile.NamedTemporaryFile(mode="r", suffix=".txt", delete=False, encoding="utf-8") as tmp:
         out_path = tmp.name
 
+    t_start = time.time()
+    # 10 minutes, not 120s: a freshly-built/downloaded self-contained exe can
+    # take a long time to actually START on Windows (antivirus commonly does
+    # real-time scanning of a new native binary + its DLLs on first launch),
+    # which is unrelated to how long the actual realm read takes once it's
+    # running - `dotnet run` doesn't hit this because it's already-trusted,
+    # already-JIT'd build artifacts, which is why a published exe can time
+    # out even when `dotnet run` against the same code works fine.
+    REALM_READER_TIMEOUT = 600
     try:
-        proc = subprocess.run([helper, realm_path, out_path], capture_output=True, text=True, timeout=120)
+        proc = subprocess.run([helper, realm_path, out_path], capture_output=True, text=True,
+                               timeout=REALM_READER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f"realm-reader didn't finish within {REALM_READER_TIMEOUT}s - falling back to filesystem scan. "
+            "This is often antivirus scanning a freshly-built/downloaded exe on first run rather than a "
+            "real hang; if it keeps happening, try adding an exclusion for the app's folder, or just let "
+            "the fallback scan run (it works, just slower).")
+        return None
     except Exception as e:
         log(f"realm-reader failed to run ({e}) - falling back to filesystem scan.")
         return None
@@ -548,6 +571,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     if proc.stderr:
         log(proc.stderr.strip())
+    log(f"realm-reader finished in {time.time() - t_start:.1f}s.")
 
     try:
         with open(out_path, "r", encoding="utf-8") as f:
