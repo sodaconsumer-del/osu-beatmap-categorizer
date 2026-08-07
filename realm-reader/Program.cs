@@ -107,6 +107,7 @@ class Program
             }
 
             var writer = outputPath != null ? new StreamWriter(outputPath) : Console.Out;
+            int setIndex = 0;
             try
             {
                 int written = 0;
@@ -117,6 +118,9 @@ class Program
                 bool loggedFileInfoError = false;
                 foreach (dynamic set in beatmapSets)
                 {
+                    setIndex++;
+                    if (setIndex % 5000 == 0)
+                        Console.Error.WriteLine($"realm-reader: processed {setIndex} beatmap sets so far...");
                     // osu!'s BeatmapOnlineStatus enum: -2=Graveyard, -1=WIP,
                     // 0=Pending, 1=Ranked, 2=Approved, 3=Qualified, 4=Loved.
                     // Ranked/Approved/Loved/Qualified all have real
@@ -191,6 +195,11 @@ class Program
                 }
 
                 Console.Error.WriteLine($"realm-reader: resolved {written} .osu file paths ({missing} referenced but not found on disk).");
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"ERROR: unexpected failure while processing beatmap sets (around set #{setIndex}): {e}");
+                return 5;
             }
             finally
             {
