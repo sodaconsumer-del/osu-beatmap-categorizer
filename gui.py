@@ -35,6 +35,9 @@ class ClassifierGUI(tk.Tk):
         self.running = False
         self.cancel_event = None
         self.pause_event = None
+        # Last "N/M files" text shown, so resuming can restore it instead of
+        # leaving the label stuck on "Paused" until the next progress tick.
+        self._last_progress_text = ""
 
         self._build_widgets()
         self.after(100, self._poll_queue)
@@ -278,6 +281,7 @@ class ClassifierGUI(tk.Tk):
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
         self.progress["value"] = 0
+        self._last_progress_text = ""
         self.progress_label.config(text="Starting...")
         self.run_button.config(state="disabled")
         self.pause_button.config(state="normal", text="Pause")
@@ -311,9 +315,19 @@ class ClassifierGUI(tk.Tk):
             self.pause_event.clear()
             self.pause_button.config(text="Resume")
             self.progress_label.config(text="Paused")
+            self._log("Paused - click Resume to continue. (A phase that's already in "
+                      "progress, like the directory walk, finishes its current step first.)")
         else:
             self.pause_event.set()
             self.pause_button.config(text="Pause")
+            # Restore the label immediately rather than leaving it reading
+            # "Paused". Some phases (the directory walk, the realm-reader
+            # subprocess, CSV writing) emit no progress callbacks at all, so
+            # without this the UI can sit on a stale "Paused" with a frozen
+            # progress bar for minutes after resuming - indistinguishable
+            # from resume simply not working.
+            self.progress_label.config(text=self._last_progress_text or "Working...")
+            self._log("Resumed.")
 
     def _worker(self, folder, output, csv_path, params, cancel_event, pause_event,
                 include_categories, ranked_mode, min_star, max_star):
@@ -346,7 +360,12 @@ class ClassifierGUI(tk.Tk):
                     if total:
                         self.progress["maximum"] = total
                         self.progress["value"] = done
-                        self.progress_label.config(text=f"{done}/{total} files")
+                        self._last_progress_text = f"{done}/{total} files"
+                        # Don't clobber the "Paused" label with a stale
+                        # progress tick that was already queued when the
+                        # pause took effect.
+                        if self.pause_event is None or self.pause_event.is_set():
+                            self.progress_label.config(text=self._last_progress_text)
                 elif kind == "log":
                     self._log(item[1])
                 elif kind == "done":

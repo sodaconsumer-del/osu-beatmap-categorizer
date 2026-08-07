@@ -682,20 +682,69 @@ def default_lazer_files_dir():
     return os.path.join(data_dir, "files") if data_dir else None
 
 
+def resolve_lazer_storage(data_dir, log_cb=None):
+    """
+    Follows osu!lazer's storage.ini redirect, if there is one.
+
+    When you move your lazer library to another drive, lazer leaves the
+    default data folder in place as a stub and drops a storage.ini in it
+    pointing at the real location:
+
+        FullPath = D:\\osu-lazer
+
+    The stub keeps a (mostly empty) files/ folder and client.realm.lock, but
+    NOT client.realm - so without following this redirect the realm fast
+    path is skipped entirely and the fallback scan walks an empty files/
+    folder and finds zero beatmaps.
+
+    Returns the redirected folder if storage.ini names one that exists, else
+    the folder it was given unchanged. Safe to call on any folder.
+    """
+    if not data_dir:
+        return data_dir
+    ini_path = os.path.join(data_dir, "storage.ini")
+    if not os.path.isfile(ini_path):
+        return data_dir
+    try:
+        with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return data_dir
+    # Not a real ini (no section header), so just pull the one key out.
+    m = re.search(r"^\s*FullPath\s*=\s*(.+?)\s*$", text, re.M)
+    if not m:
+        return data_dir
+    target = m.group(1).strip().strip('"')
+    if not target:
+        return data_dir
+    if not os.path.isdir(target):
+        if log_cb:
+            log_cb(f"Note: {ini_path} points at {target}, but that folder doesn't exist - "
+                   f"using {data_dir} as-is.")
+        return data_dir
+    if log_cb:
+        log_cb(f"Followed lazer's storage.ini redirect: {data_dir} -> {target}")
+    return target
+
+
 def default_lazer_data_dir():
     """
     Best-guess default location of osu!lazer's top-level data folder (the
     one containing client.realm and files/) per OS. Point the tool at this
     folder (rather than files/ directly) to enable the fast realm-reader
     path when the helper is available.
+
+    Follows storage.ini if the library has been relocated to another drive -
+    see resolve_lazer_storage().
     """
     if sys.platform.startswith("win"):
         base = os.environ.get("APPDATA")
-        return os.path.join(base, "osu") if base else None
+        base_dir = os.path.join(base, "osu") if base else None
     elif sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/osu")
+        base_dir = os.path.expanduser("~/Library/Application Support/osu")
     else:
-        return os.path.expanduser("~/.local/share/osu")
+        base_dir = os.path.expanduser("~/.local/share/osu")
+    return resolve_lazer_storage(base_dir)
 
 
 # --------------------------------------------------------------------------
@@ -972,16 +1021,36 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     # directly, or one level up if the given folder is itself a files/
     # subfolder (a very natural thing to point at, so worth handling rather
     # than silently skipping the fast path with no explanation).
+    # Candidate data folders to look for client.realm in, in priority order:
+    # the folder given, that folder's parent (if we were handed a files/
+    # subfolder, a very natural thing to point at), and the storage.ini
+    # redirect target of either (lazer leaves a stub behind when the library
+    # has been moved to another drive - see resolve_lazer_storage).
     realm_data_dir = None
-    if os.path.isfile(os.path.join(songs_folder, "client.realm")):
-        realm_data_dir = songs_folder
-    else:
-        parent = os.path.dirname(os.path.normpath(songs_folder))
-        if os.path.basename(os.path.normpath(songs_folder)).lower() == "files" and \
-                os.path.isfile(os.path.join(parent, "client.realm")):
-            realm_data_dir = parent
-            log(f"Detected you're pointed at a files/ subfolder - found client.realm in the parent folder "
-                f"({parent}), trying the fast path from there.")
+    normed = os.path.normpath(songs_folder)
+    parent = os.path.dirname(normed)
+    is_files_subdir = os.path.basename(normed).lower() == "files"
+
+    candidates = [(songs_folder, None)]
+    if is_files_subdir:
+        candidates.append((parent, f"Detected you're pointed at a files/ subfolder - looking for "
+                                    f"client.realm in the parent folder ({parent})."))
+    redirected = resolve_lazer_storage(songs_folder)
+    if redirected != songs_folder:
+        candidates.append((redirected, None))
+    if is_files_subdir:
+        redirected_parent = resolve_lazer_storage(parent)
+        if redirected_parent != parent:
+            candidates.append((redirected_parent, None))
+
+    for candidate, note in candidates:
+        if os.path.isfile(os.path.join(candidate, "client.realm")):
+            if note:
+                log(note)
+            if candidate != songs_folder:
+                log(f"Using lazer data folder {candidate} (found client.realm there).")
+            realm_data_dir = candidate
+            break
 
     if realm_data_dir:
         fast_result = scan_lazer_realm(realm_data_dir, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event, pause_event=pause_event)
@@ -993,13 +1062,20 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
     if diffs is None:
         scan_root = songs_folder
-        # If we were given lazer's top-level data dir (containing client.realm)
-        # but the fast path wasn't usable, fall back to scanning its files/
-        # subfolder rather than the whole data dir (which also has scores,
-        # skins, etc. we don't need to touch).
-        files_subdir = os.path.join(songs_folder, "files")
-        if realm_data_dir == songs_folder and os.path.isdir(files_subdir):
-            scan_root = files_subdir
+        # If we identified a lazer data dir (containing client.realm) but the
+        # fast path wasn't usable, fall back to scanning its files/ subfolder
+        # rather than the whole data dir (which also has scores, skins, etc.
+        # we don't need to touch). This deliberately uses realm_data_dir, not
+        # songs_folder, so a storage.ini redirect is still honored on the slow
+        # path - otherwise we'd walk the near-empty stub folder and report
+        # zero beatmaps.
+        base = realm_data_dir or resolve_lazer_storage(songs_folder, log_cb=log)
+        files_subdir = os.path.join(base, "files")
+        if base != songs_folder or realm_data_dir == songs_folder:
+            if os.path.isdir(files_subdir):
+                scan_root = files_subdir
+        if scan_root != songs_folder:
+            log(f"Scanning {scan_root}")
         diffs, errors = scan_folder(scan_root, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event, pause_event=pause_event)
     log(f"Classified {len(diffs)} difficulties.")
 

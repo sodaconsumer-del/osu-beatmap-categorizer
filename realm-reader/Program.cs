@@ -24,7 +24,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using Realms;
 
 class Program
@@ -116,12 +115,23 @@ class Program
 
                 // Star rating lives on the individual difficulty ("Beatmap")
                 // object, not the file itself, so build a hash -> star
-                // rating lookup first. Beatmap.Hash is assumed to be the
-                // same MD5-of-file-content hash used everywhere else in
-                // osu! (collections, score matching) - we compute each
-                // resolved file's MD5 further down and join against this
-                // table, rather than trying to match filenames, which
-                // would be far more fragile.
+                // rating lookup first.
+                //
+                // Join key is Beatmap.Hash, which is the SHA-256 of the .osu
+                // file content - the SAME hash the content-addressed files/
+                // store is keyed by, and therefore the same value we already
+                // have in hand as RealmNamedFileUsage.File.Hash below. So the
+                // join is a straight dictionary hit with no file IO at all.
+                //
+                // NOTE: Beatmap also exposes MD5Hash, which is a DIFFERENT
+                // hash (the MD5 used for collection.db / online lookups).
+                // Joining File.Hash against MD5Hash - or against an MD5
+                // computed from the file's bytes - never matches, and paying
+                // a full read of every .osu in the library to compute that
+                // MD5 is what made this step take tens of minutes on a large
+                // library (long enough for the Python side to hit its
+                // subprocess timeout and silently fall back to a filesystem
+                // scan). Keep this joining on Hash, not MD5Hash.
                 var starRatingByHash = new Dictionary<string, double>();
                 bool loggedStarRatingError = false;
                 try
@@ -151,8 +161,6 @@ class Program
                 {
                     Console.Error.WriteLine($"realm-reader: couldn't read Beatmap class at all ({e.Message}) - star rating won't be available.");
                 }
-
-                using var md5 = MD5.Create();
 
                 dynamic beatmapSets = realm.DynamicApi.All("BeatmapSet");
                 bool loggedFilesError = false;
@@ -224,19 +232,12 @@ class Program
                         string resolved = Path.Combine(filesDir, hash.Substring(0, 1), hash.Substring(0, 2), hash);
                         if (File.Exists(resolved))
                         {
+                            // Straight lookup on the store hash we already
+                            // have - see the note above on why this must not
+                            // go via MD5.
                             string starRatingStr = "unknown";
-                            try
-                            {
-                                byte[] fileBytes = File.ReadAllBytes(resolved);
-                                byte[] hashBytes = md5.ComputeHash(fileBytes);
-                                string fileMd5 = Convert.ToHexString(hashBytes).ToLowerInvariant();
-                                if (starRatingByHash.TryGetValue(fileMd5, out double sr))
-                                    starRatingStr = sr.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-                            }
-                            catch (Exception)
-                            {
-                                // leave as "unknown" - not fatal, just means this one file's star rating is unavailable
-                            }
+                            if (starRatingByHash.TryGetValue(hash, out double sr))
+                                starRatingStr = sr.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
                             // Tab-separated: path, ranked status, star rating
                             writer.WriteLine($"{resolved}\t{rankedStatus}\t{starRatingStr}");
                             written++;
