@@ -117,6 +117,24 @@ class Program
                 bool loggedFileInfoError = false;
                 foreach (dynamic set in beatmapSets)
                 {
+                    // osu!'s BeatmapOnlineStatus enum: -2=Graveyard, -1=WIP,
+                    // 0=Pending, 1=Ranked, 2=Approved, 3=Qualified, 4=Loved.
+                    // Ranked/Approved/Loved/Qualified all have real
+                    // leaderboards and are what most players mean by
+                    // "ranked" in casual usage - only Graveyard/WIP/Pending
+                    // count as "unranked" here.
+                    string rankedStatus = "unranked";
+                    try
+                    {
+                        int statusValue = (int)set.Status;
+                        if (statusValue >= 1)
+                            rankedStatus = "ranked";
+                    }
+                    catch (Exception)
+                    {
+                        rankedStatus = "unknown";
+                    }
+
                     IEnumerable<dynamic> files;
                     try
                     {
@@ -161,7 +179,8 @@ class Program
                         string resolved = Path.Combine(filesDir, hash.Substring(0, 1), hash.Substring(0, 2), hash);
                         if (File.Exists(resolved))
                         {
-                            writer.WriteLine(resolved);
+                            // Tab-separated: path, then ranked status
+                            writer.WriteLine($"{resolved}\t{rankedStatus}");
                             written++;
                         }
                         else

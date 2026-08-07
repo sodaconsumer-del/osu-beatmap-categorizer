@@ -90,8 +90,42 @@ class ClassifierGUI(tk.Tk):
         ttk.Checkbutton(row1, text="Write CSV report (recommended - audit before trusting the collection.db)",
                          variable=self.write_csv_var).pack(side="left")
 
+        # --- Category selection ---
+        frame_cat = ttk.LabelFrame(self, text="3. Categories to include in collection.db")
+        frame_cat.pack(fill="x", **pad)
+        row_cat = ttk.Frame(frame_cat)
+        row_cat.pack(fill="x", padx=10, pady=8)
+        self.category_vars = {}
+        for cat in ["Streams", "Bursts", "Jumps", "Misc"]:
+            var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(row_cat, text=cat, variable=var).pack(side="left", padx=(0, 16))
+            self.category_vars[cat] = var
+        ttk.Label(frame_cat,
+                  text="Uncheck what you don't want - e.g. an aim-only player could keep just Jumps checked.",
+                  foreground="#666666").pack(anchor="w", padx=10, pady=(0, 8))
+
+        # --- Ranked status handling ---
+        frame_ranked = ttk.LabelFrame(self, text="4. Ranked status (osu!lazer fast path only)")
+        frame_ranked.pack(fill="x", **pad)
+        self.ranked_mode_var = tk.StringVar(value="all_together")
+        row_ranked = ttk.Frame(frame_ranked)
+        row_ranked.pack(fill="x", padx=10, pady=8)
+        ranked_options = [
+            ("Keep ranked & unranked together", "all_together"),
+            ("Ranked only", "ranked_only"),
+            ("Unranked only", "unranked_only"),
+            ("Split into separate collections", "split"),
+        ]
+        for label, value in ranked_options:
+            ttk.Radiobutton(row_ranked, text=label, variable=self.ranked_mode_var, value=value).pack(
+                side="left", padx=(0, 14))
+        ttk.Label(frame_ranked,
+                  text="Ranked status is only known when scanning via osu!lazer's realm fast path. "
+                       "Other scan methods (Songs folder, files/ folder, .osz) can't tell ranked from unranked.",
+                  foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
         # --- Advanced thresholds (collapsible-ish via a simple frame) ---
-        frame_adv = ttk.LabelFrame(self, text="3. Thresholds (defaults match osu!'s official tag definitions)")
+        frame_adv = ttk.LabelFrame(self, text="5. Thresholds (defaults match osu!'s official tag definitions)")
         frame_adv.pack(fill="x", **pad)
 
         self.param_vars = {}
@@ -199,6 +233,14 @@ class ClassifierGUI(tk.Tk):
         output = os.path.join(export_dir, "collection.db") if self.write_db_var.get() else None
         csv_path = os.path.join(export_dir, "report.csv") if self.write_csv_var.get() else None
 
+        include_categories = [cat for cat, var in self.category_vars.items() if var.get()]
+        if self.write_db_var.get() and not include_categories:
+            messagebox.showerror("No categories selected",
+                                  "Check at least one category to include in collection.db, "
+                                  "or uncheck 'Write collection.db' if you only want the CSV.")
+            return
+        ranked_mode = self.ranked_mode_var.get()
+
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
@@ -210,7 +252,9 @@ class ClassifierGUI(tk.Tk):
         self.cancel_event = threading.Event()
 
         self.worker_thread = threading.Thread(
-            target=self._worker, args=(folder, output, csv_path, params, self.cancel_event), daemon=True
+            target=self._worker,
+            args=(folder, output, csv_path, params, self.cancel_event, include_categories, ranked_mode),
+            daemon=True,
         )
         self.worker_thread.start()
 
@@ -220,7 +264,7 @@ class ClassifierGUI(tk.Tk):
             self.cancel_button.config(state="disabled")
             self.progress_label.config(text="Cancelling...")
 
-    def _worker(self, folder, output, csv_path, params, cancel_event):
+    def _worker(self, folder, output, csv_path, params, cancel_event, include_categories, ranked_mode):
         def progress_cb(done, total):
             self.msg_queue.put(("progress", done, total))
 
@@ -231,6 +275,7 @@ class ClassifierGUI(tk.Tk):
             result = cm.run_pipeline(
                 folder, output=output, csv_path=csv_path, write_db=output is not None,
                 params=params, progress_cb=progress_cb, log_cb=log_cb, cancel_event=cancel_event,
+                include_categories=include_categories, ranked_mode=ranked_mode,
             )
             self.msg_queue.put(("done", result))
         except cm.ScanCancelled:
@@ -254,7 +299,7 @@ class ClassifierGUI(tk.Tk):
                 elif kind == "done":
                     self._log("\nDone.")
                     if self.write_db_var.get():
-                        self._log("Note: each diff lands in exactly one collection, named for its exact tag combination (e.g. 'Streams, Bursts, Jumps') - no duplicates across collections.")
+                        self._log("Note: each diff is classified by its DOMINANT pattern (Streams > Bursts > Jumps > Misc) - a stream map with a jump section is still a stream map, not split across collections.")
                         self._log("Back up your existing collection.db before replacing it, or merge with a tool like Piotrekol's CollectionManager.")
                     self.run_button.config(state="normal")
                     self.cancel_button.config(state="disabled")

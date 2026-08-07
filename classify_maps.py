@@ -63,6 +63,12 @@ class DiffInfo:
     has_jumps: bool = False
     has_cutstreams: bool = False
 
+    # "ranked", "unranked", or None if unknown (only available via the
+    # osu!lazer realm fast path - a plain filesystem scan of .osu files
+    # has no way to know a beatmap's online ranked status, since that's
+    # tracked separately by osu! servers, not stored in the .osu file itself)
+    ranked_status: object = None
+
 
 def parse_osu_file(path):
     with open(path, "rb") as f:
@@ -154,17 +160,17 @@ def _beat_length_at(t, timing_points):
 # Classification
 # --------------------------------------------------------------------------
 
-def classify_diff(diff: DiffInfo, snap_ratio=0.30,
+def classify_diff(diff: DiffInfo, snap_ratio=0.55,
                    tight_diam_ratio=1.35, spaced_diam_ratio=2.0,
                    burst_min=5, burst_max=9, stream_min=10,
                    jump_velocity_ratio=2.2, jump_pct_threshold=15.0,
-                   run_wide_fraction_max=0.4):
+                   run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5):
     """
     Terminology (matching osu!'s official beatmap tags):
       - burst  : 5-9 note run
       - stream : 10+ note run
       - spaced stream : a stream where notes don't overlap but spacing/rhythm
-        stays consistent - still a stream, not a jump
+        stays consistent - still a stream, not a jump.
       - cutstream : a stream where a MINORITY of notes have much larger
         spacing than the rest - still a stream overall, just with cuts
       - jump   : wide, irregular spacing between consecutive objects. This is
@@ -172,13 +178,31 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.30,
         any snap speed and can co-occur with bursts/streams (jump bursts,
         spaced streams, etc). It is NOT mutually exclusive with bursts/streams.
 
+    A note-to-note transition only joins a burst/stream run if it's fast
+    (<= snap_ratio * local beat length). snap_ratio defaults to 0.55 rather
+    than a tighter ~0.3 (which would only catch 1/4-snap-or-faster) because
+    some mappers author extreme stream/finger-control maps with the file's
+    stored BPM deliberately doubled from the song's true felt tempo (for
+    finer editor snap precision) - in that case, a real 1/4-snap-of-true-
+    tempo stream note lands at exactly 1/2-snap of the doubled, stored
+    tempo (confirmed against real "doubled BPM" stream maps: consistent
+    gap/beatLength ~0.499 throughout their stream sections). A tighter
+    cutoff misses these runs entirely before spacing is even considered;
+    run-length filtering (burst_min/stream_min) guards against stray,
+    non-stream 1/2-snap taps in normal gameplay turning into false positives.
+
     Runs are built purely from TIMING (is this still being consecutively
-    tapped fast?). Spacing is then used to judge what KIND of run it is:
-    if only a minority of transitions in the run are wide-spaced, it's a
-    stream/burst (possibly a cutstream). If the majority of the run is
-    wide-spaced throughout (e.g. ESSE CARA!, where nearly every 1/4-snap
-    note is jumped 3-5 circle diameters away), it's a jump run, not a
-    stream/burst, even though the timing alone looked fast enough.
+    tapped fast?). Spacing is then used to judge what KIND of run it is,
+    using THREE tiers rather than a single cutoff:
+      - tight  : dist <= tight_diam_ratio * diameter (stacked/near-overlapping)
+      - spaced : dist <= spaced_diam_ratio * diameter (non-overlapping but
+                 still a deliberate, readable stream/finger-control spacing -
+                 does NOT count against a run being a stream/burst)
+      - jump-wide : beyond spaced_diam_ratio * diameter (genuinely far apart)
+
+    A run is only discarded as "actually a jump run" if too much of it is
+    jump-wide - spaced (but not jump-wide) transitions are treated as normal
+    stream/burst content.
     """
     objs = diff.objs
     if len(objs) < burst_min:
@@ -187,7 +211,7 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.30,
     radius = 54.4 - 4.48 * diff.circle_size
     diam = radius * 2
 
-    # Build (is_fast, is_wide) per transition, and independently track
+    # Build (is_fast, is_jump_wide) per transition, and independently track
     # jump "velocity" (distance normalized by both circle size and time)
     # for the overall jump density metric.
     transitions = []
@@ -203,31 +227,29 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.30,
 
         total_gaps += 1
         is_fast = gap <= thresh
-        is_wide = dist > diam * tight_diam_ratio  # beyond "tight" = spaced or wider
+        # Only genuinely far spacing (beyond the "spaced stream" tier)
+        # counts against a run - non-overlapping-but-readable spacing is
+        # normal stream/burst/finger-control content, not a jump.
+        is_jump_wide = dist > diam * spaced_diam_ratio
 
         norm_dist = dist / diam
         norm_time = max(gap / bl, 0.05)
-        # Require BOTH a genuinely wide distance (is_wide) AND a high
+        # Require BOTH genuinely far spacing (is_jump_wide) AND a high
         # distance/time ratio. Velocity alone isn't enough: a legitimate
         # tight stream has a tiny time-per-note by definition, which
         # inflates distance/time even when the actual spacing is small -
         # that was causing real streams to get flagged as mostly jumps.
-        # Requiring is_wide too means only transitions that are BOTH
-        # spaced far apart AND covered quickly count as jumps (e.g. ESSE
-        # CARA!'s 1/4-snap jumps), while tight-spaced fast transitions
-        # (ordinary streams, however dense) never do, regardless of how
-        # small the time-per-note is.
-        if is_wide and (norm_dist / norm_time) > jump_velocity_ratio:
+        if is_jump_wide and (norm_dist / norm_time) > jump_velocity_ratio:
             jump_count += 1
 
-        transitions.append((is_fast, is_wide))
+        transitions.append((is_fast, is_jump_wide, norm_dist))
 
     # Group consecutive fast transitions into runs (timing-only)
-    runs = []  # list of list[is_wide]
+    runs = []  # list of list[(is_jump_wide, norm_dist)]
     cur = []
-    for is_fast, is_wide in transitions:
+    for is_fast, is_jump_wide, norm_dist in transitions:
         if is_fast:
-            cur.append(is_wide)
+            cur.append((is_jump_wide, norm_dist))
         else:
             if cur:
                 runs.append(cur)
@@ -242,9 +264,20 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.30,
         length = len(run) + 1  # transitions -> note count
         if length < burst_min:
             continue
-        wide_fraction = sum(run) / len(run) if run else 0
+        wide_fraction = sum(1 for w, _ in run if w) / len(run) if run else 0
+        mean_dist_ratio = sum(nd for _, nd in run) / len(run) if run else 0
         if wide_fraction > run_wide_fraction_max:
-            continue  # this is a jump run, not a burst/stream
+            continue  # too much genuinely jump-wide spacing - this is a jump run, not a burst/stream
+        if mean_dist_ratio > mean_diam_ratio_max:
+            # Individual transitions can dodge the wide-fraction cutoff by
+            # chance (e.g. a wide-angle jump shape occasionally swings back
+            # close to a previous point), but a real stream/burst - even a
+            # "spaced" one - still averages close to circle-diameter scale
+            # across the whole run. A run whose AVERAGE spacing is this wide
+            # is a jump pattern that happens to be on a fast snap, not a
+            # stream, regardless of what fraction of individual transitions
+            # technically dodged the wide-fraction check.
+            continue
         if burst_min <= length <= burst_max:
             bursts.append(length)
         elif length >= stream_min:
@@ -518,20 +551,31 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     try:
         with open(out_path, "r", encoding="utf-8") as f:
-            paths = [line.strip() for line in f if line.strip()]
+            entries = []
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                # New format: "path\tranked_status". Old format (backward
+                # compat with an older compiled helper): just a bare path.
+                if "\t" in line:
+                    path_part, status_part = line.split("\t", 1)
+                    entries.append((path_part, status_part.strip() or None))
+                else:
+                    entries.append((line, None))
     except OSError:
-        paths = []
+        entries = []
     finally:
         try:
             os.unlink(out_path)
         except OSError:
             pass
 
-    if not paths:
+    if not entries:
         log("realm-reader found no beatmap paths - falling back to filesystem scan.")
         return None
 
-    log(f"realm-reader resolved {len(paths)} .osu files directly - parsing them now (no filesystem walk needed).")
+    log(f"realm-reader resolved {len(entries)} .osu files directly - parsing them now (no filesystem walk needed).")
 
     def emit(diff):
         if on_parsed:
@@ -540,22 +584,23 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     results = []
     errors = []
-    for i, full in enumerate(paths):
+    for i, (full, ranked_status) in enumerate(entries):
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
         try:
             diff = parse_osu_file(full)
             if diff is not None and diff.objs:
+                diff.ranked_status = ranked_status
                 results.append(emit(diff))
         except Exception as e:
             errors.append((full, str(e)))
         if progress_cb and (i + 1) % 25 == 0:
-            progress_cb(i + 1, len(paths))
+            progress_cb(i + 1, len(entries))
         if log_cb and (i + 1) % 5000 == 0:
-            log(f"  ... {i + 1}/{len(paths)} parsed")
+            log(f"  ... {i + 1}/{len(entries)} parsed")
 
     if progress_cb:
-        progress_cb(len(paths), len(paths))
+        progress_cb(len(entries), len(entries))
 
     log(f"Fast-path scan complete. {len(results)} osu!standard difficulties found.")
     if errors:
@@ -630,35 +675,89 @@ def write_collection_db(path, collections, db_version=20211103):
 
 def derive_collections(diffs):
     """
-    Groups diffs by their EXACT combination of tags, so each diff lands in
-    exactly one collection rather than being duplicated across several
-    overlapping ones. A hybrid map (bursts + jumps + streams) goes into a
-    collection literally named "Streams, Bursts, Jumps" - not separately
-    into "Streams" AND "Bursts" AND some other "Hybrid" bucket.
+    Groups diffs by DOMINANT pattern, not by presence of every tag. A map
+    that's mostly streams with a jump section thrown in is still a stream
+    map - a small secondary pattern doesn't change what the map fundamentally
+    is. Priority order: Streams > Bursts > Jumps > Misc.
 
-    Tag order in the name is always Streams, Bursts, Cutstreams, Jumps
-    (matching the CSV/report column order) regardless of which tags are
-    present, so combination names stay consistent and predictable. A diff
-    with none of the four tags goes into "Misc".
+      - Streams : has any genuine stream run (10+ notes, tight/fast).
+                  Cutstreams (a stream with a minority of wider-spaced notes)
+                  count as streams here too, not a separate category - a
+                  cutstream is still a stream.
+      - Bursts  : has burst run(s) but no full streams.
+      - Jumps   : jump-heavy, no bursts or streams at all (a "pure" jump map).
+      - Misc    : none of the above (low-density / normal play).
+
+    This mirrors how the osu! community actually talks about maps - "this
+    is a stream map" even if it has a jump section, "this is a jump map"
+    only when it's not also a burst/stream map.
     """
-    groups = {}
+    groups = {"Streams": [], "Bursts": [], "Jumps": [], "Misc": []}
     for d in diffs:
-        parts = []
         if d.has_streams:
-            parts.append("Streams")
-        if d.has_bursts:
-            parts.append("Bursts")
-        if d.has_cutstreams:
-            parts.append("Cutstreams")
-        if d.has_jumps:
-            parts.append("Jumps")
-        name = ", ".join(parts) if parts else "Misc"
-        groups.setdefault(name, []).append(d)
+            groups["Streams"].append(d)
+        elif d.has_bursts:
+            groups["Bursts"].append(d)
+        elif d.has_jumps:
+            groups["Jumps"].append(d)
+        else:
+            groups["Misc"].append(d)
+    return groups
+
+
+def build_output_collections(groups, include_categories=None, ranked_mode="all_together", log_cb=None):
+    """
+    Applies category selection and ranked-status handling on top of the
+    dominant-pattern groups from derive_collections(). This is what actually
+    controls what ends up in the output collection.db - e.g. an aim-only
+    player could pass include_categories=["Jumps"] to get just a Jumps
+    collection and nothing else.
+
+    ranked_mode:
+      - "all_together" : ignore ranked status entirely (default)
+      - "ranked_only"  : drop any diff that isn't ranked/approved/qualified/loved
+      - "unranked_only": drop any diff that IS ranked/approved/qualified/loved
+      - "split"         : each category becomes two, e.g. "Streams - Ranked" /
+                          "Streams - Unranked"
+
+    Ranked status is only known when the diffs came from the osu!lazer realm
+    fast path - anything else has ranked_status=None, which is treated as
+    "not ranked" for filtering/splitting purposes (with a warning logged).
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    if include_categories:
+        groups = {label: members for label, members in groups.items() if label in include_categories}
+
+    if ranked_mode == "all_together":
+        return groups
+
+    any_known = any(d.ranked_status is not None for members in groups.values() for d in members)
+    if not any_known:
+        log("Note: ranked status isn't available for this scan (only the osu!lazer realm fast path "
+            "provides it) - all diffs are being treated as unranked for this filter/split.")
+
+    if ranked_mode == "ranked_only":
+        return {label: [d for d in members if d.ranked_status == "ranked"] for label, members in groups.items()}
+    elif ranked_mode == "unranked_only":
+        return {label: [d for d in members if d.ranked_status != "ranked"] for label, members in groups.items()}
+    elif ranked_mode == "split":
+        result = {}
+        for label, members in groups.items():
+            ranked = [d for d in members if d.ranked_status == "ranked"]
+            unranked = [d for d in members if d.ranked_status != "ranked"]
+            if ranked:
+                result[f"{label} - Ranked"] = ranked
+            if unranked:
+                result[f"{label} - Unranked"] = unranked
+        return result
     return groups
 
 
 DEFAULT_PARAMS = dict(
-    snap_ratio=0.30,
+    snap_ratio=0.55,
     tight_diam_ratio=1.35,
     spaced_diam_ratio=2.0,
     burst_min=3,
@@ -667,11 +766,13 @@ DEFAULT_PARAMS = dict(
     jump_velocity_ratio=2.2,
     jump_pct_threshold=15.0,
     run_wide_fraction_max=0.4,
+    mean_diam_ratio_max=1.5,
 )
 
 
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
-                  params=None, progress_cb=None, log_cb=None, cancel_event=None):
+                  params=None, progress_cb=None, log_cb=None, cancel_event=None,
+                  include_categories=None, ranked_mode="all_together"):
     """
     Core pipeline used by both the CLI and the GUI:
       1. scan_folder() over .osu/.osz files
@@ -685,6 +786,18 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     phase - if set, raises ScanCancelled to stop promptly without writing
     a CSV or collection.db (a partial/interrupted run isn't something you'd
     want to trust as the actual output).
+    include_categories, if given, restricts which categories ("Streams",
+    "Bursts", "Jumps", "Misc") get written to the output collection.db -
+    e.g. pass ["Jumps"] to only output a Jumps collection and skip writing
+    the rest entirely. The CSV report always includes every diff regardless,
+    so you can still audit the full scan.
+    ranked_mode controls how ranked status factors into collection names
+    (only meaningful when ranked status is actually available - currently
+    only the osu!lazer realm fast path provides it):
+      - "all_together" (default): ranked status ignored, one collection per category
+      - "ranked_only": only ranked/approved/loved/qualified diffs are included
+      - "unranked_only": only pending/WIP/graveyard diffs are included
+      - "split": two collections per category, e.g. "Streams - Ranked" / "Streams - Unranked"
     Returns a dict: {diffs, errors, groups, counts}
     """
     p = dict(DEFAULT_PARAMS)
@@ -715,6 +828,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
             jump_velocity_ratio=p["jump_velocity_ratio"],
             jump_pct_threshold=p["jump_pct_threshold"],
             run_wide_fraction_max=p["run_wide_fraction_max"],
+            mean_diam_ratio_max=p["mean_diam_ratio_max"],
         )
         # Free per-note data immediately - only the summary fields (counts,
         # booleans, hash) are needed from here on. Classifying inline like
@@ -770,7 +884,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     groups = derive_collections(diffs)
     counts = {label: len(members) for label, members in groups.items()}
 
-    log("Summary (one collection per exact tag combination):")
+    log("Summary (by dominant pattern):")
     for label, count in sorted(counts.items(), key=lambda kv: -kv[1]):
         log(f"  {label}: {count}")
 
@@ -781,11 +895,11 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                 w = csv.writer(f)
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
-                            "max_stream_len", "jump_pct", "path"])
+                            "max_stream_len", "jump_pct", "ranked_status", "path"])
                 for d in diffs:
                     w.writerow([d.title, d.diff_name, round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
-                                d.max_stream_len, round(d.jump_pct, 1), d.path])
+                                d.max_stream_len, round(d.jump_pct, 1), d.ranked_status or "unknown", d.path])
             log(f"Full per-diff results written to {csv_path}")
         except Exception:
             import traceback
@@ -794,7 +908,9 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
     if write_db and output:
         try:
-            collections = {label: [d.version_hash for d in members] for label, members in groups.items() if members}
+            output_groups = build_output_collections(groups, include_categories=include_categories,
+                                                       ranked_mode=ranked_mode, log_cb=log)
+            collections = {label: [d.version_hash for d in members] for label, members in output_groups.items() if members}
             write_collection_db(output, collections)
             log(f"collection.db written to {output}")
         except Exception:
@@ -805,7 +921,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     return {"diffs": diffs, "errors": errors, "groups": groups, "counts": counts}
 
 
-def collection_from_csv(csv_path, output_db, log_cb=None):
+def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=None, ranked_mode="all_together"):
     """
     Rebuilds a collection.db from a previously-generated report.csv, without
     rescanning the library. Useful if a run produced the CSV successfully
@@ -820,6 +936,11 @@ def collection_from_csv(csv_path, output_db, log_cb=None):
     (format "archive.osz::inner.osu") or no longer exists on disk are
     skipped and counted, since only the archive's basename was recorded,
     not enough to reopen it.
+
+    include_categories / ranked_mode work the same as in run_pipeline() -
+    see build_output_collections() for details. ranked_status is read from
+    the CSV's own ranked_status column (only meaningful if that CSV was
+    produced via the osu!lazer realm fast path).
     """
     import csv as csv_module
 
@@ -827,7 +948,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None):
         if log_cb:
             log_cb(msg)
 
-    groups = {}
+    groups = {"Streams": [], "Bursts": [], "Jumps": [], "Misc": []}
     total = 0
     skipped = 0
 
@@ -849,29 +970,56 @@ def collection_from_csv(csv_path, output_db, log_cb=None):
             b = row.get("has_bursts") == "True"
             s = row.get("has_streams") == "True"
             j = row.get("has_jumps") == "True"
-            c = row.get("has_cutstreams") == "True"
+            ranked_status = row.get("ranked_status")
+            if ranked_status in (None, "", "unknown"):
+                ranked_status = None
+            entry = (h, ranked_status)
 
-            parts = []
             if s:
-                parts.append("Streams")
-            if b:
-                parts.append("Bursts")
-            if c:
-                parts.append("Cutstreams")
-            if j:
-                parts.append("Jumps")
-            name = ", ".join(parts) if parts else "Misc"
-            groups.setdefault(name, []).append(h)
+                groups["Streams"].append(entry)
+            elif b:
+                groups["Bursts"].append(entry)
+            elif j:
+                groups["Jumps"].append(entry)
+            else:
+                groups["Misc"].append(entry)
 
             if log_cb and total % 20000 == 0:
                 log(f"  ... {total} rows processed")
+
+    if include_categories:
+        groups = {label: entries for label, entries in groups.items() if label in include_categories}
+
+    if ranked_mode != "all_together":
+        any_known = any(status is not None for entries in groups.values() for _, status in entries)
+        if not any_known:
+            log("Note: ranked status isn't available in this CSV (only present when the original scan "
+                "used the osu!lazer realm fast path) - all diffs are being treated as unranked for this filter/split.")
+
+        if ranked_mode == "ranked_only":
+            groups = {label: [(h, s) for h, s in entries if s == "ranked"] for label, entries in groups.items()}
+        elif ranked_mode == "unranked_only":
+            groups = {label: [(h, s) for h, s in entries if s != "ranked"] for label, entries in groups.items()}
+        elif ranked_mode == "split":
+            split_groups = {}
+            for label, entries in groups.items():
+                ranked = [h for h, s in entries if s == "ranked"]
+                unranked = [h for h, s in entries if s != "ranked"]
+                if ranked:
+                    split_groups[f"{label} - Ranked"] = ranked
+                if unranked:
+                    split_groups[f"{label} - Unranked"] = unranked
+            groups = split_groups
+
+    if ranked_mode != "split":
+        groups = {label: [h for h, _ in entries] for label, entries in groups.items()}
 
     collections = {label: hashes for label, hashes in groups.items() if hashes}
     write_collection_db(output_db, collections)
     log(f"Processed {total} rows ({skipped} skipped - missing file or inside an unreadable .osz entry).")
     log(f"collection.db written to {output_db}")
     counts = {label: len(hashes) for label, hashes in groups.items()}
-    log("Summary (one collection per exact tag combination):")
+    log("Summary (by dominant pattern):")
     for label, count in sorted(counts.items(), key=lambda kv: -kv[1]):
         log(f"  {label}: {count}")
     return {"total": total, "skipped": skipped, "groups": groups, "counts": counts}
@@ -899,11 +1047,26 @@ def main():
     ap.add_argument("--jump-velocity-ratio", type=float, default=DEFAULT_PARAMS["jump_velocity_ratio"])
     ap.add_argument("--jump-pct-threshold", type=float, default=DEFAULT_PARAMS["jump_pct_threshold"])
     ap.add_argument("--run-wide-fraction-max", type=float, default=DEFAULT_PARAMS["run_wide_fraction_max"])
+    ap.add_argument("--mean-diam-ratio-max", type=float, default=DEFAULT_PARAMS["mean_diam_ratio_max"],
+                     help="Max average distance/circle-diameter ratio across a run for it to still count "
+                          "as a stream/burst rather than a jump pattern that happens to be fast-snapped")
     ap.add_argument("--csv", default=None, help="Optional path to dump full per-diff results as CSV")
+    ap.add_argument("--categories", default=None,
+                     help="Comma-separated list of categories to include in the output collection.db "
+                          "(Streams,Bursts,Jumps,Misc). Default: all of them. E.g. --categories Jumps "
+                          "to only get a Jumps collection and skip writing the rest.")
+    ap.add_argument("--ranked-mode", choices=["all_together", "ranked_only", "unranked_only", "split"],
+                     default="all_together",
+                     help="How ranked status factors into collections - only meaningful when ranked "
+                          "status is available (currently only the osu!lazer realm fast path provides it). "
+                          "'split' makes separate 'X - Ranked' / 'X - Unranked' collections per category.")
     args = ap.parse_args()
 
+    include_categories = [c.strip() for c in args.categories.split(",")] if args.categories else None
+
     if args.from_csv:
-        collection_from_csv(args.from_csv, args.output, log_cb=print)
+        collection_from_csv(args.from_csv, args.output, log_cb=print,
+                             include_categories=include_categories, ranked_mode=args.ranked_mode)
         return
 
     if not args.songs_folder:
@@ -923,6 +1086,7 @@ def main():
         jump_velocity_ratio=args.jump_velocity_ratio,
         jump_pct_threshold=args.jump_pct_threshold,
         run_wide_fraction_max=args.run_wide_fraction_max,
+        mean_diam_ratio_max=args.mean_diam_ratio_max,
     )
 
     def cli_progress(done, total):
@@ -937,11 +1101,13 @@ def main():
         params=params,
         progress_cb=cli_progress,
         log_cb=print,
+        include_categories=include_categories,
+        ranked_mode=args.ranked_mode,
     )
 
     if not args.no_db:
-        print("\nNote: each diff lands in exactly one collection, named for its exact tag combination")
-        print("(e.g. 'Streams, Bursts, Jumps') - no duplicates across collections.")
+        print("\nNote: each diff is classified by its DOMINANT pattern (Streams > Bursts > Jumps > Misc) -")
+        print("a stream map with a jump section is still a stream map, not split across collections.")
         print("Back up your existing collection.db before replacing it, or merge with a tool")
         print("like Piotrekol's CollectionManager rather than overwriting directly.")
 
