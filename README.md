@@ -12,6 +12,24 @@ If you wish to contact me, you can find me on osu! ( [-soda-](https://osu.ppy.sh
 
 ##
 
+## Download
+
+Grab the latest zip from [Releases](../../releases) and extract it. **Windows
+only** for now. No Python needed.
+
+Inside you'll find `osu-beatmap-categorizer.exe` — that's the one to run — next
+to a `realm-reader` folder. Leave that folder where it is: it holds the helper
+that reads osu!lazer's database directly, and without it a lazer scan falls
+back to a much slower method.
+
+> **Windows will probably warn you the first time.** The app isn't code-signed
+> (certificates cost money), so SmartScreen shows "Windows protected your PC".
+> *More info → Run anyway.* Some antivirus also flags PyInstaller-built
+> executables as suspicious — that's a known false positive with how PyInstaller
+> packs Python apps, not something specific to this tool. If you'd rather not
+> take my word for it, the source is right here and you can run it with
+> `python gui.py` instead.
+
 ## Quick start
 
 1. Point it at your beatmap folder:
@@ -74,6 +92,29 @@ python eval_classifier.py --csv report.csv --labels labels.csv
 That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. You'll need a free osu! OAuth app for the tag fetch, and `online_id` is only populated on the lazer realm fast path.
 
 ##
+
+## Running from source
+
+Needs Python 3.8+ and nothing else — the app is pure standard library.
+
+```
+python gui.py
+```
+
+or from the command line:
+
+```
+python classify_maps.py "D:/osu-lazer" --csv report.csv --output collection.db
+```
+
+`python classify_maps.py --help` lists every option.
+
+The `realm-reader` helper is optional and only speeds up osu!lazer scans. To
+build it you need the .NET 8 SDK:
+
+```
+dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader
+```
 
 ## Credits
 

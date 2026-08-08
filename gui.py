@@ -12,6 +12,7 @@ A user-friendly front end for classify_maps.py. Works with:
 Pure standard library (tkinter) - nothing to pip install.
 """
 
+import json
 import os
 import sys
 import threading
@@ -23,12 +24,73 @@ from tkinter import ttk, filedialog, messagebox
 import classify_maps as cm
 
 
+APP_VERSION = "1.0.0"
+
+# Where the theme preference is remembered. Deliberately in the user's home
+# directory rather than next to the executable: people drop this in Program
+# Files or run it straight out of a read-only extracted zip, and a settings
+# write that throws on startup would be a miserable first impression.
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu-beatmap-categorizer.json")
+
+
+# Two palettes. Dark is the default because this is a tool for osu! players,
+# who are overwhelmingly running a dark game on a dark desktop, and a
+# full-white window at 2am is genuinely unpleasant.
+THEMES = {
+    "dark": {
+        "bg": "#1e1f22",         # window and frame background
+        "surface": "#2b2d31",    # entries, text area
+        "fg": "#e4e6eb",         # primary text
+        "muted": "#9aa0a6",      # hint text
+        "accent": "#5865f2",     # selection / focus
+        "border": "#3f4147",
+        "disabled": "#6b6f76",
+        "trough": "#111214",     # progress bar background
+    },
+    "light": {
+        "bg": "#f5f5f5",
+        "surface": "#ffffff",
+        "fg": "#1a1a1a",
+        "muted": "#666666",
+        "accent": "#3b5bdb",
+        "border": "#c8c8c8",
+        "disabled": "#a0a0a0",
+        "trough": "#e0e0e0",
+    },
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass  # a preference failing to save is not worth interrupting anyone over
+
+
 class ClassifierGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("osu-beatmap-categorizer")
+        # Version in the title so bug reports say which build they're from
+        # without anyone having to ask.
+        self.title(f"osu-beatmap-categorizer {APP_VERSION}")
         self.geometry("1200x800")
         self.minsize(900, 650)
+
+        self.config_data = load_config()
+        self.theme_name = self.config_data.get("theme", "dark")
+        if self.theme_name not in THEMES:
+            self.theme_name = "dark"
+        self.style = ttk.Style(self)
+        self._themed_widgets = []
 
         self.msg_queue = queue.Queue()
         self.worker_thread = None
@@ -39,8 +101,128 @@ class ClassifierGUI(tk.Tk):
         # leaving the label stuck on "Paused" until the next progress tick.
         self._last_progress_text = ""
 
+        self._closing = False
+        self._poll_job = None
+
         self._build_widgets()
-        self.after(100, self._poll_queue)
+        self._apply_theme()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll_job = self.after(100, self._poll_queue)
+
+    def _on_close(self):
+        """
+        Shuts the poll loop down before tearing the window down, so Tk doesn't
+        fire a queued `after` callback at a widget that no longer exists.
+        Also stops a running scan rather than leaving the worker thread
+        churning through a library after the window has gone.
+        """
+        if self.running:
+            if not messagebox.askokcancel(
+                    "Quit", "A classification is still running. Quit anyway?\n\n"
+                            "Nothing will be written for this run."):
+                return
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            if self.pause_event is not None:
+                self.pause_event.set()  # release a pause so the worker can see the cancel
+        self._closing = True
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
+        self.destroy()
+
+    # ------------------------------------------------------------------
+    # Theming
+    # ------------------------------------------------------------------
+    def _apply_theme(self):
+        """
+        Restyles every widget for the current palette.
+
+        ttk's native Windows theme ignores most colour options - it draws
+        through the OS, so setting a background on a native button does
+        nothing. 'clam' is the most colour-configurable built-in theme, so we
+        switch to it and style it by hand. That keeps this to the standard
+        library: no pip install, nothing to bundle.
+        """
+        c = THEMES[self.theme_name]
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass  # extremely old Tk - fall back to whatever's active
+
+        self.configure(bg=c["bg"])
+        s = self.style
+        s.configure(".", background=c["bg"], foreground=c["fg"],
+                    fieldbackground=c["surface"], bordercolor=c["border"],
+                    lightcolor=c["bg"], darkcolor=c["bg"], troughcolor=c["trough"],
+                    focuscolor=c["accent"], insertcolor=c["fg"])
+        s.configure("TFrame", background=c["bg"])
+        s.configure("TLabel", background=c["bg"], foreground=c["fg"])
+        s.configure("Muted.TLabel", background=c["bg"], foreground=c["muted"])
+        s.configure("TLabelframe", background=c["bg"], bordercolor=c["border"])
+        s.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
+        # Checkbox and radio indicators are drawn by a dedicated element with
+        # its own options - indicatorbackground/indicatorforeground, NOT the
+        # indicatorcolor you might expect. Getting this wrong is silent: the
+        # option is ignored and the indicators stay stock white, which on a
+        # dark background looks like a rendering bug.
+        s.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
+                    indicatorbackground=c["surface"], indicatorforeground=c["fg"],
+                    upperbordercolor=c["border"], lowerbordercolor=c["border"])
+        s.configure("TRadiobutton", background=c["bg"], foreground=c["fg"],
+                    indicatorbackground=c["surface"], indicatorforeground=c["fg"],
+                    upperbordercolor=c["border"], lowerbordercolor=c["border"])
+        s.configure("TEntry", fieldbackground=c["surface"], foreground=c["fg"],
+                    insertcolor=c["fg"], bordercolor=c["border"])
+        s.configure("TButton", background=c["surface"], foreground=c["fg"],
+                    bordercolor=c["border"], focuscolor=c["bg"])
+        s.configure("TProgressbar", background=c["accent"], troughcolor=c["trough"],
+                    bordercolor=c["border"], lightcolor=c["accent"], darkcolor=c["accent"])
+
+        # ttk state maps: without these, hover and disabled states revert to
+        # clam's stock grey and the dark theme flickers light on mouseover.
+        s.map("TButton",
+              background=[("active", c["accent"]), ("disabled", c["bg"])],
+              foreground=[("disabled", c["disabled"])])
+        s.map("TCheckbutton",
+              background=[("active", c["bg"])],
+              foreground=[("disabled", c["disabled"])],
+              indicatorbackground=[("selected", c["accent"]),
+                                    ("disabled", c["bg"]),
+                                    ("!selected", c["surface"])],
+              indicatorforeground=[("selected", c["fg"])])
+        s.map("TRadiobutton",
+              background=[("active", c["bg"])],
+              foreground=[("disabled", c["disabled"])],
+              indicatorbackground=[("selected", c["accent"]),
+                                    ("disabled", c["bg"]),
+                                    ("!selected", c["surface"])],
+              indicatorforeground=[("selected", c["fg"])])
+        # Entries are drawn by Entry.field, whose only colour knobs are
+        # fieldbackground/bordercolor/lightcolor - a plain `background` on
+        # TEntry does nothing, which is why an unstyled entry stays white.
+        s.map("TEntry",
+              fieldbackground=[("readonly", c["bg"]), ("disabled", c["bg"])],
+              lightcolor=[("focus", c["accent"])],
+              bordercolor=[("focus", c["accent"])])
+
+        # The log is a plain tk.Text, not a ttk widget, so it needs colouring
+        # directly - ttk styles don't reach it.
+        self.log_text.configure(bg=c["surface"], fg=c["fg"], insertbackground=c["fg"],
+                                selectbackground=c["accent"], selectforeground=c["fg"],
+                                highlightbackground=c["border"], highlightcolor=c["border"])
+        for w in self._themed_widgets:
+            w.configure(style="Muted.TLabel")
+        self.theme_button.config(
+            text="Light mode" if self.theme_name == "dark" else "Dark mode")
+
+    def _toggle_theme(self):
+        self.theme_name = "light" if self.theme_name == "dark" else "dark"
+        self._apply_theme()
+        self.config_data["theme"] = self.theme_name
+        save_config(self.config_data)
 
     # ------------------------------------------------------------------
     # Layout
@@ -69,7 +251,7 @@ class ClassifierGUI(tk.Tk):
                  "scanning files/ directly otherwise. No export needed either way.\n"
                  "You can also point it at a BeatmapExporter export folder if you'd rather work from that; "
                  ".osz files are read directly either way.",
-            foreground="#666666", justify="left", wraplength=680,
+            style="Muted.TLabel", justify="left", wraplength=680,
         )
         hint.pack(fill="x", padx=10, pady=(0, 8))
 
@@ -84,7 +266,7 @@ class ClassifierGUI(tk.Tk):
         ttk.Button(row0, text="Choose...", command=self._pick_export_dir).pack(side="left")
 
         ttk.Label(frame_out, text="collection.db and report.csv will be written into this folder.",
-                  foreground="#666666").pack(anchor="w", padx=10)
+                  style="Muted.TLabel").pack(anchor="w", padx=10)
 
         row1 = ttk.Frame(frame_out)
         row1.pack(fill="x", padx=10, pady=(6, 8))
@@ -106,7 +288,7 @@ class ClassifierGUI(tk.Tk):
             self.category_vars[cat] = var
         ttk.Label(frame_cat,
                   text="Uncheck what you don't want - e.g. an aim-only player could keep just Jumps checked.",
-                  foreground="#666666").pack(anchor="w", padx=10, pady=(0, 8))
+                  style="Muted.TLabel").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Ranked status handling ---
         frame_ranked = ttk.LabelFrame(self, text="4. Ranked status (osu!lazer fast path only)")
@@ -126,7 +308,7 @@ class ClassifierGUI(tk.Tk):
         ttk.Label(frame_ranked,
                   text="Ranked status is only known when scanning via osu!lazer's realm fast path. "
                        "Other scan methods (Songs folder, files/ folder, .osz) can't tell ranked from unranked.",
-                  foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+                  style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Star rating filter ---
         frame_star = ttk.LabelFrame(self, text="5. Star rating filter (osu!lazer fast path only)")
@@ -142,7 +324,7 @@ class ClassifierGUI(tk.Tk):
         ttk.Label(frame_star,
                   text="Leave blank for no limit. Decimals OK (e.g. Max Star: 6.5). Same lazer-only "
                        "availability as ranked status - a filter here matches nothing on other scan methods.",
-                  foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+                  style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Mods ---
         frame_mods = ttk.LabelFrame(self, text="6. Classify as if these mods were active")
@@ -163,7 +345,7 @@ class ClassifierGUI(tk.Tk):
                        "count as streams, HR shrinks circles so the same spacing reads as wider. "
                        "(HR's vertical flip doesn't matter here: flipping every object preserves the "
                        "distance between them.)",
-                  foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+                  style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Advanced thresholds (collapsible-ish via a simple frame) ---
         frame_adv = ttk.LabelFrame(self, text="7. Thresholds (defaults match osu!'s official tag definitions)")
@@ -213,6 +395,8 @@ class ClassifierGUI(tk.Tk):
         self.progress.pack(side="left", fill="x", expand=True, padx=10)
         self.progress_label = ttk.Label(frame_run, text="")
         self.progress_label.pack(side="left")
+        self.theme_button = ttk.Button(frame_run, text="Light mode", command=self._toggle_theme)
+        self.theme_button.pack(side="left", padx=(10, 0))
 
         # --- Log ---
         frame_log = ttk.LabelFrame(self, text="Log")
@@ -378,6 +562,8 @@ class ClassifierGUI(tk.Tk):
             self.msg_queue.put(("error", traceback.format_exc()))
 
     def _poll_queue(self):
+        if self._closing:
+            return
         try:
             while True:
                 item = self.msg_queue.get_nowait()
@@ -421,7 +607,8 @@ class ClassifierGUI(tk.Tk):
                     self.running = False
         except queue.Empty:
             pass
-        self.after(100, self._poll_queue)
+        if not self._closing:
+            self._poll_job = self.after(100, self._poll_queue)
 
 
 def main():

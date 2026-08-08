@@ -1,4 +1,4 @@
-name: Build standalone executables
+name: Build standalone executable
 
 on:
   push:
@@ -7,26 +7,22 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  test:
+    # Runs on every build. The classifier is a pile of tuned heuristics, so a
+    # refactor that quietly breaks one is entirely possible - catching that
+    # before a release goes out is the whole point.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run classifier tests
+        run: python test_classify.py
+
   build:
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            build_name: osu-beatmap-categorizer
-            exe_suffix: ".exe"
-            zip_name: osu-beatmap-categorizer-windows.zip
-            dotnet_rid: win-x64
-          - os: macos-latest
-            build_name: osu-beatmap-categorizer
-            exe_suffix: ""
-            zip_name: osu-beatmap-categorizer-macos.zip
-            dotnet_rid: osx-x64
-          - os: ubuntu-latest
-            build_name: osu-beatmap-categorizer
-            exe_suffix: ""
-            zip_name: osu-beatmap-categorizer-linux.zip
-            dotnet_rid: linux-x64
-    runs-on: ${{ matrix.os }}
+    needs: test
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -41,31 +37,50 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
-      - name: Install tkinter (Linux only)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y python3-tk
-
       - name: Build main GUI executable
-        run: pyinstaller --onefile --windowed --name ${{ matrix.build_name }} gui.py
+        run: pyinstaller --onefile --windowed --name osu-beatmap-categorizer gui.py
 
       - name: Build realm-reader helper
-        # Not required for the tool to work - if this step fails or is
-        # skipped, classify_maps.py falls back to its filesystem scan.
+        # The tool still works without this - classify_maps.py falls back to a
+        # filesystem scan - so a failure here shouldn't sink the whole build.
+        # But a release that silently ships without it looks exactly like the
+        # helper being broken, so the check below turns that into a hard
+        # failure for tagged builds specifically.
         continue-on-error: true
         run: >
           dotnet publish realm-reader/RealmReader.csproj -c Release
-          -r ${{ matrix.dotnet_rid }} --self-contained true
+          -r win-x64 --self-contained true
           -o realm-reader-dist
 
       - name: Assemble release folder
         shell: bash
         run: |
           mkdir -p release
-          cp dist/${{ matrix.build_name }}${{ matrix.exe_suffix }} release/
-          if [ -f realm-reader-dist/realm-reader${{ matrix.exe_suffix }} ]; then
-            cp -r realm-reader-dist/. release/
-          fi
+          cp dist/osu-beatmap-categorizer.exe release/
           cp README.md release/ || true
+          # The self-contained .NET publish is ~190 files and ~76MB of runtime
+          # DLLs. Dumping those next to the GUI exe makes the folder unusable -
+          # you can't find the thing you're meant to double-click. They go in a
+          # subfolder instead, which default_realm_reader_path() already looks
+          # in, so this needs no code change.
+          if [ -f realm-reader-dist/realm-reader.exe ]; then
+            mkdir -p release/realm-reader
+            cp -r realm-reader-dist/. release/realm-reader/
+            echo "helper bundled: $(ls release/realm-reader | wc -l) files"
+          else
+            echo "::warning::realm-reader helper missing - the app will fall back to the slower filesystem scan"
+          fi
+
+      - name: Require the helper for tagged releases
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          if [ ! -f release/realm-reader/realm-reader.exe ]; then
+            echo "::error::realm-reader.exe is missing. A release without it is a huge silent" \
+                 "downgrade for lazer users (minutes-long filesystem scan instead of seconds)." \
+                 "Fix the publish step rather than shipping this."
+            exit 1
+          fi
 
       - name: Upload artifact
         # actions/upload-artifact zips whatever path is given when you
@@ -74,22 +89,16 @@ jobs:
         # get a single zip on download, not a zip-inside-a-zip.
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.zip_name }}
+          name: osu-beatmap-categorizer-windows
           path: release/
 
       - name: Zip release folder for GitHub Release attachment
         if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          cd release
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            powershell -Command "Compress-Archive -Path * -DestinationPath ../${{ matrix.zip_name }}"
-          else
-            zip -r ../${{ matrix.zip_name }} .
-          fi
+        shell: pwsh
+        run: Compress-Archive -Path release/* -DestinationPath osu-beatmap-categorizer-windows.zip
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.zip_name }}
+          files: osu-beatmap-categorizer-windows.zip
