@@ -30,6 +30,8 @@ back to a much slower method.
 > take my word for it, the source is right here and you can run it with
 > `python gui.py` instead.
 
+##
+
 ## Quick start
 
 1. Point it at your beatmap folder:
@@ -115,6 +117,8 @@ build it you need the .NET 8 SDK:
 ```
 dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader
 ```
+
+##
 
 ## Credits
 
