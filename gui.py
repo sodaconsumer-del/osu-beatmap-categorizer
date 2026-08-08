@@ -144,8 +144,29 @@ class ClassifierGUI(tk.Tk):
                        "availability as ranked status - a filter here matches nothing on other scan methods.",
                   foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
+        # --- Mods ---
+        frame_mods = ttk.LabelFrame(self, text="6. Classify as if these mods were active")
+        frame_mods.pack(fill="x", **pad)
+        row_mods = ttk.Frame(frame_mods)
+        row_mods.pack(fill="x", padx=10, pady=8)
+        self.mod_vars = {}
+        for acronym, label in [("DT", "Double Time (1.5x speed)"),
+                                ("HR", "Hard Rock (CS x1.3)"),
+                                ("HT", "Half Time (0.75x speed)"),
+                                ("EZ", "Easy (CS / 2)")]:
+            var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(row_mods, text=label, variable=var).pack(side="left", padx=(0, 16))
+            self.mod_vars[acronym] = var
+        ttk.Label(frame_mods,
+                  text="Leave all unchecked for NM (no mods), which is the baseline. Only speed and "
+                       "circle size change what a pattern is - DT makes slower rhythms fast enough to "
+                       "count as streams, HR shrinks circles so the same spacing reads as wider. "
+                       "(HR's vertical flip doesn't matter here: flipping every object preserves the "
+                       "distance between them.)",
+                  foreground="#666666", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
         # --- Advanced thresholds (collapsible-ish via a simple frame) ---
-        frame_adv = ttk.LabelFrame(self, text="6. Thresholds (defaults match osu!'s official tag definitions)")
+        frame_adv = ttk.LabelFrame(self, text="7. Thresholds (defaults match osu!'s official tag definitions)")
         frame_adv.pack(fill="x", **pad)
 
         self.param_vars = {}
@@ -153,14 +174,18 @@ class ClassifierGUI(tk.Tk):
         params_grid.pack(fill="x", padx=10, pady=8)
 
         fields = [
+            ("max_gap_ms", "Max ms between notes", cm.DEFAULT_PARAMS["max_gap_ms"]),
+            ("gap_consistency_tol", "Gap consistency tol.", cm.DEFAULT_PARAMS["gap_consistency_tol"]),
             ("burst_min", "Burst min notes", cm.DEFAULT_PARAMS["burst_min"]),
             ("burst_max", "Burst max notes", cm.DEFAULT_PARAMS["burst_max"]),
             ("stream_min", "Stream min notes", cm.DEFAULT_PARAMS["stream_min"]),
-            ("snap_ratio", "Snap speed ratio", cm.DEFAULT_PARAMS["snap_ratio"]),
+            ("cut_max_multiple", "Max cut gap multiple", cm.DEFAULT_PARAMS["cut_max_multiple"]),
             ("tight_diam_ratio", "Tight spacing ratio", cm.DEFAULT_PARAMS["tight_diam_ratio"]),
             ("spaced_diam_ratio", "Spaced stream ratio", cm.DEFAULT_PARAMS["spaced_diam_ratio"]),
-            ("jump_velocity_ratio", "Jump velocity ratio", cm.DEFAULT_PARAMS["jump_velocity_ratio"]),
+            ("jump_velocity_ratio", "Jump vel. (diam/100ms)", cm.DEFAULT_PARAMS["jump_velocity_ratio"]),
             ("jump_pct_threshold", "Jump %% threshold", cm.DEFAULT_PARAMS["jump_pct_threshold"]),
+            ("jump_min_transitions", "Min notes for jump calc", cm.DEFAULT_PARAMS["jump_min_transitions"]),
+            ("jump_gap_cap_ms", "Break cutoff (ms)", cm.DEFAULT_PARAMS["jump_gap_cap_ms"]),
             ("run_wide_fraction_max", "Max wide fraction in run", cm.DEFAULT_PARAMS["run_wide_fraction_max"]),
             ("mean_diam_ratio_max", "Max avg spacing ratio", cm.DEFAULT_PARAMS["mean_diam_ratio_max"]),
         ]
@@ -238,11 +263,13 @@ class ClassifierGUI(tk.Tk):
             return
 
         try:
-            params = {key: (int(var.get()) if key in ("burst_min", "burst_max", "stream_min")
-                             else float(var.get())) for key, var in self.param_vars.items()}
+            params = {key: (int(var.get()) if key in cm.INT_PARAMS else float(var.get()))
+                      for key, var in self.param_vars.items()}
         except ValueError:
             messagebox.showerror("Invalid threshold", "Threshold fields must be numbers.")
             return
+
+        mods = [acronym for acronym, var in self.mod_vars.items() if var.get()] or None
 
         export_dir = self.export_dir_var.get().strip()
         if not export_dir:
@@ -294,7 +321,7 @@ class ClassifierGUI(tk.Tk):
         self.worker_thread = threading.Thread(
             target=self._worker,
             args=(folder, output, csv_path, params, self.cancel_event, self.pause_event,
-                  include_categories, ranked_mode, min_star, max_star),
+                  include_categories, ranked_mode, min_star, max_star, mods),
             daemon=True,
         )
         self.worker_thread.start()
@@ -330,7 +357,7 @@ class ClassifierGUI(tk.Tk):
             self._log("Resumed.")
 
     def _worker(self, folder, output, csv_path, params, cancel_event, pause_event,
-                include_categories, ranked_mode, min_star, max_star):
+                include_categories, ranked_mode, min_star, max_star, mods):
         def progress_cb(done, total):
             self.msg_queue.put(("progress", done, total))
 
@@ -342,7 +369,7 @@ class ClassifierGUI(tk.Tk):
                 folder, output=output, csv_path=csv_path, write_db=output is not None,
                 params=params, progress_cb=progress_cb, log_cb=log_cb, cancel_event=cancel_event,
                 pause_event=pause_event, include_categories=include_categories, ranked_mode=ranked_mode,
-                min_star=min_star, max_star=max_star,
+                min_star=min_star, max_star=max_star, mods=mods,
             )
             self.msg_queue.put(("done", result))
         except cm.ScanCancelled:
