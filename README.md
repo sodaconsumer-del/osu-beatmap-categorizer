@@ -10,6 +10,8 @@ This tool was built largely with AI assistance (code generation, debugging, etc.
 
 If you wish to contact me, you can find me on osu! [-soda-](https://osu.ppy.sh/users/17477549) Or if you want to message me on discord, my username is plaaanet.
 
+##
+
 ## Quick start
 
 1. Point it at your beatmap folder:
@@ -21,6 +23,8 @@ If you wish to contact me, you can find me on osu! [-soda-](https://osu.ppy.sh/u
 3. Hit **Run classification**.
 
 4. Check `report.csv` before trusting the result, then **back up your existing `collection.db`** before replacing it. ( or import via [CollectionManager](https://github.com/Piotrekol/CollectionManager) instead of copying the file directly.)
+
+##
 
 ## Categories
 
@@ -44,9 +48,13 @@ A run also has to be **rhythmically consistent**: a real stream doesn't change t
 
 Spacing is measured from each object's **end** position. Sliders are around 30% of a typical library, and measuring from the head makes a long slider whose tail sits beside the next note read as a full-screen jump. Spinners are skipped — their stored position is a placeholder, not where you actually move.
 
+##
+
 ### Mods
 
 `--mods DT`, `--mods HR`, or any combination (checkboxes in the GUI). NM is the baseline. Only two things a mod does can change what a pattern *is*: rate (DT/NC/HT/DC) and circle size (HR/EZ). HR's vertical flip is ignored on purpose — reflecting every object preserves the distances between them.
+
+##
 
 ## Accuracy
 
@@ -65,6 +73,8 @@ python eval_classifier.py --csv report.csv --labels labels.csv
 
 That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. You'll need a free osu! OAuth app for the tag fetch, and `online_id` is only populated on the lazer realm fast path.
 
+##
+
 ## Credits
 
 - [Piotrekol's CollectionManager](https://github.com/Piotrekol/CollectionManager) — `collection.db` format reference, and the approach of reading `client.realm` directly
@@ -76,6 +86,8 @@ That prints per-category precision/recall and a confusion matrix. Add `--baselin
 - [Realm .NET SDK](https://github.com/realm/realm-dotnet) — powers the `realm-reader` fast path
 
 - [osu!'s official beatmap tags](https://osu.ppy.sh/wiki/en/Beatmap/Beatmap_tags) — reference for what counts as a burst/stream/jump
+
+##
 
 Not affiliated with or endorsed by ppy or the osu! team.
 
