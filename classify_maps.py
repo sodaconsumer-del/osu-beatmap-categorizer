@@ -14,19 +14,37 @@ Usage:
     python classify_maps.py "C:/path/to/Songs" --no-db
 
 Categories (default thresholds, all tunable via CLI flags):
-    - streams        : contains a run of 8+ consecutive stream-snapped, closely-spaced notes
-    - bursts_only     : contains 3-7 note bursts but no full streams
-    - jumps_only      : has jump content but no bursts/streams at all
-    - plain           : none of the above (low density / normal play)
+    - Streams            : contains a run of 10+ fast, consistently-timed,
+                            closely-spaced notes (cutstreams count too)
+    - Bursts             : contains 3-9 note bursts but no full streams
+    - Jumps with bursts  : has both, but jumps cover more of the map
+    - Jumps (no bursts)  : jump-heavy, no bursts or streams at all
+    - Misc               : none of the above (low density / normal play)
 
 A note-to-note transition only counts toward a burst/stream run if BOTH:
-    1. It's fast relative to the map's current BPM (<= snap_ratio * beat length)
-    2. It's spatially close (<= jump_diam_ratio * circle diameter)
-Fast-but-far transitions are jumps, not bursts, regardless of how tight the
-timing is (e.g. 1/4-snap jump streams at high BPM are NOT bursts).
+    1. It's fast in ABSOLUTE terms (<= max_gap_ms between taps). Speed is
+       deliberately not judged as a ratio to the map's stored BPM, because
+       plenty of maps store a doubled tempo. Stream BPM = 15000 / ms.
+    2. It's rhythmically consistent with the rest of the run - a real stream
+       doesn't change tapping speed halfway through.
+Spacing then decides what KIND of run it is. Fast-but-far transitions are
+jumps, not bursts, regardless of how tight the timing is (e.g. 1/4-snap jump
+streams at high BPM are NOT bursts).
+
+Spacing is measured from the previous object's END, so a long slider whose
+tail sits next to the following note isn't mistaken for a full-screen jump.
+
+Pass --mods DT / --mods HR,DT to classify as if those mods were active. NM
+is the baseline.
+
+Accuracy is measurable rather than a matter of taste - see fetch_osu_tags.py
+(builds ground truth from osu!'s own community beatmap tags) and
+eval_classifier.py (scores a report.csv against it). Run test_classify.py for
+the synthetic unit tests.
 """
 
 import argparse
+import bisect
 import hashlib
 import os
 import re
@@ -45,10 +63,16 @@ class DiffInfo:
     title: str
     diff_name: str
     version_hash: str  # MD5 of raw file content, as used by osu!'s own db
-    objs: list          # (time_ms, x, y)
+    # (start_ms, end_ms, start_x, start_y, end_x, end_y) per hit object.
+    # For circles start == end in both time and position. For sliders, end_ms
+    # is when the slider finishes and (end_x, end_y) is where the cursor is
+    # left - see _slider_end(). Spinners are dropped at parse time.
+    objs: list
     timing_points: list  # (time, beatLength) uninherited only
+    sv_points: list      # (time, slider velocity multiplier) from inherited points
     circle_size: float
     bpm: float
+    slider_multiplier: float = 1.4
 
     burst_count: int = 0
     stream_count: int = 0
@@ -84,6 +108,12 @@ class DiffInfo:
     # data came from a cached value already stored in client.realm.
     star_rating: object = None
 
+    # osu! online beatmap ID (int), or None if unknown. Same lazer-realm-only
+    # availability as the two above. Carried through to the CSV so predictions
+    # can be joined against ground-truth labels fetched from the osu! API -
+    # see fetch_osu_tags.py / eval_classifier.py.
+    online_id: object = None
+
 
 def parse_osu_file(path):
     with open(path, "rb") as f:
@@ -99,6 +129,7 @@ def parse_osu_bytes(raw, display_name, path=None):
     diff_m = re.search(r"^Version:(.*)$", text, re.M)
     cs_m = re.search(r"^CircleSize:(.*)$", text, re.M)
     mode_m = re.search(r"^Mode:(.*)$", text, re.M)
+    sm_m = re.search(r"^SliderMultiplier:(.*)$", text, re.M)
 
     mode = int(mode_m.group(1).strip()) if mode_m else 0
     if mode != 0:
@@ -107,9 +138,21 @@ def parse_osu_bytes(raw, display_name, path=None):
     title = title_m.group(1).strip() if title_m else display_name
     diff_name = diff_m.group(1).strip() if diff_m else "?"
     cs = float(cs_m.group(1).strip()) if cs_m else 4.0
+    try:
+        slider_multiplier = float(sm_m.group(1).strip()) if sm_m else 1.4
+    except ValueError:
+        slider_multiplier = 1.4
+    if slider_multiplier <= 0:
+        slider_multiplier = 1.4
 
+    # Two kinds of timing point, distinguished by the sign of beatLength:
+    #   positive -> uninherited, sets the actual tempo
+    #   negative -> inherited, sets slider velocity as -100/beatLength
+    # Slider velocity is needed to work out how long a slider lasts, which
+    # feeds the movement-time term of the jump metric.
     tp_section = re.search(r"\[TimingPoints\](.*?)(\[|$)", text, re.S)
     timing_points = []
+    sv_points = []
     if tp_section:
         for line in tp_section.group(1).splitlines():
             line = line.strip()
@@ -126,7 +169,10 @@ def parse_osu_bytes(raw, display_name, path=None):
             uninherited = parts[6] if len(parts) > 6 else "1"
             if bl > 0 and (uninherited == "1" or len(parts) <= 6):
                 timing_points.append((t, bl))
+            elif bl < 0:
+                sv_points.append((t, -100.0 / bl))
     timing_points.sort()
+    sv_points.sort()
 
     ho_section = re.search(r"\[HitObjects\](.*?)(\[|$)", text, re.S)
     objs = []
@@ -136,15 +182,33 @@ def parse_osu_bytes(raw, display_name, path=None):
             if not line:
                 continue
             parts = line.split(",")
-            if len(parts) < 3:
+            if len(parts) < 4:
                 continue
             try:
                 x = float(parts[0])
                 y = float(parts[1])
                 t = int(parts[2])
+                obj_type = int(parts[3])
             except ValueError:
                 continue
-            objs.append((t, x, y))
+
+            # Type is a bit field: 1=circle, 2=slider, 8=spinner (bit 2 is
+            # new-combo and bits 4-6 are combo-colour skip, so these must be
+            # tested as flags, not compared for equality).
+            if obj_type & 8:
+                # Spinners carry a placeholder position (almost always the
+                # playfield centre) that has nothing to do with where the
+                # cursor actually goes. Including them invents a jump into
+                # and out of the centre of the screen - and 56% of the
+                # difficulties in a sample of this library contain at least
+                # one - so they're dropped rather than mismeasured.
+                continue
+            if obj_type & 2:
+                end_t, ex, ey = _slider_end(parts, t, x, y, timing_points,
+                                             sv_points, slider_multiplier)
+            else:
+                end_t, ex, ey = float(t), x, y
+            objs.append((float(t), end_t, x, y, ex, ey))
     objs.sort(key=lambda o: o[0])
 
     bpm = 60000.0 / timing_points[0][1] if timing_points else 0.0
@@ -156,33 +220,177 @@ def parse_osu_bytes(raw, display_name, path=None):
         version_hash=md5,
         objs=objs,
         timing_points=timing_points,
+        sv_points=sv_points,
         circle_size=cs,
         bpm=bpm,
+        slider_multiplier=slider_multiplier,
     )
 
 
 def _beat_length_at(t, timing_points):
-    bl = timing_points[0][1] if timing_points else 500.0
-    for tp_t, tp_bl in timing_points:
-        if tp_t <= t + 2:
-            bl = tp_bl
-        else:
-            break
-    return bl
+    """
+    Beat length in ms at time t. Binary search rather than a linear rescan:
+    this is called once per note transition, so a linear scan made the whole
+    classify pass O(notes x timing_points) - noticeable on maps that carry
+    hundreds of timing points.
+
+    Comparing against (t + 2, inf) picks the last point at or before t (with
+    the same 2ms grace the linear version used, for notes sitting exactly on
+    a timing point but rounded a hair early).
+    """
+    if not timing_points:
+        return 500.0
+    i = bisect.bisect_right(timing_points, (t + 2, float("inf"))) - 1
+    return timing_points[i][1] if i >= 0 else timing_points[0][1]
+
+
+def _sv_at(t, sv_points):
+    """Slider velocity multiplier at time t. Defaults to 1.0 before the first
+    inherited point, matching osu!'s behaviour."""
+    if not sv_points:
+        return 1.0
+    i = bisect.bisect_right(sv_points, (t + 2, float("inf"))) - 1
+    return sv_points[i][1] if i >= 0 else 1.0
+
+
+def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
+    """
+    Works out when a slider finishes and roughly where it leaves the cursor.
+
+    Line format is:
+        x,y,time,type,hitSound,curve,slides,length,...
+    so parts[5] is the curve, parts[6] the number of slides (1 = no repeat)
+    and parts[7] the path length in osu!pixels.
+
+    Duration is exact, straight from osu!'s own formula. The end POSITION is
+    an approximation: the true path is a bezier/perfect-circle/catmull curve,
+    and computing it properly means reimplementing osu!'s path generator. We
+    instead walk `length` pixels along the polyline through the control
+    points, which is exact for linear sliders and close for the gentle curves
+    that make up most real maps. It over-runs slightly on tightly-curved
+    sliders (a chord is shorter than its arc), in which case it clamps to the
+    last control point.
+
+    This only feeds spacing, and even a rough tail position is far better
+    than the alternative of using the head - a long slider whose tail sits
+    next to the following note otherwise reads as a huge jump.
+    """
+    try:
+        slides = int(parts[6])
+        length = float(parts[7])
+    except (ValueError, IndexError):
+        return float(t), x, y
+    if slides < 1:
+        slides = 1
+    if length < 0:
+        length = 0.0
+
+    bl = _beat_length_at(t, timing_points)
+    sv = _sv_at(t, sv_points)
+    px_per_beat = 100.0 * slider_multiplier * sv
+    if px_per_beat <= 0:
+        return float(t), x, y
+    duration = (length / px_per_beat) * bl * slides
+    end_t = float(t) + duration
+
+    # An even number of slides lands the cursor back where it started.
+    if slides % 2 == 0:
+        return end_t, x, y
+
+    curve = parts[5] if len(parts) > 5 else ""
+    ex, ey = _point_along_polyline(curve, x, y, length)
+    return end_t, ex, ey
+
+
+def _point_along_polyline(curve, x0, y0, length):
+    """Walk `length` pixels from (x0, y0) along the slider's control points."""
+    pts = [(x0, y0)]
+    for token in curve.split("|")[1:]:  # first token is the curve type letter
+        bits = token.split(":")
+        if len(bits) != 2:
+            continue
+        try:
+            pts.append((float(bits[0]), float(bits[1])))
+        except ValueError:
+            continue
+    if len(pts) < 2:
+        return x0, y0
+
+    remaining = length
+    for i in range(1, len(pts)):
+        ax, ay = pts[i - 1]
+        bx, by = pts[i]
+        seg = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+        if seg <= 0:
+            continue
+        if remaining <= seg:
+            f = remaining / seg
+            return ax + (bx - ax) * f, ay + (by - ay) * f
+        remaining -= seg
+    return pts[-1]
+
+
+# --------------------------------------------------------------------------
+# Mods
+# --------------------------------------------------------------------------
+
+# Rate-changing mods, from osu!'s ModRateAdjust subclasses. DT/NC default to
+# SpeedChange 1.5, HT/DC to 0.75. These scale every time value in the map, so
+# they matter a great deal once speed is judged in absolute milliseconds: a
+# 150ms 1/2 rhythm becomes a 100ms one under DT, which really is stream speed.
+_MOD_RATES = {"DT": 1.5, "NC": 1.5, "HT": 0.75, "DC": 0.75}
+
+
+def mod_adjustments(mods, circle_size):
+    """
+    Returns (rate, effective_circle_size) for a set of mod acronyms.
+
+    Only two things a mod does can change how a map is classified here:
+
+      - rate, which scales all timing (DT/NC/HT/DC)
+      - circle size, which scales the diameter that all spacing is measured
+        against. HR is CS * 1.3 capped at 10, EZ is CS / 2.
+
+    Deliberately ignored: HR's ReflectVerticallyAlongPlayfield. Reflecting
+    every object across one axis is an isometry, so it leaves every
+    pairwise distance - and therefore every spacing decision made below -
+    exactly as it was. HR's OD/AR changes affect hit windows and approach
+    time, neither of which is a pattern property.
+
+    NM (no mods) is the baseline and returns (1.0, circle_size) unchanged.
+    """
+    rate = 1.0
+    cs = circle_size
+    for m in (mods or []):
+        m = m.strip().upper()
+        if not m or m == "NM":
+            continue
+        if m in _MOD_RATES:
+            rate *= _MOD_RATES[m]
+        elif m == "HR":
+            cs = min(cs * 1.3, 10.0)
+        elif m == "EZ":
+            cs = cs / 2.0
+    return rate, cs
 
 
 # --------------------------------------------------------------------------
 # Classification
 # --------------------------------------------------------------------------
 
-def classify_diff(diff: DiffInfo, snap_ratio=0.55,
+def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    tight_diam_ratio=1.35, spaced_diam_ratio=2.0,
-                   burst_min=5, burst_max=9, stream_min=10,
-                   jump_velocity_ratio=2.2, jump_pct_threshold=15.0,
-                   run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5):
+                   burst_min=3, burst_max=9, stream_min=10,
+                   jump_velocity_ratio=0.75, jump_pct_threshold=15.0,
+                   jump_min_transitions=40, jump_gap_cap_ms=1000.0,
+                   run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
+                   cut_max_multiple=3.0, mods=None):
     """
     Terminology (matching osu!'s official beatmap tags):
-      - burst  : 5-9 note run
+      - burst  : 3-9 note run. Three notes really is enough - short 3-note
+        bursts are everywhere in jump, aim-control and flow-aim maps, and
+        calling those "not a burst" because they're under five doesn't match
+        how the pattern is actually talked about.
       - stream : 10+ note run
       - spaced stream : a stream where notes don't overlap but spacing/rhythm
         stays consistent - still a stream, not a jump.
@@ -193,18 +401,30 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
         any snap speed and can co-occur with bursts/streams (jump bursts,
         spaced streams, etc). It is NOT mutually exclusive with bursts/streams.
 
-    A note-to-note transition only joins a burst/stream run if it's fast
-    (<= snap_ratio * local beat length). snap_ratio defaults to 0.55 rather
-    than a tighter ~0.3 (which would only catch 1/4-snap-or-faster) because
-    some mappers author extreme stream/finger-control maps with the file's
-    stored BPM deliberately doubled from the song's true felt tempo (for
-    finer editor snap precision) - in that case, a real 1/4-snap-of-true-
-    tempo stream note lands at exactly 1/2-snap of the doubled, stored
-    tempo (confirmed against real "doubled BPM" stream maps: consistent
-    gap/beatLength ~0.499 throughout their stream sections). A tighter
-    cutoff misses these runs entirely before spacing is even considered;
-    run-length filtering (burst_min/stream_min) guards against stray,
-    non-stream 1/2-snap taps in normal gameplay turning into false positives.
+    SPEED IS JUDGED IN ABSOLUTE MILLISECONDS, not as a ratio to the map's
+    stored BPM. This replaces an earlier snap_ratio test and is the single
+    biggest accuracy change in here.
+
+    The old test accepted any gap <= 0.55 beats, loosened from ~0.3 to cope
+    with maps authored at deliberately doubled BPM (where a true 1/4 stream
+    note sits at 1/2 of the stored tempo). Measured over a 400-difficulty
+    sample of a real library, that cutoff was letting through 48% of its
+    transitions at 1/2 snap, with a clear second population at 150-174ms per
+    note - which is a ~90-100 BPM stream, i.e. ordinary 1/2 tapping, not a
+    stream at all. Doubled-BPM maps are a niche; they were not half the
+    library.
+
+    Working in milliseconds sidesteps the whole problem, because it never
+    consults the stored tempo. Stream BPM is just 15000 / ms_per_note, so
+    max_gap_ms = 140 is "roughly a 107 BPM stream or faster".
+
+    The second gate is CONSISTENCY: every gap in a run must stay within
+    gap_consistency_tol of the run's running mean. A real stream does not
+    change tapping speed halfway through, but 39% of runs under the old
+    consecutive-fast-transitions rule mixed 1/4 and 1/2 gaps internally.
+    Requiring consistency is what makes it safe to keep the speed cutoff
+    generous - the two gates together reject far more junk than either alone,
+    so neither has to be strict enough to start eating true positives.
 
     Runs are built purely from TIMING (is this still being consecutively
     tapped fast?). Spacing is then used to judge what KIND of run it is,
@@ -218,75 +438,144 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
     A run is only discarded as "actually a jump run" if too much of it is
     jump-wide - spaced (but not jump-wide) transitions are treated as normal
     stream/burst content.
+
+    SPACING IS MEASURED FROM THE PREVIOUS OBJECT'S END, not its start. For
+    circles those are the same point, but sliders are ~30% of a typical
+    library, and a long slider whose tail sits right next to the following
+    note otherwise reads as a full-screen jump. See _slider_end().
+
+    CUT RUNS ARE REJOINED before lengths are judged - see below. A stream
+    interrupted by a skipped beat is still a stream, which is what the
+    "cutstreams count as streams" rule is supposed to mean.
+
+    mods, if given, is a list of acronyms like ["DT"] or ["HR", "DT"]. NM is
+    the baseline; see mod_adjustments().
     """
     objs = diff.objs
     if len(objs) < burst_min:
         return diff
 
-    radius = 54.4 - 4.48 * diff.circle_size
-    diam = radius * 2
+    rate, eff_cs = mod_adjustments(mods, diff.circle_size)
+    radius = 54.4 - 4.48 * eff_cs
+    diam = max(radius * 2, 1.0)
 
-    # Build (is_fast, is_jump_wide) per transition, and independently track
-    # jump "velocity" (distance normalized by both circle size and time)
-    # for the overall jump density metric.
+    # Per transition, three quantities:
+    #   tap_gap   - start-to-start, i.e. the interval between taps. This is
+    #               the rhythm, and it already accounts for slider duration
+    #               because a slider's stored time is its head.
+    #   move_time - previous object's END to this object's start, i.e. how
+    #               long the cursor actually has to travel. Only differs from
+    #               tap_gap on sliders, and it's the honest denominator for a
+    #               velocity metric.
+    #   dist      - previous object's END position to this object's start.
     transitions = []
-    jump_count = 0
-    total_gaps = 0
     for i in range(1, len(objs)):
-        t0, x0, y0 = objs[i - 1]
-        t1, x1, y1 = objs[i]
-        gap = t1 - t0
-        dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-        bl = _beat_length_at(t1, diff.timing_points)
-        thresh = bl * snap_ratio
+        p = objs[i - 1]
+        c = objs[i]
+        tap_gap = (c[0] - p[0]) / rate
+        move_time = max((c[0] - p[1]) / rate, 1.0)
+        dist = ((c[2] - p[4]) ** 2 + (c[3] - p[5]) ** 2) ** 0.5
+        transitions.append((tap_gap, move_time, dist))
 
-        total_gaps += 1
-        is_fast = gap <= thresh
-        # Only genuinely far spacing (beyond the "spaced stream" tier)
-        # counts against a run - non-overlapping-but-readable spacing is
-        # normal stream/burst/finger-control content, not a jump.
-        is_jump_wide = dist > diam * spaced_diam_ratio
-        # Tight = stacked/near-overlapping. Used to detect cutstreams: a
-        # stream where most notes are tight but a minority are noticeably
-        # wider (but still under the jump-wide cutoff) - matching osu!'s own
-        # "cutstreams" tag definition.
-        is_tight = dist <= diam * tight_diam_ratio
-
+    # --- jump density ------------------------------------------------------
+    # Velocity is in diameters per 100ms. That unit is BPM-independent, which
+    # is the whole point; note it is NOT the old diameters-per-beat, so the
+    # default threshold was re-derived rather than carried over.
+    jump_count = 0
+    counted_gaps = 0
+    for tap_gap, move_time, dist in transitions:
+        # Gaps longer than the cap are breaks and section boundaries, not
+        # gameplay. Leaving them in the denominator quietly diluted dense
+        # maps and inflated sparse ones.
+        if tap_gap > jump_gap_cap_ms:
+            continue
+        counted_gaps += 1
         norm_dist = dist / diam
-        norm_time = max(gap / bl, 0.05)
-        # Require BOTH genuinely far spacing (is_jump_wide) AND a high
-        # distance/time ratio. Velocity alone isn't enough: a legitimate
-        # tight stream has a tiny time-per-note by definition, which
-        # inflates distance/time even when the actual spacing is small -
-        # that was causing real streams to get flagged as mostly jumps.
-        if is_jump_wide and (norm_dist / norm_time) > jump_velocity_ratio:
+        # Require BOTH genuinely far spacing AND a high distance/time ratio.
+        # Velocity alone isn't enough: a legitimate tight stream has a tiny
+        # time-per-note by definition, which inflates distance/time even when
+        # the actual spacing is small - that was causing real streams to get
+        # flagged as mostly jumps.
+        if dist > diam * spaced_diam_ratio and (norm_dist / (move_time / 100.0)) > jump_velocity_ratio:
             jump_count += 1
 
-        transitions.append((is_fast, is_jump_wide, is_tight, norm_dist))
-
-    # Group consecutive fast transitions into runs (timing-only)
-    runs = []  # list of list[(is_jump_wide, is_tight, norm_dist)]
+    # --- run building: fast AND rhythmically consistent ---------------------
+    raw_runs = []
     cur = []
-    for is_fast, is_jump_wide, is_tight, norm_dist in transitions:
-        if is_fast:
-            cur.append((is_jump_wide, is_tight, norm_dist))
-        else:
+    cur_sum = 0.0
+    for idx, (tap_gap, _, _) in enumerate(transitions):
+        if tap_gap > max_gap_ms:
             if cur:
-                runs.append(cur)
-            cur = []
+                raw_runs.append(cur)
+            cur, cur_sum = [], 0.0
+            continue
+        if not cur:
+            cur, cur_sum = [idx], tap_gap
+            continue
+        ref = cur_sum / len(cur)
+        if ref > 0 and abs(tap_gap - ref) / ref > gap_consistency_tol:
+            # Speed changed mid-run: close it here and start a new one.
+            raw_runs.append(cur)
+            cur, cur_sum = [idx], tap_gap
+        else:
+            cur.append(idx)
+            cur_sum += tap_gap
     if cur:
-        runs.append(cur)
+        raw_runs.append(cur)
+
+    def mean_gap(indices):
+        return sum(transitions[j][0] for j in indices) / len(indices) if indices else 0.0
+
+    # --- rejoin cut runs ---------------------------------------------------
+    # A stream broken by a skipped beat arrives here as two separate runs
+    # with one over-long transition between them. If that transition is a
+    # whole-number multiple of the note gap (2x, 3x - i.e. notes are missing
+    # from an otherwise steady rhythm) and both sides are at the same speed,
+    # it's one cut stream rather than two bursts. Without this, a 12-note
+    # stream with a single gap in the middle came out as two 6-note bursts
+    # and got filed under Bursts.
+    merged_runs = []  # (all_transition_indices, set_of_cut_indices)
+    i = 0
+    while i < len(raw_runs):
+        run = list(raw_runs[i])
+        cuts = set()
+        while i + 1 < len(raw_runs):
+            nxt = raw_runs[i + 1]
+            between = nxt[0] - 1
+            if between != run[-1] + 1:
+                break
+            note_gap = mean_gap(run)
+            if note_gap <= 0:
+                break
+            mult = transitions[between][0] / note_gap
+            if not (2 <= round(mult) <= cut_max_multiple):
+                break
+            if abs(mult - round(mult)) > gap_consistency_tol:
+                break  # not a clean skipped-note gap, just a pause
+            if abs(mean_gap(nxt) - note_gap) / note_gap > gap_consistency_tol:
+                break  # the other side is at a different speed
+            run = run + [between] + list(nxt)
+            cuts.add(between)
+            i += 1
+        merged_runs.append((run, cuts))
+        i += 1
 
     bursts = []
     streams = []
     cutstreams = 0
-    for run in runs:
+    for run, cuts in merged_runs:
         length = len(run) + 1  # transitions -> note count
         if length < burst_min:
             continue
-        wide_fraction = sum(1 for w, _, _ in run if w) / len(run) if run else 0
-        not_tight_fraction = sum(1 for _, t, _ in run if not t) / len(run) if run else 0
-        mean_dist_ratio = sum(nd for _, _, nd in run) / len(run) if run else 0
+        # Spacing is judged over the run's own notes. The cut junctions are
+        # excluded: the jump across a cut is a property of the cut, not of
+        # the stream, and counting it would push cut streams over the
+        # wide-fraction cutoff that rejoining them was meant to survive.
+        spacing = [j for j in run if j not in cuts]
+        if not spacing:
+            continue
+        wide_fraction = sum(1 for j in spacing if transitions[j][2] > diam * spaced_diam_ratio) / len(spacing)
+        mean_dist_ratio = sum(transitions[j][2] for j in spacing) / len(spacing) / diam
         if wide_fraction > run_wide_fraction_max:
             continue  # too much genuinely jump-wide spacing - this is a jump run, not a burst/stream
         if mean_dist_ratio > mean_diam_ratio_max:
@@ -303,7 +592,11 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
             bursts.append(length)
         elif length >= stream_min:
             streams.append(length)
-            if not_tight_fraction > 0:
+            # A cutstream is now literally a stream that was cut - i.e. one
+            # we had to rejoin across a skipped beat. The previous definition
+            # keyed on spacing variation instead, which is a different
+            # property wearing the same name.
+            if cuts:
                 cutstreams += 1
 
     diff.burst_count = len(bursts)
@@ -311,13 +604,16 @@ def classify_diff(diff: DiffInfo, snap_ratio=0.55,
     diff.cutstream_count = cutstreams
     diff.max_burst_len = max(bursts, default=0)
     diff.max_stream_len = max(streams, default=0)
-    diff.jump_pct = (jump_count / total_gaps * 100) if total_gaps else 0.0
+    diff.jump_pct = (jump_count / counted_gaps * 100) if counted_gaps else 0.0
     diff.burst_note_total = sum(bursts)
     diff.total_note_count = len(objs)
 
     diff.has_bursts = len(bursts) > 0
     diff.has_streams = len(streams) > 0
-    diff.has_jumps = diff.jump_pct >= jump_pct_threshold
+    # Require a floor of actual gameplay before a percentage means anything.
+    # Without it a 30-note diff with 5 wide transitions clears a 15% threshold
+    # and gets called a jump map on the strength of five jumps.
+    diff.has_jumps = counted_gaps >= jump_min_transitions and diff.jump_pct >= jump_pct_threshold
     diff.has_cutstreams = cutstreams > 0
 
     return diff
@@ -615,9 +911,11 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                # Current format: "path\tranked_status\tstar_rating".
-                # Older compiled helpers may only emit "path\tranked_status"
-                # or just a bare path - handled for backward compatibility.
+                # Current format:
+                #   "path\tranked_status\tstar_rating\tonline_id"
+                # Older compiled helpers emit fewer columns (down to a bare
+                # path) - all handled for backward compatibility, since the
+                # helper ships as a prebuilt binary and may lag the Python.
                 parts = line.split("\t")
                 path_part = parts[0]
                 status_part = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
@@ -627,7 +925,13 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
                         star_part = float(parts[2].strip())
                     except ValueError:
                         star_part = None
-                entries.append((path_part, status_part, star_part))
+                online_part = None
+                if len(parts) > 3 and parts[3].strip() and parts[3].strip().lower() != "unknown":
+                    try:
+                        online_part = int(parts[3].strip())
+                    except ValueError:
+                        online_part = None
+                entries.append((path_part, status_part, star_part, online_part))
     except OSError:
         entries = []
     finally:
@@ -649,7 +953,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     results = []
     errors = []
-    for i, (full, ranked_status, star_rating) in enumerate(entries):
+    for i, (full, ranked_status, star_rating, online_id) in enumerate(entries):
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
         wait_if_paused(pause_event, cancel_event)
@@ -658,6 +962,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
             if diff is not None and diff.objs:
                 diff.ranked_status = ranked_status
                 diff.star_rating = star_rating
+                diff.online_id = online_id
                 results.append(emit(diff))
         except Exception as e:
             errors.append((full, str(e)))
@@ -789,6 +1094,37 @@ def write_collection_db(path, collections, db_version=20211103):
 # Main
 # --------------------------------------------------------------------------
 
+CATEGORIES = ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]
+
+
+def category_of(has_streams, has_bursts=None, has_jumps=None,
+                 burst_note_total=0, total_note_count=0, jump_pct=0.0):
+    """
+    The one place the dominant-pattern rules live.
+
+    Call it either with a DiffInfo (everything else is read off it) or with
+    the individual values, which is what the CSV path does. Both callers used
+    to carry their own copy of these rules, so a threshold change had to be
+    made twice and could silently drift.
+    """
+    if hasattr(has_streams, "has_streams"):
+        d = has_streams
+        has_streams, has_bursts, has_jumps = d.has_streams, d.has_bursts, d.has_jumps
+        burst_note_total, total_note_count = d.burst_note_total, d.total_note_count
+        jump_pct = d.jump_pct
+
+    if has_streams:
+        return "Streams"
+    if has_jumps and has_bursts:
+        burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
+        return "Jumps with bursts" if (jump_pct / 100.0) > burst_coverage else "Bursts"
+    if has_bursts:
+        return "Bursts"
+    if has_jumps:
+        return "Jumps (no bursts)"
+    return "Misc"
+
+
 def derive_collections(diffs):
     """
     Groups diffs by DOMINANT pattern, not by presence of every tag. A map
@@ -820,25 +1156,9 @@ def derive_collections(diffs):
     section, but a map isn't relabeled a "burst map" just because it has
     one short burst somewhere in an otherwise pure jump map.
     """
-    groups = {"Streams": [], "Bursts": [], "Jumps with bursts": [], "Jumps (no bursts)": [], "Misc": []}
+    groups = {label: [] for label in CATEGORIES}
     for d in diffs:
-        if d.has_streams:
-            groups["Streams"].append(d)
-            continue
-
-        if d.has_jumps and d.has_bursts:
-            burst_coverage = (d.burst_note_total / d.total_note_count) if d.total_note_count else 0.0
-            jump_coverage = d.jump_pct / 100.0
-            if jump_coverage > burst_coverage:
-                groups["Jumps with bursts"].append(d)
-            else:
-                groups["Bursts"].append(d)
-        elif d.has_bursts:
-            groups["Bursts"].append(d)
-        elif d.has_jumps:
-            groups["Jumps (no bursts)"].append(d)
-        else:
-            groups["Misc"].append(d)
+        groups[category_of(d)].append(d)
     return groups
 
 
@@ -926,23 +1246,46 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
 
 
 DEFAULT_PARAMS = dict(
-    snap_ratio=0.55,
+    # Speed gate, in absolute ms per note. Stream BPM = 15000 / ms, so 140ms
+    # is about a 107 BPM stream. Replaces the old snap_ratio, which compared
+    # against the map's stored BPM and so broke on doubled-BPM maps.
+    max_gap_ms=140.0,
+    # How much a gap may deviate from its run's running mean before the run
+    # is considered to have changed speed and is split.
+    gap_consistency_tol=0.18,
     tight_diam_ratio=1.35,
     spaced_diam_ratio=2.0,
+    # 3, not 5: a three-circle burst is a real and very common pattern.
     burst_min=3,
     burst_max=9,
     stream_min=10,
-    jump_velocity_ratio=2.2,
+    # Diameters per 100ms. NOT the old diameters-per-beat - the unit changed
+    # when the BPM dependence came out, so this default was re-derived (it
+    # approximates the old behaviour at ~200 BPM) and wants validating
+    # against a labelled set rather than trusting.
+    jump_velocity_ratio=0.75,
     jump_pct_threshold=15.0,
+    # Minimum number of in-play transitions before jump_pct is allowed to
+    # decide anything.
+    jump_min_transitions=40,
+    # Gaps longer than this are breaks, and are kept out of the jump_pct
+    # denominator entirely.
+    jump_gap_cap_ms=1000.0,
     run_wide_fraction_max=0.4,
     mean_diam_ratio_max=1.5,
+    # Largest skipped-note gap that still counts as a cut within one stream
+    # rather than a genuine break between two runs.
+    cut_max_multiple=3.0,
 )
+
+# Params that must stay integers when parsed from a string (CLI/GUI).
+INT_PARAMS = ("burst_min", "burst_max", "stream_min", "jump_min_transitions")
 
 
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                   params=None, progress_cb=None, log_cb=None, cancel_event=None,
                   include_categories=None, ranked_mode="all_together",
-                  min_star=None, max_star=None, pause_event=None):
+                  min_star=None, max_star=None, pause_event=None, mods=None):
     """
     Core pipeline used by both the CLI and the GUI:
       1. scan_folder() over .osu/.osz files
@@ -981,6 +1324,9 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     import time
 
     log(f"=== Starting run on {songs_folder} ===")
+    if mods:
+        log(f"Classifying as if these mods were active: {', '.join(mods)} "
+            f"(NM is the baseline - this changes what counts as a stream).")
 
     classify_count = [0]
 
@@ -988,19 +1334,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
         wait_if_paused(pause_event, cancel_event)
-        classify_diff(
-            d,
-            snap_ratio=p["snap_ratio"],
-            tight_diam_ratio=p["tight_diam_ratio"],
-            spaced_diam_ratio=p["spaced_diam_ratio"],
-            burst_min=p["burst_min"],
-            burst_max=p["burst_max"],
-            stream_min=p["stream_min"],
-            jump_velocity_ratio=p["jump_velocity_ratio"],
-            jump_pct_threshold=p["jump_pct_threshold"],
-            run_wide_fraction_max=p["run_wide_fraction_max"],
-            mean_diam_ratio_max=p["mean_diam_ratio_max"],
-        )
+        classify_diff(d, mods=mods, **{k: p[k] for k in DEFAULT_PARAMS})
         # Free per-note data immediately - only the summary fields (counts,
         # booleans, hash) are needed from here on. Classifying inline like
         # this (instead of parsing the whole library first, THEN classifying
@@ -1091,15 +1425,18 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
             import csv
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
+                mods_str = "+".join(mods) if mods else "NM"
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
                             "max_stream_len", "jump_pct", "burst_note_total", "total_note_count",
-                            "ranked_status", "star_rating", "path"])
+                            "ranked_status", "star_rating", "online_id", "mods", "category", "path"])
                 for d in diffs:
                     w.writerow([d.title, d.diff_name, round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
                                 d.max_stream_len, round(d.jump_pct, 1), d.burst_note_total, d.total_note_count,
-                                d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown", d.path])
+                                d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown",
+                                d.online_id if d.online_id is not None else "unknown", mods_str,
+                                category_of(d), d.path])
             log(f"Full per-diff results written to {csv_path}")
         except Exception:
             import traceback
@@ -1153,7 +1490,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
         if log_cb:
             log_cb(msg)
 
-    groups = {"Streams": [], "Bursts": [], "Jumps with bursts": [], "Jumps (no bursts)": [], "Misc": []}
+    groups = {label: [] for label in CATEGORIES}
     total = 0
     skipped = 0
 
@@ -1172,9 +1509,6 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                 skipped += 1
                 continue
 
-            b = row.get("has_bursts") == "True"
-            s = row.get("has_streams") == "True"
-            j = row.get("has_jumps") == "True"
             ranked_status = row.get("ranked_status")
             if ranked_status in (None, "", "unknown"):
                 ranked_status = None
@@ -1187,28 +1521,25 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                     star_rating = None
             entry = (h, ranked_status, star_rating)
 
-            if s:
-                groups["Streams"].append(entry)
-            elif j and b:
+            # Newer CSVs carry the decided category outright. Older ones
+            # don't, so fall back to re-deriving it from the raw columns via
+            # the same shared rules run_pipeline uses.
+            category = (row.get("category") or "").strip()
+            if category not in groups:
                 try:
                     burst_note_total = int(row.get("burst_note_total") or 0)
                     total_note_count = int(row.get("total_note_count") or 0)
                     jump_pct = float(row.get("jump_pct") or 0)
                 except ValueError:
                     burst_note_total = total_note_count = 0
-                    jump_pct = 0
-                burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
-                jump_coverage = jump_pct / 100.0
-                if jump_coverage > burst_coverage:
-                    groups["Jumps with bursts"].append(entry)
-                else:
-                    groups["Bursts"].append(entry)
-            elif b:
-                groups["Bursts"].append(entry)
-            elif j:
-                groups["Jumps (no bursts)"].append(entry)
-            else:
-                groups["Misc"].append(entry)
+                    jump_pct = 0.0
+                category = category_of(
+                    row.get("has_streams") == "True",
+                    row.get("has_bursts") == "True",
+                    row.get("has_jumps") == "True",
+                    burst_note_total, total_note_count, jump_pct,
+                )
+            groups[category].append(entry)
 
             if log_cb and total % 20000 == 0:
                 log(f"  ... {total} rows processed")
@@ -1290,21 +1621,41 @@ def main():
                           "(fast - just re-hashes the files already listed in the CSV)")
     ap.add_argument("--output", default="collection.db", help="Output collection.db path")
     ap.add_argument("--no-db", action="store_true", help="Only print the report, don't write a collection.db")
-    ap.add_argument("--snap-ratio", type=float, default=DEFAULT_PARAMS["snap_ratio"],
-                     help="Max gap/beatLength ratio to count as 'fast' timing")
+    ap.add_argument("--max-gap-ms", type=float, default=DEFAULT_PARAMS["max_gap_ms"],
+                     help="Max milliseconds between notes to count as 'fast'. Stream BPM = 15000/ms, "
+                          "so 140 is about a 107 BPM stream. Replaces the old --snap-ratio, which "
+                          "compared against the map's stored BPM and broke on doubled-BPM maps.")
+    ap.add_argument("--gap-consistency-tol", type=float, default=DEFAULT_PARAMS["gap_consistency_tol"],
+                     help="How far a gap may stray from its run's running mean before the run is split. "
+                          "A real stream doesn't change tapping speed partway through.")
     ap.add_argument("--tight-diam-ratio", type=float, default=DEFAULT_PARAMS["tight_diam_ratio"],
                      help="Max distance/circle-diameter ratio for normal stream spacing")
     ap.add_argument("--spaced-diam-ratio", type=float, default=DEFAULT_PARAMS["spaced_diam_ratio"],
                      help="Max distance/circle-diameter ratio still counted as a 'spaced stream'")
-    ap.add_argument("--burst-min", type=int, default=DEFAULT_PARAMS["burst_min"])
+    ap.add_argument("--burst-min", type=int, default=DEFAULT_PARAMS["burst_min"],
+                     help="Fewest notes that count as a burst (default 3 - three-circle bursts are "
+                          "common in jump and flow-aim maps)")
     ap.add_argument("--burst-max", type=int, default=DEFAULT_PARAMS["burst_max"])
     ap.add_argument("--stream-min", type=int, default=DEFAULT_PARAMS["stream_min"])
-    ap.add_argument("--jump-velocity-ratio", type=float, default=DEFAULT_PARAMS["jump_velocity_ratio"])
+    ap.add_argument("--jump-velocity-ratio", type=float, default=DEFAULT_PARAMS["jump_velocity_ratio"],
+                     help="Jump speed cutoff in circle diameters per 100ms (note: this used to be "
+                          "diameters per BEAT - the unit changed when the BPM dependence was removed)")
     ap.add_argument("--jump-pct-threshold", type=float, default=DEFAULT_PARAMS["jump_pct_threshold"])
+    ap.add_argument("--jump-min-transitions", type=int, default=DEFAULT_PARAMS["jump_min_transitions"],
+                     help="Minimum in-play transitions before jump percentage is allowed to decide anything")
+    ap.add_argument("--jump-gap-cap-ms", type=float, default=DEFAULT_PARAMS["jump_gap_cap_ms"],
+                     help="Gaps longer than this are breaks and stay out of the jump-percentage denominator")
     ap.add_argument("--run-wide-fraction-max", type=float, default=DEFAULT_PARAMS["run_wide_fraction_max"])
     ap.add_argument("--mean-diam-ratio-max", type=float, default=DEFAULT_PARAMS["mean_diam_ratio_max"],
                      help="Max average distance/circle-diameter ratio across a run for it to still count "
                           "as a stream/burst rather than a jump pattern that happens to be fast-snapped")
+    ap.add_argument("--cut-max-multiple", type=float, default=DEFAULT_PARAMS["cut_max_multiple"],
+                     help="Largest skipped-note gap still treated as a cut inside one stream rather than "
+                          "a break between two separate runs")
+    ap.add_argument("--mods", default=None,
+                     help="Classify as if these mods were active, e.g. --mods DT or --mods HR,DT. "
+                          "NM (no mods) is the baseline and the default. Only DT/NC, HT/DC, HR and EZ "
+                          "change anything here - rate and circle size.")
     ap.add_argument("--csv", default=None, help="Optional path to dump full per-diff results as CSV")
     ap.add_argument("--categories", default=None,
                      help="Comma-separated list of categories to include in the output collection.db "
@@ -1337,18 +1688,8 @@ def main():
         print(f"Error: {args.songs_folder} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    params = dict(
-        snap_ratio=args.snap_ratio,
-        tight_diam_ratio=args.tight_diam_ratio,
-        spaced_diam_ratio=args.spaced_diam_ratio,
-        burst_min=args.burst_min,
-        burst_max=args.burst_max,
-        stream_min=args.stream_min,
-        jump_velocity_ratio=args.jump_velocity_ratio,
-        jump_pct_threshold=args.jump_pct_threshold,
-        run_wide_fraction_max=args.run_wide_fraction_max,
-        mean_diam_ratio_max=args.mean_diam_ratio_max,
-    )
+    params = {key: getattr(args, key) for key in DEFAULT_PARAMS}
+    mods = [m.strip().upper() for m in args.mods.replace("+", ",").split(",") if m.strip()] if args.mods else None
 
     def cli_progress(done, total):
         if total:
@@ -1366,6 +1707,7 @@ def main():
         ranked_mode=args.ranked_mode,
         min_star=args.min_star,
         max_star=args.max_star,
+        mods=mods,
     )
 
     if not args.no_db:

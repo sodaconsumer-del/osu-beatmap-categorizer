@@ -133,6 +133,10 @@ class Program
                 // subprocess timeout and silently fall back to a filesystem
                 // scan). Keep this joining on Hash, not MD5Hash.
                 var starRatingByHash = new Dictionary<string, double>();
+                // Online beatmap ID, keyed the same way. Needed to join local
+                // difficulties against ground-truth labels pulled from the
+                // osu! API - see fetch_osu_tags.py.
+                var onlineIdByHash = new Dictionary<string, int>();
                 bool loggedStarRatingError = false;
                 try
                 {
@@ -144,7 +148,19 @@ class Program
                             string bHash = (string)beatmap.Hash;
                             double sr = (double)beatmap.StarRating;
                             if (!string.IsNullOrEmpty(bHash))
+                            {
                                 starRatingByHash[bHash] = sr;
+                                try
+                                {
+                                    int oid = (int)beatmap.OnlineID;
+                                    if (oid > 0)
+                                        onlineIdByHash[bHash] = oid;
+                                }
+                                catch (Exception)
+                                {
+                                    // OnlineID is optional - unsubmitted maps have none.
+                                }
+                            }
                         }
                         catch (Exception e)
                         {
@@ -238,8 +254,11 @@ class Program
                             string starRatingStr = "unknown";
                             if (starRatingByHash.TryGetValue(hash, out double sr))
                                 starRatingStr = sr.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-                            // Tab-separated: path, ranked status, star rating
-                            writer.WriteLine($"{resolved}\t{rankedStatus}\t{starRatingStr}");
+                            string onlineIdStr = onlineIdByHash.TryGetValue(hash, out int oid)
+                                ? oid.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                                : "unknown";
+                            // Tab-separated: path, ranked status, star rating, online beatmap id
+                            writer.WriteLine($"{resolved}\t{rankedStatus}\t{starRatingStr}\t{onlineIdStr}");
                             written++;
                         }
                         else
