@@ -7,6 +7,12 @@ This tool was built largely with AI assistance (code generation, debugging, etc.
 
 
 
+## Contact
+If you wish to contact me, you can find me on osu! [-soda-](https://osu.ppy.sh/users/17477549)
+Discord: plaaanet
+
+
+
 
 ## Quick start
 
