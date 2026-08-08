@@ -106,7 +106,7 @@ python gui.py
 or from the command line:
 
 ```
-python classify_maps.py "D:/osu-lazer" --csv report.csv --output collection.db
+python classify_maps.py "C:/Users/you/AppData/Roaming/osu" --csv report.csv --output collection.db
 ```
 
 `python classify_maps.py --help` lists every option.

@@ -8,13 +8,13 @@ own community beatmap tags.
 
 Usage
 -----
-    python classify_maps.py "D:/osu-lazer" --csv report.csv --no-db
+    python classify_maps.py "C:/Users/you/AppData/Roaming/osu" --csv report.csv --no-db
     python fetch_osu_tags.py --csv report.csv --out labels.csv
     python eval_classifier.py --csv report.csv --labels labels.csv
 
 Then change a threshold, re-run, and compare:
 
-    python classify_maps.py "D:/osu-lazer" --csv new.csv --no-db --max-gap-ms 120
+    python classify_maps.py "C:/Users/you/AppData/Roaming/osu" --csv new.csv --no-db --max-gap-ms 120
     python eval_classifier.py --csv new.csv --labels labels.csv --baseline report.csv
 
 Reading the output
