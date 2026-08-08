@@ -115,8 +115,11 @@ The `realm-reader` helper is optional and only speeds up osu!lazer scans. To
 build it you need the .NET 8 SDK:
 
 ```
-dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader
+dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader-dist
 ```
+
+`realm-reader-dist/` is gitignored and picked up automatically — don't publish
+into `realm-reader/` itself, or ~190 runtime DLLs land on top of the source.
 
 ##
 

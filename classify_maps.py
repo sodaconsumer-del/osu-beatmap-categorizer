@@ -831,8 +831,18 @@ def default_realm_reader_path():
 
     for d in search_dirs:
         for candidate in (
+            # Next to the app - how a downloaded release used to be laid out.
             os.path.join(d, exe_name),
+            # Release layout: the helper and its ~190 runtime DLLs live in
+            # their own folder so the release root stays navigable.
             os.path.join(d, "realm-reader", exe_name),
+            # Working from source: publishing into realm-reader/ would bury
+            # Program.cs under those same DLLs, so the documented build sends
+            # them here instead (and .gitignore knows about it).
+            os.path.join(d, "realm-reader-dist", exe_name),
+            # A plain `dotnet build` leaves it here, which saves anyone
+            # hacking on the helper from having to publish just to test.
+            os.path.join(d, "realm-reader", "bin", "Release", "net8.0", "win-x64", exe_name),
         ):
             if os.path.isfile(candidate):
                 return candidate
