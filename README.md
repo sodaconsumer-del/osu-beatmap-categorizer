@@ -50,8 +50,8 @@ back to a much slower method.
 
 | Category | Meaning |
 |---|---|
-| Streams | Has a genuine 10+ note stream (cutstreams count as streams) |
-| Bursts | Has 3-9 note burst(s), no full streams |
+| Streams | Streams cover 15%+ of the map, or a burst map streams once (12+ notes). Cutstreams count as streams |
+| Bursts | Has 3-9 note burst(s), and never streams |
 | Jumps with bursts | Has both, but jumps cover more of the map |
 | Jumps (no bursts) | Jump-heavy, no bursts or streams |
 | Misc | None of the above |
