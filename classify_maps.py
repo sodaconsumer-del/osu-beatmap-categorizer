@@ -37,9 +37,8 @@ tail sits next to the following note isn't mistaken for a full-screen jump.
 Pass --mods DT / --mods HR,DT to classify as if those mods were active. NM
 is the baseline.
 
-Accuracy is measurable rather than a matter of taste - see fetch_osu_tags.py
-(builds ground truth from osu!'s own community beatmap tags) and
-eval_classifier.py (scores a report.csv against it). Run test_classify.py for
+Accuracy is measurable rather than a matter of taste - see eval_classifier.py,
+which scores a report.csv against hand-labelled maps. Run test_classify.py for
 the synthetic unit tests.
 """
 
@@ -112,7 +111,7 @@ class DiffInfo:
     # osu! online beatmap ID (int), or None if unknown. Same lazer-realm-only
     # availability as the two above. Carried through to the CSV so predictions
     # can be joined against ground-truth labels fetched from the osu! API -
-    # see fetch_osu_tags.py / eval_classifier.py.
+    # see eval_classifier.py.
     online_id: object = None
 
 
@@ -707,8 +706,19 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
     osu_paths = []
     osz_paths = []
     peek_candidates = []
+    folders = 0
+    # The walk is the longest silent stretch of the whole run: on a 25k-folder
+    # osu!stable Songs library it takes around three minutes on its own,
+    # during which nothing used to be reported at all. The progress bar sat at
+    # zero and the log said nothing, so the app looked frozen and people
+    # reasonably concluded stable scanning simply didn't work. Report progress
+    # while it happens - the total isn't knowable yet, hence total=None, which
+    # tells a GUI to show an indeterminate/pulsing bar rather than a stuck one.
+    if progress_cb:
+        progress_cb(0, None)
     for dirpath, _, filenames in os.walk(root):
         check_cancel()
+        folders += 1
         for fn in filenames:
             low = fn.lower()
             full = os.path.join(dirpath, fn)
@@ -719,6 +729,13 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
             elif "." not in fn:
                 # No extension at all - candidate for lazer's hash-named blob store
                 peek_candidates.append(full)
+        if folders % 1000 == 0:
+            found = len(osu_paths) + len(osz_paths)
+            if progress_cb:
+                progress_cb(folders, None)
+            if log_cb and folders % 5000 == 0:
+                log(f"  ... {folders} folders searched, {found} beatmap files found so far "
+                    f"({time.time() - t_start:.0f}s)")
 
     t_walk = time.time()
     log(f"Directory walk done in {t_walk - t_start:.1f}s. "

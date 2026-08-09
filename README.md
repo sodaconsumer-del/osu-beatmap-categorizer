@@ -84,14 +84,15 @@ These are heuristics, so there's tooling to measure them rather than argue about
 python test_classify.py
 ```
 
-To score against real maps, osu!'s own community beatmap tags make a ready-made ground truth:
+To score against real maps, hand-label a few dozen mapsets you know well into a `labels.csv` of `online_id,label`, then:
 
 ```
-python fetch_osu_tags.py --csv report.csv --out labels.csv
 python eval_classifier.py --csv report.csv --labels labels.csv
 ```
 
-That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. You'll need a free osu! OAuth app for the tag fetch, and `online_id` is only populated on the lazer realm fast path.
+That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. `online_id` is only populated on the lazer realm fast path.
+
+Scraping osu!'s community beatmap tags was tried and dropped: outside the most popular few hundred maps, almost nothing carries a usertag, so the coverage is far too thin to tune against.
 
 ##
 

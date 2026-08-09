@@ -3,13 +3,34 @@
 Scores the classifier against ground-truth labels.
 
 Turns "does this threshold change help?" from a matter of opinion into a
-number. Pair it with fetch_osu_tags.py, which builds the labels from osu!'s
-own community beatmap tags.
+number.
+
+Where the labels come from
+--------------------------
+Hand-label them. That sounds like more work than it is: sort a few dozen
+mapsets you know well into folders named after the category you'd put them
+in, and build labels.csv from the folder names.
+
+This deliberately does NOT scrape osu!'s community beatmap tags. That was
+tried and dropped - outside the few hundred most popular maps, almost nothing
+carries a usertag, so the coverage is far too thin to tune against and biased
+towards popular maps besides.
+
+If you want an automatic signal later, the osu! API's per-beatmap difficulty
+attributes expose aim_difficulty and speed_difficulty, and their ratio
+separates jump maps from stream maps rather well. It's one request per
+beatmap rather than fifty, so it only suits a sample of a few hundred - which
+is all an eval set needs anyway.
+
+labels.csv format - one row per beatmap, header required:
+
+    online_id,label
+    1234567,Streams
+    2345678,Jumps (no bursts)
 
 Usage
 -----
     python classify_maps.py "C:/Users/you/AppData/Roaming/osu" --csv report.csv --no-db
-    python fetch_osu_tags.py --csv report.csv --out labels.csv
     python eval_classifier.py --csv report.csv --labels labels.csv
 
 Then change a threshold, re-run, and compare:
@@ -151,7 +172,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--csv", required=True, help="report.csv to score")
-    ap.add_argument("--labels", required=True, help="labels.csv from fetch_osu_tags.py")
+    ap.add_argument("--labels", required=True, help="labels.csv: online_id,label - see the notes at the top of this file")
     ap.add_argument("--baseline", default=None,
                      help="a second report.csv to compare against, so you can see whether "
                           "a change actually helped")

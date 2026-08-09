@@ -83,7 +83,10 @@ class ClassifierGUI(tk.Tk):
         # without anyone having to ask.
         self.title(f"osu-beatmap-categorizer {APP_VERSION}")
         self.geometry("1200x800")
-        self.minsize(900, 650)
+        # Everything above the run controls scrolls now, so the window can go
+        # much smaller than the content without hiding anything. This used to
+        # be 900x650 purely because the layout clipped below that.
+        self.minsize(560, 420)
 
         self.config_data = load_config()
         self.theme_name = self.config_data.get("theme", "dark")
@@ -100,6 +103,9 @@ class ClassifierGUI(tk.Tk):
         # Last "N/M files" text shown, so resuming can restore it instead of
         # leaving the label stuck on "Paused" until the next progress tick.
         self._last_progress_text = ""
+        # True while the progress bar is pulsing for a phase whose total
+        # isn't known yet (the directory walk).
+        self._indeterminate = False
 
         self._closing = False
         self._poll_job = None
@@ -213,8 +219,10 @@ class ClassifierGUI(tk.Tk):
         self.log_text.configure(bg=c["surface"], fg=c["fg"], insertbackground=c["fg"],
                                 selectbackground=c["accent"], selectforeground=c["fg"],
                                 highlightbackground=c["border"], highlightcolor=c["border"])
-        for w in self._themed_widgets:
-            w.configure(style="Muted.TLabel")
+        # The scroll viewport is a plain tk.Canvas, so like the log it needs
+        # colouring directly or it shows through as a white slab behind the
+        # dark sections.
+        self.canvas.configure(bg=c["bg"])
         self.theme_button.config(
             text="Light mode" if self.theme_name == "dark" else "Dark mode")
 
@@ -224,23 +232,97 @@ class ClassifierGUI(tk.Tk):
         self.config_data["theme"] = self.theme_name
         save_config(self.config_data)
 
+    def _rewrap(self, width):
+        """
+        Rewrap the explanatory labels to the current window width.
+
+        They used to carry a hardcoded wraplength=680, which meant they broke
+        mid-sentence in a narrow window and left a wide empty margin in a
+        maximised one. tkinter has no automatic wrapping for ttk labels, so
+        the width has to be pushed in on every resize.
+        """
+        target = max(width - 60, 240)
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                try:
+                    if int(child.cget("wraplength") or 0):
+                        child.configure(wraplength=target)
+                except (tk.TclError, ValueError):
+                    pass  # not a label, or has no wraplength option
+                walk(child)
+
+        walk(self)
+
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
     def _build_widgets(self):
         pad = {"padx": 10, "pady": 6}
 
+        # The seven option sections are taller than a non-maximised window, so
+        # they live in a scrollable canvas. Previously they were packed
+        # straight onto the root window, which silently clipped everything
+        # below the fold - with no scrollbar there was no way to reach the
+        # thresholds or the Run button except by maximising.
+        #
+        # The run controls and log are deliberately OUTSIDE the scroll area,
+        # pinned to the bottom, so Run and the progress bar are reachable at
+        # any window size without hunting for them.
+        outer = ttk.Frame(self)
+        outer.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        body = ttk.Frame(self.canvas)
+        body_id = self.canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_body_resize(_event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+        def _on_canvas_resize(event):
+            # Keep the inner frame exactly as wide as the viewport so the
+            # sections stretch instead of leaving a dead strip on the right.
+            self.canvas.itemconfigure(body_id, width=event.width)
+            self._rewrap(event.width)
+
+        body.bind("<Configure>", _on_body_resize)
+        self.canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Mouse wheel. Bound on the toplevel rather than the canvas so it
+        # works wherever the pointer is, and a no-op when everything already
+        # fits (otherwise the view jitters against its own scroll limits).
+        def _on_wheel(event):
+            first, last = self.canvas.yview()
+            if first <= 0.0 and last >= 1.0:
+                return
+            self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+        self.bind_all("<MouseWheel>", _on_wheel)
+
         # --- Input folder ---
-        frame_in = ttk.LabelFrame(self, text="1. Beatmap folder")
+        frame_in = ttk.LabelFrame(body, text="1. Beatmap folder")
         frame_in.pack(fill="x", **pad)
 
+        # The entry and its buttons need their own row. Packing them side="left"
+        # directly into the LabelFrame left the hint below to fill whatever
+        # space was left over - which pack puts to the RIGHT of them, not
+        # underneath - so the hint got squeezed into a narrow column and
+        # clipped its own text.
+        row_in = ttk.Frame(frame_in)
+        row_in.pack(fill="x")
+
         self.folder_var = tk.StringVar()
-        ttk.Entry(frame_in, textvariable=self.folder_var).pack(side="left", fill="x", expand=True, padx=(10, 5), pady=8)
-        ttk.Button(frame_in, text="Browse...", command=self._pick_folder).pack(side="left", padx=(0, 5), pady=8)
+        ttk.Entry(row_in, textvariable=self.folder_var).pack(side="left", fill="x", expand=True, padx=(10, 5), pady=8)
+        ttk.Button(row_in, text="Browse...", command=self._pick_folder).pack(side="left", padx=(0, 5), pady=8)
 
         lazer_default = cm.default_lazer_data_dir()
         if lazer_default and os.path.isdir(lazer_default):
-            ttk.Button(frame_in, text="Use lazer data folder", command=self._pick_lazer_default).pack(
+            ttk.Button(row_in, text="Use lazer data folder", command=self._pick_lazer_default).pack(
                 side="left", padx=(0, 10), pady=8)
 
         hint = ttk.Label(
@@ -256,7 +338,7 @@ class ClassifierGUI(tk.Tk):
         hint.pack(fill="x", padx=10, pady=(0, 8))
 
         # --- Output ---
-        frame_out = ttk.LabelFrame(self, text="2. Export folder")
+        frame_out = ttk.LabelFrame(body, text="2. Export folder")
         frame_out.pack(fill="x", **pad)
 
         row0 = ttk.Frame(frame_out)
@@ -277,7 +359,7 @@ class ClassifierGUI(tk.Tk):
                          variable=self.write_csv_var).pack(side="left")
 
         # --- Category selection ---
-        frame_cat = ttk.LabelFrame(self, text="3. Categories to include in collection.db")
+        frame_cat = ttk.LabelFrame(body, text="3. Categories to include in collection.db")
         frame_cat.pack(fill="x", **pad)
         row_cat = ttk.Frame(frame_cat)
         row_cat.pack(fill="x", padx=10, pady=8)
@@ -291,7 +373,7 @@ class ClassifierGUI(tk.Tk):
                   style="Muted.TLabel").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Ranked status handling ---
-        frame_ranked = ttk.LabelFrame(self, text="4. Ranked status (osu!lazer fast path only)")
+        frame_ranked = ttk.LabelFrame(body, text="4. Ranked status (osu!lazer fast path only)")
         frame_ranked.pack(fill="x", **pad)
         self.ranked_mode_var = tk.StringVar(value="all_together")
         row_ranked = ttk.Frame(frame_ranked)
@@ -311,7 +393,7 @@ class ClassifierGUI(tk.Tk):
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Star rating filter ---
-        frame_star = ttk.LabelFrame(self, text="5. Star rating filter (osu!lazer fast path only)")
+        frame_star = ttk.LabelFrame(body, text="5. Star rating filter (osu!lazer fast path only)")
         frame_star.pack(fill="x", **pad)
         row_star = ttk.Frame(frame_star)
         row_star.pack(fill="x", padx=10, pady=8)
@@ -327,7 +409,7 @@ class ClassifierGUI(tk.Tk):
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Mods ---
-        frame_mods = ttk.LabelFrame(self, text="6. Classify as if these mods were active")
+        frame_mods = ttk.LabelFrame(body, text="6. Classify as if these mods were active")
         frame_mods.pack(fill="x", **pad)
         row_mods = ttk.Frame(frame_mods)
         row_mods.pack(fill="x", padx=10, pady=8)
@@ -348,7 +430,7 @@ class ClassifierGUI(tk.Tk):
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Advanced thresholds (collapsible-ish via a simple frame) ---
-        frame_adv = ttk.LabelFrame(self, text="7. Thresholds (defaults match osu!'s official tag definitions)")
+        frame_adv = ttk.LabelFrame(body, text="7. Thresholds (defaults match osu!'s official tag definitions)")
         frame_adv.pack(fill="x", **pad)
 
         self.param_vars = {}
@@ -383,7 +465,12 @@ class ClassifierGUI(tk.Tk):
         ttk.Button(frame_adv, text="Reset to defaults", command=self._reset_defaults).pack(anchor="e", padx=10, pady=(0, 8))
 
         # --- Run controls ---
-        frame_run = ttk.Frame(self)
+        # Pinned below the scroll area: Run, pause/cancel, progress and the
+        # log must never be the thing that scrolled off the bottom.
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="both", side="bottom")
+
+        frame_run = ttk.Frame(bottom)
         frame_run.pack(fill="x", **pad)
         self.run_button = ttk.Button(frame_run, text="Run classification", command=self._start_run)
         self.run_button.pack(side="left")
@@ -399,7 +486,7 @@ class ClassifierGUI(tk.Tk):
         self.theme_button.pack(side="left", padx=(10, 0))
 
         # --- Log ---
-        frame_log = ttk.LabelFrame(self, text="Log")
+        frame_log = ttk.LabelFrame(bottom, text="Log")
         frame_log.pack(fill="both", expand=True, **pad)
         self.log_text = tk.Text(frame_log, height=12, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
@@ -491,6 +578,9 @@ class ClassifierGUI(tk.Tk):
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+        self.progress.stop()
+        self.progress.config(mode="determinate")
+        self._indeterminate = False
         self.progress["value"] = 0
         self._last_progress_text = ""
         self.progress_label.config(text="Starting...")
@@ -570,7 +660,24 @@ class ClassifierGUI(tk.Tk):
                 kind = item[0]
                 if kind == "progress":
                     _, done, total = item
-                    if total:
+                    if total is None:
+                        # Indeterminate phase: the directory walk, where the
+                        # total isn't known yet. Pulse the bar and count
+                        # folders so it's visibly alive - a stuck bar during
+                        # a three-minute walk reads as a crash.
+                        if not self._indeterminate:
+                            self._indeterminate = True
+                            self.progress.config(mode="indeterminate")
+                            self.progress.start(15)
+                        self._last_progress_text = (f"searching {done} folders..."
+                                                     if done else "searching folders...")
+                        if self.pause_event is None or self.pause_event.is_set():
+                            self.progress_label.config(text=self._last_progress_text)
+                    elif total:
+                        if self._indeterminate:
+                            self._indeterminate = False
+                            self.progress.stop()
+                            self.progress.config(mode="determinate")
                         self.progress["maximum"] = total
                         self.progress["value"] = done
                         self._last_progress_text = f"{done}/{total} files"
