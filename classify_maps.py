@@ -1164,7 +1164,8 @@ def is_ranked(status):
 
 def category_of(has_streams, has_bursts=None, has_jumps=None,
                  burst_note_total=0, total_note_count=0, jump_pct=0.0,
-                 stream_note_total=0):
+                 stream_note_total=0, stream_run_count=0, max_stream_len=0,
+                 burst_promote_stream_len=12):
     """
     The one place the dominant-pattern rules live.
 
@@ -1192,10 +1193,36 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
         burst_note_total, total_note_count = d.burst_note_total, d.total_note_count
         jump_pct = d.jump_pct
         stream_note_total = d.stream_note_total
+        stream_run_count = d.stream_count
+        max_stream_len = d.max_stream_len
 
     jump_coverage = jump_pct / 100.0
     stream_coverage = (stream_note_total / total_note_count) if total_note_count else 0.0
     burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
+
+    # A burst map containing a genuine stream run is a stream map. Bursts and
+    # streams are the same motion, so the question for a burst player isn't
+    # how much of the map streams - it's whether the map ever demands
+    # sustained stream stamina at all. A map that asks for it once is not a
+    # burst map any more, however little of the map it occupies.
+    #
+    # The run has to clear burst_promote_stream_len (12) rather than merely
+    # reach stream_min (10). A single run sitting exactly on the minimum is a
+    # boundary artifact, not evidence the map streams: measured across ten
+    # NiNo mapsets, the one difficulty that promoted on a bare 10-note run was
+    # the same false positive the stream coverage floor was added to kill.
+    # Requiring a couple of notes of headroom drops it and keeps every
+    # convincing case (24 promotions across the labelled sets, the smallest
+    # of which is a 17-note run).
+    #
+    # Deliberately scoped to burst outcomes only. The same reasoning does NOT
+    # extend to jump maps: those spread their notes far enough apart that a
+    # stray run picked up among them is usually a tightly-spaced jump pattern
+    # rather than real streaming, which is why one short run in a long jump
+    # map leaves it a jump map.
+    def burst_or_stream():
+        real_stream = stream_run_count > 0 and max_stream_len >= burst_promote_stream_len
+        return "Streams" if real_stream else "Bursts"
 
     if has_streams and (not has_jumps or stream_coverage >= jump_coverage):
         return "Streams"
@@ -1203,9 +1230,9 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     # happens to contain a stream, so it falls through to be judged on its
     # jump and burst content like any other jump map.
     if has_jumps and has_bursts:
-        return "Jumps with bursts" if jump_coverage > burst_coverage else "Bursts"
+        return "Jumps with bursts" if jump_coverage > burst_coverage else burst_or_stream()
     if has_bursts:
-        return "Bursts"
+        return burst_or_stream()
     if has_jumps:
         return "Jumps (no bursts)"
     if has_streams:
@@ -1626,15 +1653,19 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                     burst_note_total = int(row.get("burst_note_total") or 0)
                     stream_note_total = int(row.get("stream_note_total") or 0)
                     total_note_count = int(row.get("total_note_count") or 0)
+                    stream_runs = int(row.get("stream_runs") or 0)
+                    max_stream_len = int(row.get("max_stream_len") or 0)
                     jump_pct = float(row.get("jump_pct") or 0)
                 except ValueError:
                     burst_note_total = stream_note_total = total_note_count = 0
+                    stream_runs = max_stream_len = 0
                     jump_pct = 0.0
                 category = category_of(
                     row.get("has_streams") == "True",
                     row.get("has_bursts") == "True",
                     row.get("has_jumps") == "True",
                     burst_note_total, total_note_count, jump_pct, stream_note_total,
+                    stream_runs, max_stream_len,
                 )
             groups[category].append(entry)
 

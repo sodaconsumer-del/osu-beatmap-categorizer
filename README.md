@@ -66,6 +66,8 @@ Speed is measured in **absolute milliseconds between taps**, not as a ratio to t
 
 A run also has to be **rhythmically consistent**: a real stream doesn't change tapping speed partway through. A stream broken by a skipped beat is rejoined before lengths are judged, so a cut stream stays one stream instead of becoming two bursts.
 
+A **burst map that streams even once is a stream map**. Bursts and streams are the same motion, so what matters to a burst player isn't how much of the map streams but whether it ever demands sustained stream stamina at all — one run of 12+ notes does. This applies only to burst maps: a short run inside a jump map is usually tightly-spaced jumps rather than real streaming.
+
 Patterns also have to **cover enough of the map to own it**. One 10-note run in a 400-note jump map doesn't make it a stream map, so streams need at least 15% of the map's notes before they count at all — and even then they still have to out-cover the jumps. This is what stops tightly-spaced jump maps (NiNo-style diffs are the classic case, where the jumps sit close enough together to look like a stream) from being filed under Streams.
 
 Spacing is measured from each object's **end** position. Sliders are around 30% of a typical library, and measuring from the head makes a long slider whose tail sits beside the next note read as a full-screen jump. Spinners are skipped — their stored position is a placeholder, not where you actually move.

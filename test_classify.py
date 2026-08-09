@@ -231,6 +231,41 @@ def test_stream_threshold_is_tunable():
     assert classify(lines, stream_pct_threshold=1.0).has_streams
 
 
+def test_burst_map_with_a_real_stream_becomes_a_stream_map():
+    # A burst map that streams even once isn't a burst map - it demands
+    # sustained stream stamina somewhere, however little of the map that is.
+    assert cm.category_of(False, True, False, 40, 400, 0.0,
+                           stream_note_total=20, stream_run_count=1,
+                           max_stream_len=20) == "Streams"
+
+
+def test_a_single_minimum_length_run_does_not_promote():
+    # A lone run sitting exactly on stream_min is a boundary artifact, not
+    # evidence the map streams. This is the NiNo case.
+    assert cm.category_of(False, True, False, 40, 400, 0.0,
+                           stream_note_total=10, stream_run_count=1,
+                           max_stream_len=10) == "Bursts"
+
+
+def test_burst_map_with_no_stream_at_all_stays_bursts():
+    assert cm.category_of(False, True, False, 40, 400, 0.0) == "Bursts"
+
+
+def test_promotion_does_not_apply_to_jump_maps():
+    # The whole point of the coverage floor: a short run inside a jump map is
+    # usually tightly-spaced jumps, not streaming.
+    assert cm.category_of(False, False, True, 0, 400, 60.0,
+                           stream_note_total=20, stream_run_count=1,
+                           max_stream_len=20) == "Jumps (no bursts)"
+
+
+def test_promotion_threshold_is_tunable():
+    kw = dict(stream_note_total=11, stream_run_count=1, max_stream_len=11)
+    assert cm.category_of(False, True, False, 40, 400, 0.0, **kw) == "Bursts"
+    assert cm.category_of(False, True, False, 40, 400, 0.0,
+                           burst_promote_stream_len=10, **kw) == "Streams"
+
+
 def test_stream_note_total_is_recorded():
     # category_of can't compare stream coverage without this being populated.
     d = classify(circles(16))
