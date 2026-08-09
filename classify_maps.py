@@ -2,10 +2,14 @@
 """
 osu! Burst/Stream/Jump Classifier
 ----------------------------------
-Scans a folder of .osu files (e.g. your stable Songs/ folder, or a folder
-you exported from lazer with BeatmapExporter), classifies every difficulty
-by pattern content, and writes an osu!stable-compatible collection.db
-with a separate collection for each category.
+Scans your osu! library, classifies every difficulty by pattern content,
+and writes an osu!stable-compatible collection.db with a separate collection
+for each category.
+
+Reads the game's own database where it can - osu!.db for stable, client.realm
+for lazer - which avoids walking the disk and picks up ranked status, star
+ratings and beatmap ids for free. Falls back to scanning a folder of .osu /
+.osz files when there's no database to read.
 
 Usage:
     python classify_maps.py "C:/Users/you/AppData/Local/osu!/Songs" --output collection.db
@@ -847,6 +851,337 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
     return results, errors
 
 
+# --------------------------------------------------------------------------
+# osu!stable database (osu!.db)
+# --------------------------------------------------------------------------
+#
+# Binary layout follows Piotrekol's CollectionManager, specifically
+# StableOsuDatabaseReader.ReadNextBeatmap and OsuBinaryReader. That is the
+# reference implementation for this format - the community wiki is vaguer and
+# in one place actively misleading (it labels the two consecutive ints after
+# the timing points "Difficulty ID" then "Beatmap ID", when the first is
+# actually the beatmap/difficulty id and the second the set id).
+#
+# Reading this instead of walking Songs/ is a large win:
+#   - no directory walk (~180s on a 25k-folder library)
+#   - MD5 comes straight from the db, so no re-hashing every file
+#   - PlayMode is known before opening anything, so non-osu!standard
+#     difficulties are skipped without touching the disk
+#   - ranked status, star rating and online id become available on stable,
+#     which previously only the lazer path had
+
+# Minimum osu!.db version CollectionManager supports. Older files laid the
+# per-beatmap records out differently (they carried a leading record-size
+# int), and rather than guess at a format we cannot test against, we refuse
+# and fall back to the filesystem scan.
+MIN_OSU_DB_VERSION = 20191105
+
+# osu!stable's cached ranked status byte. These are NOT the same numbers the
+# API or lazer's realm use - stable has its own encoding.
+_STABLE_STATUS = {
+    0: "unknown",
+    1: "unsubmitted",
+    2: "pending",      # covers pending/wip/graveyard - stable doesn't separate them
+    3: "unknown",
+    4: "ranked",
+    5: "approved",
+    6: "qualified",
+    7: "loved",
+}
+
+
+class _OsuDbReader:
+    """Little-endian reader for osu!'s binary db format."""
+
+    def __init__(self, data):
+        self.d = data
+        self.i = 0
+
+    def _take(self, n):
+        if self.i + n > len(self.d):
+            raise EOFError("osu!.db ended mid-record")
+        v = self.d[self.i:self.i + n]
+        self.i += n
+        return v
+
+    def u8(self):
+        return self._take(1)[0]
+
+    def boolean(self):
+        return self._take(1)[0] != 0
+
+    def i16(self):
+        return struct.unpack("<h", self._take(2))[0]
+
+    def i32(self):
+        return struct.unpack("<i", self._take(4))[0]
+
+    def i64(self):
+        return struct.unpack("<q", self._take(8))[0]
+
+    def f32(self):
+        return struct.unpack("<f", self._take(4))[0]
+
+    def f64(self):
+        return struct.unpack("<d", self._take(8))[0]
+
+    def string(self):
+        """0x0b then a ULEB128 length then UTF-8 bytes; 0x00 means null."""
+        marker = self.u8()
+        if marker == 0x00:
+            return ""
+        if marker != 0x0b:
+            raise ValueError(f"bad string marker {marker:#x} at offset {self.i - 1}")
+        length = 0
+        shift = 0
+        while True:
+            b = self.u8()
+            length |= (b & 0x7F) << shift
+            if not b & 0x80:
+                break
+            shift += 7
+        return self._take(length).decode("utf-8", "replace")
+
+    def skip(self, n):
+        self.i += n
+
+    def conditional(self):
+        """
+        osu!'s type-tagged value, used inside the star-rating tables. We only
+        ever need to step over these, but the width depends on the tag, so
+        they have to be decoded rather than skipped blind.
+        """
+        t = self.u8()
+        if t == 1:
+            return self.boolean()
+        if t == 2:
+            return self.u8()
+        if t == 3:
+            return struct.unpack("<H", self._take(2))[0]
+        if t == 4:
+            return struct.unpack("<I", self._take(4))[0]
+        if t == 5:
+            return struct.unpack("<Q", self._take(8))[0]
+        if t == 6:
+            return struct.unpack("<b", self._take(1))[0]
+        if t == 7:
+            return self.i16()
+        if t == 8:
+            return self.i32()
+        if t == 9:
+            return self.i64()
+        if t == 10:
+            return self._take(2).decode("utf-16-le", "replace")
+        if t == 11:
+            return self.string()
+        if t == 12:
+            return self.f32()
+        if t == 13:
+            return self.f64()
+        if t == 14:
+            return self._take(16)
+        if t == 15:
+            return self.i64()
+        if t == 16 or t == 17:
+            n = self.i32()
+            return self._take(n) if n > 0 else None
+        return None
+
+
+def read_osu_db(path, log_cb=None, want_mode=0):
+    """
+    Reads osu!stable's osu!.db and yields one dict per difficulty.
+
+    Opened read-only. osu! only flushes this file on a clean exit, so with the
+    game running it may be slightly stale - the worst case is a recently
+    imported map being missed, which is why the caller falls back to a
+    filesystem scan when this yields nothing usable.
+
+    want_mode filters by ruleset before anything is returned (0 = osu!std).
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    with open(path, "rb") as f:
+        r = _OsuDbReader(f.read())
+
+    version = r.i32()
+    if version < MIN_OSU_DB_VERSION:
+        raise ValueError(
+            f"osu!.db version {version} is older than {MIN_OSU_DB_VERSION}; "
+            f"its record layout differs and isn't supported")
+    folder_count = r.i32()
+    r.boolean()          # account unlocked
+    r.i64()              # unlock date
+    r.string()           # player name
+    count = r.i32()
+    log(f"osu!.db version {version}: {count} difficulties across {folder_count} folders.")
+
+    for _ in range(count):
+        # 9 strings: artist, artist unicode, title, title unicode, creator,
+        # difficulty name, audio filename, md5, .osu filename
+        fields = [r.string() for _ in range(9)]
+        md5, osu_filename = fields[7], fields[8]
+        diff_name = fields[5]
+        title = fields[2] or fields[3]
+
+        state = r.u8()
+        r.skip(2 + 2 + 2)        # circle / slider / spinner counts
+        r.skip(8)                # last edit time
+        r.skip(4 * 4)            # AR, CS, HP, OD
+        r.skip(8)                # slider velocity
+
+        # Star ratings, one table per ruleset (std, taiko, ctb, mania).
+        star_rating = None
+        for mode_index in range(4):
+            pairs = r.i32()
+            for _ in range(pairs):
+                mods = r.conditional()
+                stars = r.conditional()
+                # Nomod std rating is the one worth keeping.
+                if mode_index == 0 and mods == 0 and isinstance(stars, float):
+                    star_rating = round(stars, 2)
+
+        r.skip(4 * 3)            # drain / total / preview time
+
+        timing_points = r.i32()
+        r.skip(timing_points * 17)   # double, double, bool
+
+        map_id = r.i32()
+        r.i32()                  # map set id
+        r.i32()                  # thread id
+        r.skip(4)                # 4 grade bytes
+        r.skip(2)                # local offset
+        r.skip(4)                # stack leniency
+        mode = r.u8()
+        r.string()               # source
+        r.string()               # tags
+        r.skip(2)                # online offset
+        r.string()               # title font
+        r.skip(1)                # unplayed
+        r.skip(8)                # last played
+        r.skip(1)                # is osz2
+        folder = r.string()      # folder name inside Songs/
+        r.skip(8)                # last sync
+        r.skip(5)                # 5 disable-* booleans
+        r.skip(4)                # last modification
+        r.skip(1)                # mania scroll speed
+
+        if want_mode is not None and mode != want_mode:
+            continue
+        if not folder or not osu_filename:
+            continue
+
+        yield {
+            "folder": folder,
+            "filename": osu_filename,
+            "md5": md5,
+            "title": title,
+            "diff_name": diff_name,
+            "map_id": map_id if map_id > 0 else None,
+            "star_rating": star_rating,
+            "ranked_status": _STABLE_STATUS.get(state, "unknown"),
+        }
+
+
+def default_stable_songs_dir(install_dir):
+    """Songs/ lives next to osu!.db in a stable install."""
+    return os.path.join(install_dir, "Songs")
+
+
+def find_stable_db(folder):
+    """
+    Locates osu!.db given either a stable install folder or its Songs/ folder,
+    since people point the tool at both. Returns (db_path, songs_dir) or None.
+    """
+    if not folder or not os.path.isdir(folder):
+        return None
+    candidates = [folder, os.path.dirname(os.path.normpath(folder))]
+    for base in candidates:
+        db = os.path.join(base, "osu!.db")
+        songs = os.path.join(base, "Songs")
+        if os.path.isfile(db) and os.path.isdir(songs):
+            return db, songs
+    return None
+
+
+def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=None,
+                    cancel_event=None, pause_event=None):
+    """
+    Fast path for osu!stable: take the file list from osu!.db instead of
+    walking Songs/.
+
+    Returns (results, errors), or None if the db can't be used - callers fall
+    back to scan_folder() in that case.
+    """
+    import time
+
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    t0 = time.time()
+    log(f"Found osu!.db - reading the beatmap list from it instead of walking {songs_dir} "
+        f"(much faster, and skips non-osu!standard difficulties without opening them).")
+    try:
+        entries = list(read_osu_db(db_path, log_cb=log_cb, want_mode=0))
+    except (OSError, ValueError, EOFError, struct.error) as e:
+        log(f"Couldn't read osu!.db ({e}) - falling back to scanning {songs_dir}.")
+        return None
+
+    if not entries:
+        log("osu!.db listed no osu!standard difficulties - falling back to a filesystem scan.")
+        return None
+
+    log(f"osu!.db gave {len(entries)} osu!standard difficulties in {time.time() - t0:.1f}s. Parsing them now.")
+
+    results = []
+    errors = []
+    missing = 0
+    for i, e in enumerate(entries):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
+        wait_if_paused(pause_event, cancel_event)
+
+        full = os.path.join(songs_dir, e["folder"], e["filename"])
+        try:
+            diff = parse_osu_file(full)
+        except OSError:
+            missing += 1
+            diff = None
+        except Exception as exc:
+            errors.append((full, str(exc)))
+            diff = None
+
+        if diff is not None and diff.objs:
+            # osu!.db already knows these, so take them rather than
+            # recomputing or leaving them blank as a folder scan would.
+            diff.ranked_status = e["ranked_status"]
+            diff.star_rating = e["star_rating"]
+            diff.online_id = e["map_id"]
+            if e["md5"]:
+                diff.version_hash = e["md5"]
+            results.append(diff)
+            if on_parsed:
+                on_parsed(diff)
+
+        if progress_cb and (i + 1) % 25 == 0:
+            progress_cb(i + 1, len(entries))
+        if log_cb and (i + 1) % 5000 == 0:
+            log(f"  ... {i + 1}/{len(entries)} parsed")
+
+    if progress_cb:
+        progress_cb(len(entries), len(entries))
+    log(f"Stable scan complete in {time.time() - t0:.1f}s. {len(results)} difficulties classified.")
+    if missing:
+        log(f"{missing} files listed in osu!.db are no longer on disk (deleted outside osu!, "
+            f"or the db is stale because osu! hasn't been closed since).")
+    if errors:
+        log(f"{len(errors)} files failed to parse.")
+    return results, errors
+
+
 def default_realm_reader_path():
     """
     Looks for the compiled realm-reader helper next to this script (source
@@ -1514,6 +1849,21 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     else:
         log("No client.realm found (not pointed at a lazer data folder or files/ subfolder) - "
             "skipping the realm fast path.")
+
+    # osu!stable fast path. Same idea as the lazer realm path: take the file
+    # list from the game's own database rather than walking the disk. On a
+    # 25k-folder library the walk alone costs ~180s, and it also has to hash
+    # every file and open non-osu!standard difficulties only to discard them.
+    if diffs is None:
+        stable = find_stable_db(songs_folder)
+        if stable:
+            db_path, songs_dir = stable
+            stable_result = scan_stable_db(
+                db_path, songs_dir, progress_cb=progress_cb, log_cb=log_cb,
+                on_parsed=classify_and_free, cancel_event=cancel_event,
+                pause_event=pause_event)
+            if stable_result is not None:
+                diffs, errors = stable_result
 
     if diffs is None:
         scan_root = songs_folder

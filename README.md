@@ -35,7 +35,7 @@ back to a much slower method.
 ## Quick start
 
 1. Point it at your beatmap folder:
-   - **stable**: your `Songs` folder
+   - **stable**: your osu! install folder or its `Songs` folder — either works. If `osu!.db` is found next to `Songs`, the beatmap list is read straight from it instead of walking the disk, which is far faster and also gives you ranked status, star ratings and beatmap IDs
    - **lazer**: your osu! data folder — the one with `client.realm` (`%appdata%\osu` on Windows by default). If you've moved your library to another drive, `%appdata%\osu` is just a stub containing a `storage.ini` that points at the real folder; that redirect is followed automatically, but you can also point straight at the real folder.
 
 2. Choose an export folder and which categories you want.
@@ -58,7 +58,7 @@ back to a much slower method.
 
 Three notes is enough to be a burst — short bursts are everywhere in jump, aim-control and flow-aim maps.
 
-You can filter to specific categories, and (lazer only) split ranked from unranked maps. Thresholds are adjustable via CLI flags or in the GUI.
+You can filter to specific categories, and split ranked from unranked maps. Thresholds are adjustable via CLI flags or in the GUI.
 
 ## How it decides
 
@@ -94,7 +94,7 @@ To score against real maps, hand-label a few dozen mapsets you know well into a 
 python eval_classifier.py --csv report.csv --labels labels.csv
 ```
 
-That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. `online_id` is only populated on the lazer realm fast path.
+That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. `online_id` comes from `osu!.db` on stable and `client.realm` on lazer, so a plain folder scan won't have it.
 
 Scraping osu!'s community beatmap tags was tried and dropped: outside the most popular few hundred maps, almost nothing carries a usertag, so the coverage is far too thin to tune against.
 
@@ -130,7 +130,7 @@ into `realm-reader/` itself, or ~190 runtime DLLs land on top of the source.
 
 ## Credits
 
-- [Piotrekol's CollectionManager](https://github.com/Piotrekol/CollectionManager) — `collection.db` format reference, and the approach of reading `client.realm` directly
+- [Piotrekol's CollectionManager](https://github.com/Piotrekol/CollectionManager) — `collection.db` and `osu!.db` format reference, and the approach of reading the game's own databases directly
 
 - [kabiiQ's BeatmapExporter](https://github.com/kabiiQ/BeatmapExporter) — alternative lazer export tool
 

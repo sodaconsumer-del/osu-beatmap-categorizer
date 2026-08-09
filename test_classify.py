@@ -14,6 +14,8 @@ Run with:  python test_classify.py
        or: pytest test_classify.py
 """
 
+import os
+
 import classify_maps as cm
 
 
@@ -336,6 +338,135 @@ def test_jumps_vs_bursts_is_decided_by_coverage():
     # Same flags, different coverage - whichever covers more of the map wins.
     assert cm.category_of(False, True, True, 5, 100, 60.0) == "Jumps with bursts"
     assert cm.category_of(False, True, True, 80, 100, 20.0) == "Bursts"
+
+
+# --- osu!stable database ---------------------------------------------------
+
+def _uleb(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def _str(s):
+    if s == "":
+        return b"\x00"
+    e = s.encode("utf-8")
+    return b"\x0b" + _uleb(len(e)) + e
+
+
+def _build_osu_db(entries, version=20191105):
+    """Builds a minimal but structurally exact osu!.db for round-trip tests."""
+    import struct as st
+    b = bytearray()
+    b += st.pack("<i", version)
+    b += st.pack("<i", 1)            # folder count
+    b += b"\x01"                     # account unlocked
+    b += st.pack("<q", 0)            # unlock date
+    b += _str("tester")
+    b += st.pack("<i", len(entries))
+    for e in entries:
+        for s in ["artist", "artistU", e["title"], "titleU", "creator",
+                  e["diff_name"], "audio.mp3", e["md5"], e["filename"]]:
+            b += _str(s)
+        b += bytes([e["state"]])
+        b += st.pack("<hhh", 1, 2, 3)      # circles / sliders / spinners
+        b += st.pack("<q", 0)              # edit date
+        b += st.pack("<ffff", 9.0, 4.0, 5.0, 8.0)
+        b += st.pack("<d", 1.4)
+        for mode_index in range(4):
+            if mode_index == 0 and e.get("stars") is not None:
+                b += st.pack("<i", 1)
+                b += b"\x08" + st.pack("<i", 0)              # mods = 0 (int32)
+                b += b"\x0d" + st.pack("<d", e["stars"])     # stars (double)
+            else:
+                b += st.pack("<i", 0)
+        b += st.pack("<iii", 0, 0, 0)      # drain / total / preview
+        b += st.pack("<i", 1)              # one timing point
+        b += st.pack("<dd", 300.0, 0.0) + b"\x01"
+        b += st.pack("<i", e["map_id"])
+        b += st.pack("<i", 999)            # set id
+        b += st.pack("<i", 0)              # thread id
+        b += bytes(4)                      # grades
+        b += st.pack("<h", 0)              # offset
+        b += st.pack("<f", 0.7)            # stack leniency
+        b += bytes([e["mode"]])
+        b += _str("") + _str("")           # source, tags
+        b += st.pack("<h", 0)              # online offset
+        b += _str("")                      # title font
+        b += b"\x00" + st.pack("<q", 0) + b"\x00"   # unplayed, last played, osz2
+        b += _str(e["folder"])
+        b += st.pack("<q", 0)              # last sync
+        b += bytes(5)                      # disable-* flags
+        b += st.pack("<i", 0)              # last modification
+        b += bytes([0])                    # mania scroll speed
+    b += st.pack("<i", 0)                  # permissions
+    return bytes(b)
+
+
+def _write_db(tmpname, entries, version=20191105):
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), tmpname)
+    with open(path, "wb") as f:
+        f.write(_build_osu_db(entries, version))
+    return path
+
+
+_DB_ENTRY = dict(title="Song", diff_name="Insane", md5="a" * 32,
+                 filename="song [Insane].osu", folder="123 Artist - Song",
+                 state=4, map_id=555, mode=0, stars=5.55)
+
+
+def test_osu_db_round_trip():
+    path = _write_db("cat_test_1.db", [_DB_ENTRY])
+    rows = list(cm.read_osu_db(path))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["folder"] == "123 Artist - Song"
+    assert r["filename"] == "song [Insane].osu"
+    assert r["md5"] == "a" * 32
+    assert r["map_id"] == 555
+    assert r["ranked_status"] == "ranked"
+    assert abs(r["star_rating"] - 5.55) < 0.01
+
+
+def test_osu_db_filters_non_standard_modes():
+    mania = dict(_DB_ENTRY, mode=3, filename="m.osu")
+    path = _write_db("cat_test_2.db", [_DB_ENTRY, mania])
+    assert len(list(cm.read_osu_db(path, want_mode=0))) == 1
+    assert len(list(cm.read_osu_db(path, want_mode=None))) == 2
+
+
+def test_osu_db_maps_stable_status_bytes():
+    # stable's status encoding differs from lazer's and the API's.
+    wanted = {1: "unsubmitted", 2: "pending", 4: "ranked",
+              5: "approved", 6: "qualified", 7: "loved"}
+    entries = [dict(_DB_ENTRY, state=s, filename=f"{s}.osu") for s in wanted]
+    rows = list(cm.read_osu_db(_write_db("cat_test_3.db", entries)))
+    assert [r["ranked_status"] for r in rows] == list(wanted.values())
+
+
+def test_loved_from_osu_db_is_not_ranked():
+    rows = list(cm.read_osu_db(_write_db(
+        "cat_test_4.db", [dict(_DB_ENTRY, state=7)])))
+    assert rows[0]["ranked_status"] == "loved"
+    assert not cm.is_ranked(rows[0]["ranked_status"])
+
+
+def test_old_osu_db_versions_are_refused():
+    # Pre-20191105 files lay records out differently; guessing would silently
+    # produce garbage, so the reader refuses and the caller falls back.
+    path = _write_db("cat_test_5.db", [_DB_ENTRY], version=20140609)
+    try:
+        list(cm.read_osu_db(path))
+    except ValueError as e:
+        assert "older than" in str(e)
+    else:
+        raise AssertionError("expected a ValueError for an outdated osu!.db")
 
 
 def _main():

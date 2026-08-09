@@ -3,11 +3,14 @@
 osu! Burst/Stream/Jump Classifier - GUI
 -----------------------------------------
 A user-friendly front end for classify_maps.py. Works with:
-  - osu!stable: point it at your Songs/ folder directly
-  - osu!lazer: export your library with BeatmapExporter first
-    (https://github.com/kabiiQ/BeatmapExporter), then point this at
-    whatever folder you exported to. .osz files are read natively -
-    no need to extract them.
+  - osu!stable: point it at your osu! install folder or its Songs/ folder.
+    The beatmap list is read from osu!.db when it's there, which skips the
+    directory walk entirely and brings ranked status, star ratings and
+    beatmap ids along with it.
+  - osu!lazer: point it at your osu! data folder (the one with
+    client.realm). No export step needed.
+  - Anything else: a plain folder of .osu files, or .osz archives from
+    BeatmapExporter, are read directly - no extraction required.
 
 Pure standard library (tkinter) - nothing to pip install.
 """
@@ -373,7 +376,7 @@ class ClassifierGUI(tk.Tk):
                   style="Muted.TLabel").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Ranked status handling ---
-        frame_ranked = ttk.LabelFrame(body, text="4. Ranked status (osu!lazer fast path only)")
+        frame_ranked = ttk.LabelFrame(body, text="4. Ranked status")
         frame_ranked.pack(fill="x", **pad)
         self.ranked_mode_var = tk.StringVar(value="all_together")
         row_ranked = ttk.Frame(frame_ranked)
@@ -388,12 +391,14 @@ class ClassifierGUI(tk.Tk):
             ttk.Radiobutton(row_ranked, text=label, variable=self.ranked_mode_var, value=value).pack(
                 side="left", padx=(0, 14))
         ttk.Label(frame_ranked,
-                  text="Ranked status is only known when scanning via osu!lazer's realm fast path. "
-                       "Other scan methods (Songs folder, files/ folder, .osz) can't tell ranked from unranked.",
+                  text="Ranked status comes from the game's own database - osu!.db on stable, "
+                       "client.realm on lazer. Pointing at a bare folder of .osu/.osz files instead "
+                       "(a BeatmapExporter export, or lazer's files/ folder on its own) has no "
+                       "database to read, so ranked status is unknown there.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Star rating filter ---
-        frame_star = ttk.LabelFrame(body, text="5. Star rating filter (osu!lazer fast path only)")
+        frame_star = ttk.LabelFrame(body, text="5. Star rating filter")
         frame_star.pack(fill="x", **pad)
         row_star = ttk.Frame(frame_star)
         row_star.pack(fill="x", padx=10, pady=8)
@@ -404,8 +409,9 @@ class ClassifierGUI(tk.Tk):
         self.max_star_var = tk.StringVar(value="")
         ttk.Entry(row_star, textvariable=self.max_star_var, width=8).pack(side="left", padx=(4, 4))
         ttk.Label(frame_star,
-                  text="Leave blank for no limit. Decimals OK (e.g. Max Star: 6.5). Same lazer-only "
-                       "availability as ranked status - a filter here matches nothing on other scan methods.",
+                  text="Leave blank for no limit. Decimals OK (e.g. Max Star: 6.5). Star ratings come from "
+                       "the same database as ranked status, so a filter here matches nothing when "
+                       "scanning a bare folder of files.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Mods ---
