@@ -204,6 +204,33 @@ def test_category_of_accepts_a_diff_or_raw_values():
     assert cm.category_of(d) == cm.category_of(True, False, False, 0, 0, 0.0) == "Streams"
 
 
+def test_one_short_stream_in_a_long_map_is_not_a_stream_map():
+    # The NiNo case: a 12-note run inside a long map of jumps. 12 notes out of
+    # ~400 is 3% coverage - nowhere near enough to call the map a stream map,
+    # even when the jump content sits just under jump_pct_threshold so there
+    # is technically nothing for it to lose the coverage comparison to.
+    lines = circles(12) + [
+        f"{100 + (i % 2) * 120},100,{3000 + i * 200},1,0" for i in range(390)
+    ]
+    d = classify(lines)
+    assert not d.has_streams, "3% stream coverage should not flag a map as having streams"
+    assert d.stream_count == 1, "the run itself should still be counted for the report"
+
+
+def test_a_map_that_is_mostly_stream_still_qualifies():
+    d = classify(circles(60))
+    assert d.has_streams
+    assert cm.category_of(d) == "Streams"
+
+
+def test_stream_threshold_is_tunable():
+    lines = circles(12) + [
+        f"{100 + (i % 2) * 120},100,{3000 + i * 200},1,0" for i in range(390)
+    ]
+    assert not classify(lines).has_streams
+    assert classify(lines, stream_pct_threshold=1.0).has_streams
+
+
 def test_stream_note_total_is_recorded():
     # category_of can't compare stream coverage without this being populated.
     d = classify(circles(16))

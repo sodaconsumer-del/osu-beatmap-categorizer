@@ -383,6 +383,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    burst_min=3, burst_max=9, stream_min=10,
                    jump_velocity_ratio=0.75, jump_pct_threshold=15.0,
                    jump_min_transitions=40, jump_gap_cap_ms=1000.0,
+                   stream_pct_threshold=15.0,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
                    cut_max_multiple=3.0, mods=None):
     """
@@ -610,7 +611,21 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     diff.total_note_count = len(objs)
 
     diff.has_bursts = len(bursts) > 0
-    diff.has_streams = len(streams) > 0
+    # A stream has to cover a real share of the map, not merely exist.
+    #
+    # has_jumps has always required clearing a threshold while has_streams was
+    # pure presence, and that asymmetry was the bug: a NiNo-style jump map
+    # with ONE 10-note run in 402 notes (2.5% coverage) came out as a stream
+    # map. It escaped the stream-vs-jump coverage comparison because its
+    # jump_pct was 14.5%, a half point under jump_pct_threshold - so
+    # has_jumps was false, there was nothing to lose to, and presence won.
+    #
+    # Measured separation is wide: across ten NiNo mapsets the stream-flagged
+    # runs cover 2.5-12.9% of their maps, while known real stream maps sit at
+    # 55-96%. 15% sits in the gap with room on both sides.
+    stream_coverage_pct = (diff.stream_note_total / diff.total_note_count * 100) \
+        if diff.total_note_count else 0.0
+    diff.has_streams = len(streams) > 0 and stream_coverage_pct >= stream_pct_threshold
     # Require a floor of actual gameplay before a percentage means anything.
     # Without it a 30-note diff with 5 wide transitions clears a 15% threshold
     # and gets called a jump map on the strength of five jumps.
@@ -1346,6 +1361,10 @@ DEFAULT_PARAMS = dict(
     # Gaps longer than this are breaks, and are kept out of the jump_pct
     # denominator entirely.
     jump_gap_cap_ms=1000.0,
+    # Minimum share of a map's notes that must sit in stream runs before it
+    # counts as having streams at all. The mirror of jump_pct_threshold -
+    # without it, one short run in a long jump map claimed the whole map.
+    stream_pct_threshold=15.0,
     run_wide_fraction_max=0.4,
     mean_diam_ratio_max=1.5,
     # Largest skipped-note gap that still counts as a cut within one stream
@@ -1723,6 +1742,10 @@ def main():
                      help="Minimum in-play transitions before jump percentage is allowed to decide anything")
     ap.add_argument("--jump-gap-cap-ms", type=float, default=DEFAULT_PARAMS["jump_gap_cap_ms"],
                      help="Gaps longer than this are breaks and stay out of the jump-percentage denominator")
+    ap.add_argument("--stream-pct-threshold", type=float, default=DEFAULT_PARAMS["stream_pct_threshold"],
+                     help="Minimum %% of a map's notes that must be in stream runs before it counts as "
+                          "having streams. Mirrors --jump-pct-threshold; stops one short run in a long "
+                          "jump map claiming the whole map.")
     ap.add_argument("--run-wide-fraction-max", type=float, default=DEFAULT_PARAMS["run_wide_fraction_max"])
     ap.add_argument("--mean-diam-ratio-max", type=float, default=DEFAULT_PARAMS["mean_diam_ratio_max"],
                      help="Max average distance/circle-diameter ratio across a run for it to still count "

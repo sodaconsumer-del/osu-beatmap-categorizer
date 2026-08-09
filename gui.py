@@ -448,6 +448,7 @@ class ClassifierGUI(tk.Tk):
             ("spaced_diam_ratio", "Spaced stream ratio", cm.DEFAULT_PARAMS["spaced_diam_ratio"]),
             ("jump_velocity_ratio", "Jump vel. (diam/100ms)", cm.DEFAULT_PARAMS["jump_velocity_ratio"]),
             ("jump_pct_threshold", "Jump %% threshold", cm.DEFAULT_PARAMS["jump_pct_threshold"]),
+            ("stream_pct_threshold", "Stream %% threshold", cm.DEFAULT_PARAMS["stream_pct_threshold"]),
             ("jump_min_transitions", "Min notes for jump calc", cm.DEFAULT_PARAMS["jump_min_transitions"]),
             ("jump_gap_cap_ms", "Break cutoff (ms)", cm.DEFAULT_PARAMS["jump_gap_cap_ms"]),
             ("run_wide_fraction_max", "Max wide fraction in run", cm.DEFAULT_PARAMS["run_wide_fraction_max"]),
