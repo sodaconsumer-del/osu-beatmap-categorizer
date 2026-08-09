@@ -60,16 +60,17 @@ def load_predictions(path):
                 # same shared rules rather than a second copy of them.
                 try:
                     bnt = int(row.get("burst_note_total") or 0)
+                    snt = int(row.get("stream_note_total") or 0)
                     tnc = int(row.get("total_note_count") or 0)
                     jp = float(row.get("jump_pct") or 0)
                 except ValueError:
-                    bnt = tnc = 0
+                    bnt = snt = tnc = 0
                     jp = 0.0
                 category = cm.category_of(
                     row.get("has_streams") == "True",
                     row.get("has_bursts") == "True",
                     row.get("has_jumps") == "True",
-                    bnt, tnc, jp,
+                    bnt, tnc, jp, snt,
                 )
             preds[oid] = category
     return preds, missing_online_id

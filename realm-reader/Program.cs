@@ -186,18 +186,40 @@ class Program
                     setIndex++;
                     if (setIndex % 5000 == 0)
                         Console.Error.WriteLine($"realm-reader: processed {setIndex} beatmap sets so far...");
-                    // osu!'s BeatmapOnlineStatus enum: -2=Graveyard, -1=WIP,
-                    // 0=Pending, 1=Ranked, 2=Approved, 3=Qualified, 4=Loved.
-                    // Ranked/Approved/Loved/Qualified all have real
-                    // leaderboards and are what most players mean by
-                    // "ranked" in casual usage - only Graveyard/WIP/Pending
-                    // count as "unranked" here.
-                    string rankedStatus = "unranked";
+                    // osu!'s BeatmapOnlineStatus enum.
+                    //
+                    // This used to collapse to a "ranked"/"unranked" boolean
+                    // with everything >= 1 counted as ranked, which swept
+                    // Loved and Qualified in with it. Loved maps are NOT
+                    // ranked - they award no pp, and a player asking for
+                    // "ranked only" does not mean "include the Loved
+                    // section". Qualified is likewise not ranked yet and can
+                    // still be disqualified.
+                    //
+                    // So emit the actual status and let the Python side
+                    // decide. That keeps the judgement call in one place, and
+                    // lets a caller filter for Loved specifically rather than
+                    // having the distinction thrown away here.
+                    string rankedStatus;
                     try
                     {
                         int statusValue = (int)set.Status;
-                        if (statusValue >= 1)
-                            rankedStatus = "ranked";
+                        rankedStatus = statusValue switch
+                        {
+                            // -4 and -3 are real and common: a sample of this
+                            // library's sets was 6% "None". Both mean the set
+                            // isn't in a submitted online state at all.
+                            -4 => "locally_modified",
+                            -3 => "none",
+                            -2 => "graveyard",
+                            -1 => "wip",
+                            0 => "pending",
+                            1 => "ranked",
+                            2 => "approved",
+                            3 => "qualified",
+                            4 => "loved",
+                            _ => "unknown",
+                        };
                     }
                     catch (Exception)
                     {

@@ -81,12 +81,13 @@ class DiffInfo:
     max_stream_len: int = 0
     jump_pct: float = 0.0
 
-    # Total notes covered by burst runs (not just run count) and total note
-    # count for the diff - used to compare burst coverage against jump
-    # coverage proportionally, rather than treating "any burst run at all"
-    # as equally significant regardless of how small it is relative to the
-    # rest of the map.
+    # Total notes covered by burst/stream runs (not just run count) and total
+    # note count for the diff - used to compare each pattern's coverage
+    # against the others proportionally, rather than treating "any run at
+    # all" as equally significant regardless of how small it is relative to
+    # the rest of the map.
     burst_note_total: int = 0
+    stream_note_total: int = 0
     total_note_count: int = 0
 
     # multi-label - a diff can be any combination of these, not mutually exclusive
@@ -606,6 +607,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     diff.max_stream_len = max(streams, default=0)
     diff.jump_pct = (jump_count / counted_gaps * 100) if counted_gaps else 0.0
     diff.burst_note_total = sum(bursts)
+    diff.stream_note_total = sum(streams)
     diff.total_note_count = len(objs)
 
     diff.has_bursts = len(bursts) > 0
@@ -1106,9 +1108,31 @@ def write_collection_db(path, collections, db_version=20211103):
 
 CATEGORIES = ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]
 
+# Which osu! online statuses count as "ranked" for filtering and splitting.
+#
+# Ranked and Approved are the two that award pp. Loved and Qualified do NOT:
+# Loved is a curated section with no pp, and Qualified is still in the queue
+# and can be disqualified. Lumping those in with ranked (which this used to
+# do, via a >= 1 check on the raw enum) means "ranked only" silently hands
+# you a pile of Loved maps.
+RANKED_STATUSES = frozenset({"ranked", "approved"})
+
+
+def is_ranked(status):
+    """
+    True for statuses that award pp.
+
+    Accepts the real status names emitted by current realm-reader builds, and
+    still understands the bare "ranked"/"unranked" that older compiled
+    helpers emit - the helper ships as a prebuilt binary and can lag the
+    Python it sits next to.
+    """
+    return status in RANKED_STATUSES
+
 
 def category_of(has_streams, has_bursts=None, has_jumps=None,
-                 burst_note_total=0, total_note_count=0, jump_pct=0.0):
+                 burst_note_total=0, total_note_count=0, jump_pct=0.0,
+                 stream_note_total=0):
     """
     The one place the dominant-pattern rules live.
 
@@ -1116,22 +1140,46 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     the individual values, which is what the CSV path does. Both callers used
     to carry their own copy of these rules, so a threshold change had to be
     made twice and could silently drift.
+
+    Every pattern has to EARN the map by covering more of it than the
+    competition. Streams used to win outright on mere presence, so a map that
+    was 90% jumps with a single stream buried in it came out as a stream map
+    - which is the opposite of what "dominant pattern" means, and
+    inconsistent with the coverage comparison bursts had always been subject
+    to. Streams now face the same test.
+
+    Coverage is notes-in-runs over total notes, compared against jump_pct.
+    The two aren't measured identically (one counts notes, the other counts
+    transitions), so this is a proportion-vs-proportion judgement rather than
+    an exact comparison - but it's the same basis bursts vs jumps has always
+    used, and it separates the obvious cases cleanly.
     """
     if hasattr(has_streams, "has_streams"):
         d = has_streams
         has_streams, has_bursts, has_jumps = d.has_streams, d.has_bursts, d.has_jumps
         burst_note_total, total_note_count = d.burst_note_total, d.total_note_count
         jump_pct = d.jump_pct
+        stream_note_total = d.stream_note_total
 
-    if has_streams:
+    jump_coverage = jump_pct / 100.0
+    stream_coverage = (stream_note_total / total_note_count) if total_note_count else 0.0
+    burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
+
+    if has_streams and (not has_jumps or stream_coverage >= jump_coverage):
         return "Streams"
+    # Streams present but out-covered by jumps: this is a jump map that
+    # happens to contain a stream, so it falls through to be judged on its
+    # jump and burst content like any other jump map.
     if has_jumps and has_bursts:
-        burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
-        return "Jumps with bursts" if (jump_pct / 100.0) > burst_coverage else "Bursts"
+        return "Jumps with bursts" if jump_coverage > burst_coverage else "Bursts"
     if has_bursts:
         return "Bursts"
     if has_jumps:
         return "Jumps (no bursts)"
+    if has_streams:
+        # Has a stream, no jumps to lose to, but didn't take the branch above
+        # (only reachable if total_note_count is zero/unknown).
+        return "Streams"
     return "Misc"
 
 
@@ -1239,14 +1287,14 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
             "provides it) - all diffs are being treated as unranked for this filter/split.")
 
     if ranked_mode == "ranked_only":
-        return {label: [d for d in members if d.ranked_status == "ranked"] for label, members in groups.items()}
+        return {label: [d for d in members if is_ranked(d.ranked_status)] for label, members in groups.items()}
     elif ranked_mode == "unranked_only":
-        return {label: [d for d in members if d.ranked_status != "ranked"] for label, members in groups.items()}
+        return {label: [d for d in members if not is_ranked(d.ranked_status)] for label, members in groups.items()}
     elif ranked_mode == "split":
         result = {}
         for label, members in groups.items():
-            ranked = [d for d in members if d.ranked_status == "ranked"]
-            unranked = [d for d in members if d.ranked_status != "ranked"]
+            ranked = [d for d in members if is_ranked(d.ranked_status)]
+            unranked = [d for d in members if not is_ranked(d.ranked_status)]
             if ranked:
                 result[f"{label} - Ranked"] = ranked
             if unranked:
@@ -1438,12 +1486,14 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                 mods_str = "+".join(mods) if mods else "NM"
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
-                            "max_stream_len", "jump_pct", "burst_note_total", "total_note_count",
+                            "max_stream_len", "jump_pct", "burst_note_total", "stream_note_total",
+                            "total_note_count",
                             "ranked_status", "star_rating", "online_id", "mods", "category", "path"])
                 for d in diffs:
                     w.writerow([d.title, d.diff_name, round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
-                                d.max_stream_len, round(d.jump_pct, 1), d.burst_note_total, d.total_note_count,
+                                d.max_stream_len, round(d.jump_pct, 1), d.burst_note_total,
+                                d.stream_note_total, d.total_note_count,
                                 d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown",
                                 d.online_id if d.online_id is not None else "unknown", mods_str,
                                 category_of(d), d.path])
@@ -1538,16 +1588,17 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
             if category not in groups:
                 try:
                     burst_note_total = int(row.get("burst_note_total") or 0)
+                    stream_note_total = int(row.get("stream_note_total") or 0)
                     total_note_count = int(row.get("total_note_count") or 0)
                     jump_pct = float(row.get("jump_pct") or 0)
                 except ValueError:
-                    burst_note_total = total_note_count = 0
+                    burst_note_total = stream_note_total = total_note_count = 0
                     jump_pct = 0.0
                 category = category_of(
                     row.get("has_streams") == "True",
                     row.get("has_bursts") == "True",
                     row.get("has_jumps") == "True",
-                    burst_note_total, total_note_count, jump_pct,
+                    burst_note_total, total_note_count, jump_pct, stream_note_total,
                 )
             groups[category].append(entry)
 
@@ -1590,14 +1641,14 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                 "used the osu!lazer realm fast path) - all diffs are being treated as unranked for this filter/split.")
 
         if ranked_mode == "ranked_only":
-            groups = {label: [(h, s, sr) for h, s, sr in entries if s == "ranked"] for label, entries in groups.items()}
+            groups = {label: [(h, s, sr) for h, s, sr in entries if is_ranked(s)] for label, entries in groups.items()}
         elif ranked_mode == "unranked_only":
-            groups = {label: [(h, s, sr) for h, s, sr in entries if s != "ranked"] for label, entries in groups.items()}
+            groups = {label: [(h, s, sr) for h, s, sr in entries if not is_ranked(s)] for label, entries in groups.items()}
         elif ranked_mode == "split":
             split_groups = {}
             for label, entries in groups.items():
-                ranked = [h for h, s, _ in entries if s == "ranked"]
-                unranked = [h for h, s, _ in entries if s != "ranked"]
+                ranked = [h for h, s, _ in entries if is_ranked(s)]
+                unranked = [h for h, s, _ in entries if not is_ranked(s)]
                 if ranked:
                     split_groups[f"{label} - Ranked"] = ranked
                 if unranked:

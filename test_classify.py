@@ -204,8 +204,70 @@ def test_category_of_accepts_a_diff_or_raw_values():
     assert cm.category_of(d) == cm.category_of(True, False, False, 0, 0, 0.0) == "Streams"
 
 
-def test_streams_win_over_everything():
-    assert cm.category_of(True, True, True, 50, 100, 90.0) == "Streams"
+def test_stream_note_total_is_recorded():
+    # category_of can't compare stream coverage without this being populated.
+    d = classify(circles(16))
+    assert d.stream_note_total == 16
+
+
+# --- ranked status ---------------------------------------------------------
+
+def test_loved_and_qualified_are_not_ranked():
+    # The reported bug: realm-reader collapsed everything >= 1 in osu!'s
+    # status enum to "ranked", which swept in Loved (4) and Qualified (3).
+    # Neither awards pp.
+    assert not cm.is_ranked("loved")
+    assert not cm.is_ranked("qualified")
+
+
+def test_ranked_and_approved_are_ranked():
+    assert cm.is_ranked("ranked")
+    assert cm.is_ranked("approved")
+
+
+def test_unsubmitted_statuses_are_not_ranked():
+    for status in ("graveyard", "wip", "pending", "unknown", None):
+        assert not cm.is_ranked(status), status
+
+
+def test_ranked_only_filter_drops_loved():
+    class FakeDiff:
+        def __init__(self, status):
+            self.ranked_status = status
+    groups = {"Streams": [FakeDiff("ranked"), FakeDiff("loved"),
+                          FakeDiff("approved"), FakeDiff("qualified")]}
+    kept = cm.build_output_collections(groups, ranked_mode="ranked_only")["Streams"]
+    assert [d.ranked_status for d in kept] == ["ranked", "approved"]
+
+
+def test_split_puts_loved_on_the_unranked_side():
+    class FakeDiff:
+        def __init__(self, status):
+            self.ranked_status = status
+    groups = {"Streams": [FakeDiff("ranked"), FakeDiff("loved")]}
+    out = cm.build_output_collections(groups, ranked_mode="split")
+    assert [d.ranked_status for d in out["Streams - Ranked"]] == ["ranked"]
+    assert [d.ranked_status for d in out["Streams - Unranked"]] == ["loved"]
+
+
+def test_streams_win_when_they_cover_the_map():
+    # 50 of 100 notes in streams vs 20% jumps - a stream map.
+    assert cm.category_of(True, True, True, 10, 100, 20.0, 50) == "Streams"
+
+
+def test_one_stream_in_a_jump_map_does_not_make_it_a_stream_map():
+    # The reported bug: 90% jumps with a single 10-note stream came out as
+    # Streams because any stream at all used to win outright.
+    assert cm.category_of(True, False, True, 0, 1000, 90.0, 10) == "Jumps (no bursts)"
+
+
+def test_jump_map_with_a_stream_and_bursts_lands_in_jumps_with_bursts():
+    assert cm.category_of(True, True, True, 20, 1000, 90.0, 10) == "Jumps with bursts"
+
+
+def test_stream_still_wins_when_there_are_no_jumps():
+    # No jump content to lose to, so even a modest stream takes the map.
+    assert cm.category_of(True, False, False, 0, 1000, 0.0, 10) == "Streams"
 
 
 def test_jumps_vs_bursts_is_decided_by_coverage():
