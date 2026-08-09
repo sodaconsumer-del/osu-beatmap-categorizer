@@ -49,6 +49,7 @@ the synthetic unit tests.
 import argparse
 import bisect
 import hashlib
+import math
 import os
 import re
 import struct
@@ -215,7 +216,14 @@ def parse_osu_bytes(raw, display_name, path=None):
             objs.append((float(t), end_t, x, y, ex, ey))
     objs.sort(key=lambda o: o[0])
 
+    # A malformed/corrupt map can carry a beatLength near zero (subnormal
+    # float, no exception at division - IEEE754 divide overflow just returns
+    # inf). round(inf) later crashes the CSV write with "cannot convert float
+    # infinity to integer", so clamp here at the source rather than only
+    # guarding every downstream consumer.
     bpm = 60000.0 / timing_points[0][1] if timing_points else 0.0
+    if not math.isfinite(bpm):
+        bpm = 0.0
 
     return DiffInfo(
         path=path,
@@ -1902,10 +1910,18 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                             "max_stream_len", "jump_pct", "burst_note_total", "stream_note_total",
                             "total_note_count",
                             "ranked_status", "star_rating", "online_id", "mods", "category", "path"])
+                def safe_round(x, ndigits=None):
+                    # round() raises OverflowError on inf and ValueError on
+                    # nan - one bad map (a corrupt beatLength, say) shouldn't
+                    # abort the whole CSV.
+                    if not isinstance(x, (int, float)) or not math.isfinite(x):
+                        return 0
+                    return round(x, ndigits)
+
                 for d in diffs:
-                    w.writerow([d.title, d.diff_name, round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
+                    w.writerow([d.title, d.diff_name, safe_round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
-                                d.max_stream_len, round(d.jump_pct, 1), d.burst_note_total,
+                                d.max_stream_len, safe_round(d.jump_pct, 1), d.burst_note_total,
                                 d.stream_note_total, d.total_note_count,
                                 d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown",
                                 d.online_id if d.online_id is not None else "unknown", mods_str,

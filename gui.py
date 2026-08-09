@@ -189,6 +189,10 @@ class ClassifierGUI(tk.Tk):
                     bordercolor=c["border"], focuscolor=c["bg"])
         s.configure("TProgressbar", background=c["accent"], troughcolor=c["trough"],
                     bordercolor=c["border"], lightcolor=c["accent"], darkcolor=c["accent"])
+        s.configure("TScrollbar", background=c["surface"], troughcolor=c["bg"],
+                    bordercolor=c["border"], arrowcolor=c["fg"],
+                    lightcolor=c["surface"], darkcolor=c["surface"])
+        s.map("TScrollbar", background=[("active", c["accent"])])
 
         # ttk state maps: without these, hover and disabled states revert to
         # clam's stock grey and the dark theme flickers light on mouseover.
@@ -299,7 +303,18 @@ class ClassifierGUI(tk.Tk):
         # Mouse wheel. Bound on the toplevel rather than the canvas so it
         # works wherever the pointer is, and a no-op when everything already
         # fits (otherwise the view jitters against its own scroll limits).
+        #
+        # bind_all fires for every widget regardless of what's under the
+        # cursor - Tk runs a widget's own bindings AND "all" bindings, it
+        # doesn't pick one. So without the guard below, scrolling inside the
+        # log (which has its own native Text scrolling) ALSO scrolled the
+        # outer canvas at the same time: the log moved one way and the whole
+        # window shifted under it in the same gesture. Skip entirely when the
+        # pointer is over the log so only its own scrollbar/wheel handling
+        # applies.
         def _on_wheel(event):
+            if event.widget is self.log_text:
+                return
             first, last = self.canvas.yview()
             if first <= 0.0 and last >= 1.0:
                 return
@@ -495,8 +510,13 @@ class ClassifierGUI(tk.Tk):
         # --- Log ---
         frame_log = ttk.LabelFrame(bottom, text="Log")
         frame_log.pack(fill="both", expand=True, **pad)
-        self.log_text = tk.Text(frame_log, height=12, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+        log_row = ttk.Frame(frame_log)
+        log_row.pack(fill="both", expand=True, padx=8, pady=8)
+        self.log_text = tk.Text(log_row, height=12, wrap="word", state="disabled")
+        log_vsb = ttk.Scrollbar(log_row, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_vsb.set)
+        log_vsb.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
 
     # ------------------------------------------------------------------
     # UI actions

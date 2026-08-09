@@ -177,6 +177,15 @@ def test_even_repeats_end_back_at_the_head():
     assert d.objs[0][2:4] == d.objs[0][4:6]
 
 
+def test_tiny_beat_length_does_not_produce_infinite_bpm():
+    # A subnormal beatLength overflows 60000/bl to inf with no exception at
+    # the division itself - round(inf) later crashes CSV writing with
+    # "cannot convert float infinity to integer". Must be clamped at parse.
+    d = build(circles(2), bl=1e-320)
+    assert d.bpm == 0.0
+    assert not float("inf") == d.bpm  # explicit, in case the clamp regresses to inf-passthrough
+
+
 def test_non_standard_modes_are_skipped():
     text = HEADER.format(cs=4, bl=300, extra="").replace("Mode: 0", "Mode: 3")
     assert cm.parse_osu_bytes((text + "100,100,1000,1,0").encode(), "t") is None
