@@ -176,11 +176,17 @@ of the above must parse as `int` rather than `float` when read from CLI/GUI
 text: `burst_min`, `burst_max`, `stream_min`, `jump_min_transitions`.
 
 `MIN_OBJECTS_TO_CLASSIFY` (10, module-level constant, not in `DEFAULT_PARAMS`
-and not CLI/GUI-adjustable) is a hard floor below `classify_diff` entirely:
-a diff under 10 hit objects is never run through the pattern logic at all and
-comes back Misc, regardless of `burst_min`. `total_note_count` is still set
-correctly for these — it's assigned before the floor check, not after, since
-that was the original bug this constant's addition fixed (see git history).
+and not CLI/GUI-adjustable) treats a diff under 10 hit objects as junk - a
+broken upload, a storyboard-only "difficulty", a leftover test file - rather
+than real gameplay worth reporting on. `is_junk_diff()` gates every scan path
+(`scan_folder`, `scan_lazer_realm`, `scan_stable_db`) before a diff is added
+to results, so these are excluded from the CSV, `collection.db`, and the
+difficulty count entirely - not merely filed under Misc. `classify_diff()`
+independently enforces the same floor and returns Misc-shaped defaults if
+called directly on a too-small `DiffInfo` (tests do this; it's the fallback
+for any caller that bypasses the scan-level gate). `total_note_count` is set
+before that internal check, not after, so a direct `classify_diff()` call
+still reports the real count even though nothing else runs.
 
 ### Mod math
 

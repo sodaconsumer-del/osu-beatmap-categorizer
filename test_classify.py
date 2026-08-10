@@ -123,6 +123,41 @@ def test_total_note_count_is_recorded_even_below_the_classify_floor():
     assert classify(circles(5)).total_note_count == 5
 
 
+def test_is_junk_diff():
+    d9 = build(circles(9))
+    d10 = build(circles(10))
+    assert cm.is_junk_diff(d9)
+    assert not cm.is_junk_diff(d10)
+    assert cm.is_junk_diff(None)
+
+
+def test_junk_diffs_never_reach_scan_results():
+    # The actual behaviour that matters: a sub-floor diff isn't just
+    # classified as Misc, it's dropped before it's ever added to a scan's
+    # results at all - so it never reaches the CSV, collection.db, or the
+    # difficulty count. Verified through the real scan_folder path (temp
+    # .osu files on disk), not just the is_junk_diff() helper in isolation,
+    # since that's where the actual filtering happens.
+    import shutil
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="cm_junk_test_")
+    try:
+        junk_text = HEADER.format(cs=4, bl=300, extra="") + "\n".join(circles(9))
+        real_text = HEADER.format(cs=4, bl=300, extra="") + "\n".join(circles(10))
+        with open(os.path.join(tmpdir, "junk.osu"), "w", encoding="utf-8") as f:
+            f.write(junk_text)
+        with open(os.path.join(tmpdir, "real.osu"), "w", encoding="utf-8") as f:
+            f.write(real_text)
+
+        results, errors = cm.scan_folder(tmpdir)
+        assert len(results) == 1, "the 9-object junk file should have been dropped"
+        assert results[0].diff_name == "Test"
+        assert not errors
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # --- cut streams -----------------------------------------------------------
 
 def test_cut_stream_counts_as_one_stream():

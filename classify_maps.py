@@ -390,12 +390,25 @@ def mod_adjustments(mods, circle_size):
 # Classification
 # --------------------------------------------------------------------------
 
-# Below this many hit objects there isn't enough data for pattern content to
-# mean anything - a 4-note diff being "60% jumps" is noise, not a finding.
-# Hard floor, independent of burst_min (which can be set lower via CLI/GUI):
-# a diff this sparse gets skipped and reported as Misc regardless of what
-# burst_min is configured to.
+# Below this many hit objects, a diff is almost certainly junk (a broken
+# upload, a storyboard-only "difficulty", a leftover test file) rather than
+# real gameplay - a 4-note diff being "60% jumps" is noise, not a finding.
+# Hard floor, independent of burst_min (which can be set lower via CLI/GUI).
+#
+# Excluded entirely, not just reported as Misc: every scan path (scan_folder,
+# scan_lazer_realm, scan_stable_db) filters on this before a diff is even
+# added to the results list, so junk this small never reaches the CSV,
+# collection.db, or the classify step at all. classify_diff() also enforces
+# it independently below, as a second line of defense for any caller that
+# builds a DiffInfo and classifies it directly rather than through a scan
+# (tests do this; --from-csv rebuilds do not re-run classify_diff at all,
+# since they work from already-computed CSV columns).
 MIN_OBJECTS_TO_CLASSIFY = 10
+
+
+def is_junk_diff(diff):
+    """True if `diff` has too few hit objects to be worth keeping at all."""
+    return diff is None or len(diff.objs) < MIN_OBJECTS_TO_CLASSIFY
 
 
 def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
@@ -794,7 +807,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
         check_cancel()
         try:
             diff = parse_osu_file(full)
-            if diff is not None and diff.objs:
+            if not is_junk_diff(diff):
                 results.append(emit(diff))
         except Exception as e:
             errors.append((full, str(e)))
@@ -817,7 +830,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
                         raw = z.read(name)
                         display = f"{os.path.basename(full)}::{name}"
                         diff = parse_osu_bytes(raw, display_name=display, path=display)
-                        if diff is not None and diff.objs:
+                        if not is_junk_diff(diff):
                             results.append(emit(diff))
                     except Exception as e:
                         errors.append((f"{full}::{name}", str(e)))
@@ -843,7 +856,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
                 with open(full, "rb") as f:
                     raw = f.read()
                 diff = parse_osu_bytes(raw, display_name=os.path.basename(full), path=full)
-                if diff is not None and diff.objs:
+                if not is_junk_diff(diff):
                     results.append(emit(diff))
                     matched += 1
         except Exception as e:
@@ -1176,7 +1189,7 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
             errors.append((full, str(exc)))
             diff = None
 
-        if diff is not None and diff.objs:
+        if not is_junk_diff(diff):
             # osu!.db already knows these, so take them rather than
             # recomputing or leaving them blank as a folder scan would.
             diff.ranked_status = e["ranked_status"]
@@ -1360,7 +1373,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
         wait_if_paused(pause_event, cancel_event)
         try:
             diff = parse_osu_file(full)
-            if diff is not None and diff.objs:
+            if not is_junk_diff(diff):
                 diff.ranked_status = ranked_status
                 diff.star_rating = star_rating
                 diff.online_id = online_id
