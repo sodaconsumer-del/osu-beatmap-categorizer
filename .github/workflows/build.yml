@@ -6,6 +6,13 @@ on:
       - "v*"
   workflow_dispatch: {}
 
+# Default GITHUB_TOKEN is read-only unless a repo/org setting overrides it.
+# softprops/action-gh-release needs write access to create the release and
+# attach the zip - without this, that step fails with "Resource not
+# accessible by integration" even though everything up to it succeeds.
+permissions:
+  contents: write
+
 jobs:
   test:
     # Runs on every build. The classifier is a pile of tuned heuristics, so a
