@@ -85,7 +85,14 @@ def test_speed_change_splits_a_run():
 
 def test_three_notes_is_a_burst():
     # Three circles really is a burst - common in jump and flow-aim maps.
-    d = classify(circles(3))
+    # Padded past MIN_OBJECTS_TO_CLASSIFY (10) with slow, stationary filler
+    # notes so the floor below doesn't swallow this before burst_min gets a
+    # say: filler starts >500ms after the burst (way past max_gap_ms) and is
+    # itself 500ms apart, so none of it joins the burst or forms a run of its
+    # own (a lone slow transition can't reach burst_min anyway).
+    filler = [f"100,100,{2000 + i * 500},1,0" for i in range(7)]
+    d = classify(circles(3) + filler)
+    assert d.total_note_count == 10
     assert d.has_bursts
     assert d.burst_count == 1
 
@@ -93,6 +100,27 @@ def test_three_notes_is_a_burst():
 def test_two_notes_is_not_a_burst():
     d = classify(circles(2))
     assert not d.has_bursts
+
+
+def test_sub_floor_diffs_are_not_classified_at_all():
+    # 9 fast, tight notes - exactly what burst_max (9) would call a single
+    # burst if classification ran. But MIN_OBJECTS_TO_CLASSIFY is 10, and
+    # this diff only has 9 objects total, so it must never reach the burst
+    # logic: too little data for a pattern verdict to mean anything.
+    d = classify(circles(9))
+    assert not d.has_bursts
+    assert not d.has_streams
+    assert not d.has_jumps
+    assert cm.category_of(d) == "Misc"
+
+
+def test_total_note_count_is_recorded_even_below_the_classify_floor():
+    # The original form of this bug: total_note_count silently stayed at the
+    # dataclass default (0) for any diff too small to classify, so the CSV
+    # under-reported a real difficulty's note count. Must be accurate
+    # regardless of whether classification actually ran.
+    assert classify(circles(1)).total_note_count == 1
+    assert classify(circles(5)).total_note_count == 5
 
 
 # --- cut streams -----------------------------------------------------------

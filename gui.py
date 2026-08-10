@@ -3,10 +3,10 @@
 osu! Burst/Stream/Jump Classifier - GUI
 -----------------------------------------
 A user-friendly front end for classify_maps.py. Works with:
-  - osu!stable: point it at your osu! install folder or its Songs/ folder.
-    The beatmap list is read from osu!.db when it's there, which skips the
-    directory walk entirely and brings ranked status, star ratings and
-    beatmap ids along with it.
+  - osu!stable: point it at your osu! install folder (the one osu!.db and
+    Songs/ both live in - not Songs/ itself). Reads osu!.db directly, which
+    skips the directory walk entirely and brings ranked status, star ratings
+    and beatmap ids along with it.
   - osu!lazer: point it at your osu! data folder (the one with
     client.realm). No export step needed.
   - Anything else: a plain folder of .osu files, or .osz archives from
@@ -345,7 +345,9 @@ class ClassifierGUI(tk.Tk):
 
         hint = ttk.Label(
             frame_in,
-            text="stable: your Songs folder.\n"
+            text="stable: your osu! install folder (the one with osu!.db and Songs/ in it, not "
+                 "Songs/ itself) - reads osu!.db directly for a fast scan, or falls back to walking "
+                 "Songs/ if it can't.\n"
                  "lazer: point at your osu! data folder (e.g. %appdata%\\osu on Windows, containing "
                  "client.realm and files/) - uses a fast direct-read path if available, or falls back to "
                  "scanning files/ directly otherwise. No export needed either way.\n"
@@ -522,7 +524,7 @@ class ClassifierGUI(tk.Tk):
     # UI actions
     # ------------------------------------------------------------------
     def _pick_folder(self):
-        path = filedialog.askdirectory(title="Select your Songs folder (or your lazer osu! data folder)")
+        path = filedialog.askdirectory(title="Select your osu! install folder (stable) or data folder (lazer)")
         if path:
             self.folder_var.set(path)
 
@@ -605,9 +607,7 @@ class ClassifierGUI(tk.Tk):
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
-        self.progress.stop()
-        self.progress.config(mode="determinate")
-        self._indeterminate = False
+        self._stop_progress_bar()
         self.progress["value"] = 0
         self._last_progress_text = ""
         self.progress_label.config(text="Starting...")
@@ -626,6 +626,20 @@ class ClassifierGUI(tk.Tk):
             daemon=True,
         )
         self.worker_thread.start()
+
+    def _stop_progress_bar(self):
+        """
+        Resets the bar to a clean determinate state, regardless of what mode
+        it was in. Bug: previously only _start_run did this - the done/
+        cancelled/error handlers never did, so a cancel or crash landing
+        during the walk's indeterminate (pulsing) phase left the bar
+        animating forever under a "Cancelled"/error message until the next
+        run started and reset it. .stop() on an already-stopped bar is a
+        harmless no-op, so this is safe to call unconditionally.
+        """
+        self.progress.stop()
+        self.progress.config(mode="determinate")
+        self._indeterminate = False
 
     def _cancel_run(self):
         if self.running and self.cancel_event is not None:
@@ -702,9 +716,7 @@ class ClassifierGUI(tk.Tk):
                             self.progress_label.config(text=self._last_progress_text)
                     elif total:
                         if self._indeterminate:
-                            self._indeterminate = False
-                            self.progress.stop()
-                            self.progress.config(mode="determinate")
+                            self._stop_progress_bar()
                         self.progress["maximum"] = total
                         self.progress["value"] = done
                         self._last_progress_text = f"{done}/{total} files"
@@ -723,6 +735,7 @@ class ClassifierGUI(tk.Tk):
                     self.run_button.config(state="normal")
                     self.pause_button.config(state="disabled", text="Pause")
                     self.cancel_button.config(state="disabled")
+                    self._stop_progress_bar()
                     self.progress_label.config(text="")
                     self.running = False
                 elif kind == "cancelled":
@@ -730,6 +743,7 @@ class ClassifierGUI(tk.Tk):
                     self.run_button.config(state="normal")
                     self.pause_button.config(state="disabled", text="Pause")
                     self.cancel_button.config(state="disabled")
+                    self._stop_progress_bar()
                     self.progress_label.config(text="Cancelled")
                     self.running = False
                 elif kind == "error":
@@ -738,6 +752,7 @@ class ClassifierGUI(tk.Tk):
                     self.run_button.config(state="normal")
                     self.pause_button.config(state="disabled", text="Pause")
                     self.cancel_button.config(state="disabled")
+                    self._stop_progress_bar()
                     self.running = False
         except queue.Empty:
             pass

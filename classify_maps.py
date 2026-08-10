@@ -390,6 +390,14 @@ def mod_adjustments(mods, circle_size):
 # Classification
 # --------------------------------------------------------------------------
 
+# Below this many hit objects there isn't enough data for pattern content to
+# mean anything - a 4-note diff being "60% jumps" is noise, not a finding.
+# Hard floor, independent of burst_min (which can be set lower via CLI/GUI):
+# a diff this sparse gets skipped and reported as Misc regardless of what
+# burst_min is configured to.
+MIN_OBJECTS_TO_CLASSIFY = 10
+
+
 def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    tight_diam_ratio=1.35, spaced_diam_ratio=2.0,
                    burst_min=3, burst_max=9, stream_min=10,
@@ -465,7 +473,13 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     the baseline; see mod_adjustments().
     """
     objs = diff.objs
-    if len(objs) < burst_min:
+    # Set regardless of what follows - a diff too sparse to classify still
+    # has a real note count, and the CSV should say so rather than leaving
+    # the dataclass default (0) in place. That was the original form of this
+    # bug: total_note_count silently read 0 for any diff under the old
+    # burst_min floor.
+    diff.total_note_count = len(objs)
+    if len(objs) < MIN_OBJECTS_TO_CLASSIFY:
         return diff
 
     rate, eff_cs = mod_adjustments(mods, diff.circle_size)
@@ -2108,8 +2122,9 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
 def main():
     ap = argparse.ArgumentParser(description="Classify osu! maps by burst/stream/jump content.")
     ap.add_argument("songs_folder", nargs="?", default=None,
-                     help="Path to your osu! Songs folder (or a folder of exported .osz/.osu files). "
-                          "Not needed with --from-csv.")
+                     help="Path to your osu! install folder for stable (not Songs/ itself - osu!.db "
+                          "lives one level up from there), your lazer data folder, or a plain folder "
+                          "of exported .osz/.osu files. Not needed with --from-csv.")
     ap.add_argument("--from-csv", default=None,
                      help="Rebuild collection.db from an existing report.csv instead of rescanning "
                           "(fast - just re-hashes the files already listed in the CSV)")

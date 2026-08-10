@@ -175,6 +175,13 @@ already-computed run lengths). `INT_PARAMS` in `classify_maps.py` lists which
 of the above must parse as `int` rather than `float` when read from CLI/GUI
 text: `burst_min`, `burst_max`, `stream_min`, `jump_min_transitions`.
 
+`MIN_OBJECTS_TO_CLASSIFY` (10, module-level constant, not in `DEFAULT_PARAMS`
+and not CLI/GUI-adjustable) is a hard floor below `classify_diff` entirely:
+a diff under 10 hit objects is never run through the pattern logic at all and
+comes back Misc, regardless of `burst_min`. `total_note_count` is still set
+correctly for these — it's assigned before the floor check, not after, since
+that was the original bug this constant's addition fixed (see git history).
+
 ### Mod math
 
 `mod_adjustments(mods, circle_size)` → `(rate, effective_circle_size)`.

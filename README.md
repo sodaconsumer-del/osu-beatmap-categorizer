@@ -32,7 +32,7 @@ Run `osu-beatmap-categorizer.exe`. Keep the `realm-reader` folder next to it —
 
 ## Quick start
 
-1. Point it at your beatmap folder (stable install/`Songs`, or lazer's data folder — either works, redirects are followed automatically).
+1. Point it at your beatmap folder — for stable, your osu! **install folder** (not `Songs` directly - that's where `osu!.db` lives), for lazer, its data folder. Redirects are followed automatically.
 2. Choose an export folder and which categories you want.
 3. Hit **Run classification**.
 4. Check `report.csv`, then **back up your existing `collection.db`** before replacing it — or import via [CollectionManager](https://github.com/Piotrekol/CollectionManager) instead of copying the file directly.
