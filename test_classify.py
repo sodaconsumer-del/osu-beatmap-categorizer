@@ -14,6 +14,7 @@ Run with:  python test_classify.py
        or: pytest test_classify.py
 """
 
+import math
 import os
 
 import classify_maps as cm
@@ -238,6 +239,65 @@ def test_slider_duration_is_computed():
 def test_even_repeats_end_back_at_the_head():
     d = build(["100,100,1000,2,0,L|400:100,2,300"])
     assert d.objs[0][2:4] == d.objs[0][4:6]
+
+
+# --- exact curve math (Bezier / Perfect circle / Catmull) ------------------
+#
+# A Bezier, Perfect-circle, and Catmull curve all pass through their own
+# final control point EXACTLY at t=1 - a basic property of each
+# construction, not something specific to this port. Requesting a pixel
+# length far longer than the curve's true length forces exactly that case
+# (the walk consumes every sampled segment and clamps to the last point),
+# which makes these deterministic without needing to hand-derive the
+# natural arc length of each shape first.
+
+def test_bezier_slider_end_reaches_final_control_point():
+    # Head (0,0) + curve points (100,0), (100,100) = a 3-point quadratic
+    # Bezier. Length grossly exceeds the true curve length, so the walk
+    # should land exactly on the last control point.
+    d = build(["0,0,1000,2,0,B|100:0|100:100,1,999999"])
+    ex, ey = d.objs[0][4:6]
+    assert abs(ex - 100.0) < 0.5 and abs(ey - 100.0) < 0.5
+
+
+def test_perfect_circle_slider_end_reaches_final_control_point():
+    # Head (0,0) + curve points (100,100), (200,0) - non-collinear, so this
+    # takes the exact closed-form arc path, not the Bezier fallback.
+    d = build(["0,0,1000,2,0,P|100:100|200:0,1,999999"])
+    ex, ey = d.objs[0][4:6]
+    assert abs(ex - 200.0) < 0.5 and abs(ey - 0.0) < 0.5
+
+
+def test_catmull_slider_end_reaches_final_control_point():
+    d = build(["0,0,1000,2,0,C|80:60|150:-30|220:110,1,999999"])
+    ex, ey = d.objs[0][4:6]
+    assert abs(ex - 220.0) < 0.5 and abs(ey - 110.0) < 0.5
+
+
+def test_collinear_perfect_circle_falls_back_to_bezier_not_a_crash():
+    # osu! itself falls back to Bezier when a 'P' slider's 3 points are
+    # collinear (no circle passes through them). Must not crash either way.
+    d = build(["0,0,1000,2,0,P|50:50|100:100,1,999999"])
+    ex, ey = d.objs[0][4:6]
+    assert math.isfinite(ex) and math.isfinite(ey)
+
+
+def test_malformed_curve_falls_back_without_crashing():
+    # Garbage curve data must degrade to SOMETHING finite (the old polyline
+    # approximation, or the head) rather than take classification down.
+    for curve_field in ["B|not:a:point", "P|1:1", "B", ""]:
+        d = build([f"0,0,1000,2,0,{curve_field},1,300"])
+        ex, ey = d.objs[0][4:6]
+        assert math.isfinite(ex) and math.isfinite(ey), curve_field
+
+
+def test_bezier_with_red_anchor_split_reaches_final_point():
+    # A duplicated point mid-curve stitches two Bezier segments together
+    # (osu!'s red-anchor convention) - _multi_bezier_endpoint must walk
+    # across the split, not just the first segment.
+    d = build(["0,0,1000,2,0,B|50:50|50:50|100:0|100:100,1,999999"])
+    ex, ey = d.objs[0][4:6]
+    assert abs(ex - 100.0) < 0.5 and abs(ey - 100.0) < 0.5
 
 
 def test_tiny_beat_length_does_not_produce_infinite_bpm():

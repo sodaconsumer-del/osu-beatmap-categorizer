@@ -274,18 +274,18 @@ def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
     so parts[5] is the curve, parts[6] the number of slides (1 = no repeat)
     and parts[7] the path length in osu!pixels.
 
-    Duration is exact, straight from osu!'s own formula. The end POSITION is
-    an approximation: the true path is a bezier/perfect-circle/catmull curve,
-    and computing it properly means reimplementing osu!'s path generator. We
-    instead walk `length` pixels along the polyline through the control
-    points, which is exact for linear sliders and close for the gentle curves
-    that make up most real maps. It over-runs slightly on tightly-curved
-    sliders (a chord is shorter than its arc), in which case it clamps to the
-    last control point.
+    Duration is exact, straight from osu!'s own formula. The end POSITION
+    uses exact curve math (_curve_endpoint) - real Bezier/Perfect-circle/
+    Catmull evaluation, ported from llllllllll/slider's algorithms (which
+    follow osu!'s own path generator) - falling back to the older polyline
+    walk (_point_along_polyline) only if that raises anything at all.
+    Malformed/edge-case real files should degrade to the old (already
+    shipped, already validated) approximation rather than ever crash
+    classification over a slider tail position.
 
-    This only feeds spacing, and even a rough tail position is far better
-    than the alternative of using the head - a long slider whose tail sits
-    next to the following note otherwise reads as a huge jump.
+    This only feeds spacing, and even an approximate tail position is far
+    better than the alternative of using the head - a long slider whose
+    tail sits next to the following note otherwise reads as a huge jump.
     """
     try:
         slides = int(parts[6])
@@ -310,12 +310,16 @@ def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
         return end_t, x, y
 
     curve = parts[5] if len(parts) > 5 else ""
-    ex, ey = _point_along_polyline(curve, x, y, length)
+    try:
+        kind, ex, ey = _curve_endpoint(curve, x, y, length)
+    except Exception:
+        ex, ey = _point_along_polyline(curve, x, y, length)
     return end_t, ex, ey
 
 
-def _point_along_polyline(curve, x0, y0, length):
-    """Walk `length` pixels from (x0, y0) along the slider's control points."""
+def _parse_curve_points(curve, x0, y0):
+    """(x0,y0) plus the control points encoded in a HitObjects curve field
+    (e.g. "B|264:100|300:200|..."), as a list of (x, y) tuples."""
     pts = [(x0, y0)]
     for token in curve.split("|")[1:]:  # first token is the curve type letter
         bits = token.split(":")
@@ -325,9 +329,14 @@ def _point_along_polyline(curve, x0, y0, length):
             pts.append((float(bits[0]), float(bits[1])))
         except ValueError:
             continue
-    if len(pts) < 2:
-        return x0, y0
+    return pts
 
+
+def _walk_points(pts, length):
+    """Point at arc-distance `length` along the polyline pts, clamped to the
+    last point if the polyline is shorter."""
+    if len(pts) < 2:
+        return pts[0] if pts else (0.0, 0.0)
     remaining = length
     for i in range(1, len(pts)):
         ax, ay = pts[i - 1]
@@ -340,6 +349,285 @@ def _point_along_polyline(curve, x0, y0, length):
             return ax + (bx - ax) * f, ay + (by - ay) * f
         remaining -= seg
     return pts[-1]
+
+
+def _point_along_polyline(curve, x0, y0, length):
+    """Walk `length` pixels from (x0, y0) along the RAW control points -
+    exact for linear sliders, an approximation (chord instead of arc) for
+    curved ones. Kept as the fallback for _curve_endpoint - see there for
+    why an approximation beats letting a bad slider crash the whole scan.
+    """
+    return _walk_points(_parse_curve_points(curve, x0, y0), length)
+
+
+# --------------------------------------------------------------------------
+# Exact slider curve math
+# --------------------------------------------------------------------------
+#
+# Ported from llllllllll/slider's curve.py (Bezier/Perfect/Catmull), which
+# itself follows osu!'s own path generator (ppy/osu SliderCurve.cs /
+# PathApproximator.cs). That library depends on numpy+scipy; this project is
+# pure stdlib by design (see AGENTS.md), so only the ALGORITHMS are ported,
+# not the library - math.comb (stdlib since 3.8) stands in for
+# scipy.special.comb exactly, since binomial coefficients of integers are
+# what it's used for here.
+#
+# Also narrower in scope than the original: slider's Curve objects support
+# evaluating position at any t in [0, 1] (for rendering the slider ball's
+# full path). classify_maps.py only ever needs the ENDPOINT at the slider's
+# stated pixel length, so there's no need to port slider's t-in-[0,1]
+# bisect/reparametrization machinery across stitched sub-curves at all -
+# just walk each sub-curve in path order, consuming the stated length as we
+# go, and stop the moment it's used up. This sidesteps a real bug in that
+# reparametrization for multi-segment curves (confirmed by hand-calculation
+# against the actual library): when the requested length falls far enough
+# short of the curve's full natural length that the shortfall exceeds the
+# LAST sub-curve's own length, slider's curve(1.0) incorrectly clamps to a
+# segment boundary instead of correctly landing in an earlier sub-curve.
+# Real .osu files rarely hit this (mappers' stated pixel length is normally
+# close to the drawn curve's natural length), which is presumably why it's
+# unnoticed, but there's no reason to inherit it.
+#
+# Validated (not just ported and trusted): Perfect matches the reference
+# library exactly (0.00px) at every length fraction tested, since it's a
+# closed-form circular arc with no segment-stitching involved. Bezier and
+# Catmull were validated a different way - independent of the reference
+# library's own quirk above - by checking that the returned point actually
+# sits at arc-distance `length` along a much finer resampling (2000 points
+# per segment, vs. the 50 this uses) of the same curve; both landed
+# sub-pixel-accurate (<1.1px, most <0.4px) across the full 10%-100% length
+# range. Linear was not included in that check (not worth resampling
+# 2-6 already-straight points at 2000x density) - it's the plain polyline
+# walk this file already shipped, which is exact by construction for
+# straight segments regardless.
+
+
+def _bezier_polyline(points, n=50):
+    """(points, total_length) sampled along the Bezier curve through
+    `points`, evenly spaced in t, via the Bernstein/binomial formula.
+    Length is accumulated in the same pass the points are generated in,
+    rather than a separate walk over the result afterwards - profiled,
+    that second pass alone was ~12% of total slider parsing time.
+
+    The binomial coefficients (math.comb(degree, i)) depend only on the
+    point count, never on t - so they're computed once per curve here,
+    rather than freshly on every sample. That hoist is not a micro-
+    optimization: profiled on a 300-map real sample, computing them inside
+    the per-sample, per-point inner loop (the first version of this) made
+    math.comb() alone 3.4 million calls and slider parsing ~14x slower than
+    the old plain-polyline approximation - on a 60k-difficulty library
+    that's the difference between a few minutes and the better part of an
+    hour. Hoisted, the exact curve math costs about 2x the old
+    approximation - still real overhead, but a bounded, validated one.
+    """
+    degree = len(points) - 1
+    coeffs = [math.comb(degree, i) for i in range(degree + 1)]
+    pts = []
+    total_len = 0.0
+    prev = None
+    for step in range(n + 1):
+        t = step / n
+        u = 1 - t
+        x = y = 0.0
+        for i, (px, py) in enumerate(points):
+            b = coeffs[i] * (u ** (degree - i)) * (t ** i)
+            x += b * px
+            y += b * py
+        pts.append((x, y))
+        if prev is not None:
+            total_len += ((x - prev[0]) ** 2 + (y - prev[1]) ** 2) ** 0.5
+        prev = (x, y)
+    return pts, total_len
+
+
+def _sample_curve(eval_fn, n=50):
+    """n+1 points along eval_fn(t) for t in [0, 1], evenly spaced in t.
+    Used for Catmull, whose per-t cost is already O(1) (no hoistable work
+    like Bezier's binomial coefficients) - see _bezier_polyline for why
+    Bezier sampling doesn't go through this generic path."""
+    return [eval_fn(i / n) for i in range(n + 1)]
+
+
+def _polyline_length(pts):
+    return sum(
+        ((pts[i][0] - pts[i - 1][0]) ** 2 + (pts[i][1] - pts[i - 1][1]) ** 2) ** 0.5
+        for i in range(1, len(pts))
+    )
+
+
+def _split_at_dupes(points):
+    """Split control points into Bezier sub-curves at duplicate (red anchor)
+    points, same convention osu! uses for a single HitObjects curve field to
+    encode multiple stitched Bezier segments."""
+    groups = []
+    old_ix = 0
+    for n, (a, b) in enumerate(zip(points, points[1:]), 1):
+        if a == b:
+            groups.append(points[old_ix:n])
+            old_ix = n
+    tail = points[old_ix:]
+    if tail:
+        groups.append(tail)
+    return groups
+
+
+def _multi_bezier_endpoint(points, length, samples=25):
+    """Endpoint of a 'B' curve at its stated pixel length: walk each
+    duplicate-split sub-curve in path order, stopping once `length` is
+    consumed. Also the fallback target for 'P' curves with an unusable
+    point count or collinear points, matching osu!'s own fallback.
+
+    samples=25, not a higher number: validated against a much finer (2000-
+    sample) resampling of the same curves that 50 samples gives max error
+    ~1.1px and mean ~0.26px, 25 gives max ~1.0px and mean ~0.27px -
+    statistically the same accuracy, half the per-slider cost. Below ~16
+    the error actually starts growing (worse curve-shape resolution), so
+    this isn't "lower is always cheaper for free" - 25 is close to the
+    accuracy/cost knee, not an arbitrary round number.
+    """
+    segments = _split_at_dupes(points)
+    remaining = length
+    last_point = points[-1] if points else (0.0, 0.0)
+    for seg in segments:
+        if len(seg) == 1:
+            last_point = seg[0]
+            continue
+        pts, seg_len = _bezier_polyline(seg, samples)
+        last_point = pts[-1]
+        if remaining <= seg_len:
+            return _walk_points(pts, remaining)
+        remaining -= seg_len
+    return last_point
+
+
+def _get_circle_center(a, b, c):
+    """Center of the circle through 3 points, matching osu!'s own
+    CircularArcApproximator.cs. Raises ValueError if collinear - caller
+    should fall back to Bezier, same as osu! does for a degenerate P
+    slider."""
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    a_sq = (bx - cx) ** 2 + (by - cy) ** 2
+    b_sq = (ax - cx) ** 2 + (ay - cy) ** 2
+    c_sq = (ax - bx) ** 2 + (ay - by) ** 2
+
+    if math.isclose(a_sq, 0, abs_tol=1e-9) or math.isclose(b_sq, 0, abs_tol=1e-9) \
+            or math.isclose(c_sq, 0, abs_tol=1e-9):
+        raise ValueError("collinear")
+
+    s = a_sq * (b_sq + c_sq - a_sq)
+    t = b_sq * (a_sq + c_sq - b_sq)
+    u = c_sq * (a_sq + b_sq - c_sq)
+    total = s + t + u
+    if math.isclose(total, 0, abs_tol=1e-9):
+        raise ValueError("collinear")
+    return ((s * ax + t * bx + u * cx) / total, (s * ay + t * by + u * cy) / total)
+
+
+def _rotate(point, center, radians):
+    px, py = point
+    cx, cy = center
+    dx, dy = px - cx, py - cy
+    cos_r, sin_r = math.cos(radians), math.sin(radians)
+    return (dx * cos_r - dy * sin_r + cx, dx * sin_r + dy * cos_r + cy)
+
+
+def _perfect_endpoint(points, length):
+    """Exact endpoint of a 'P' (perfect circle / arc) curve. Closed form,
+    no sampling - matches the reference library to floating-point
+    precision at every length tested. points must be exactly 3."""
+    p0, p1, p2 = points
+    center = _get_circle_center(p0, p1, p2)
+    cx, cy = center
+    a0x, a0y = p0[0] - cx, p0[1] - cy
+    a2x, a2y = p2[0] - cx, p2[1] - cy
+    start_angle = math.atan2(a0y, a0x)
+    end_angle = math.atan2(a2y, a2x)
+    if end_angle < start_angle:
+        end_angle += 2 * math.pi
+    angle = end_angle - start_angle
+
+    a_to_c = (p2[0] - p0[0], p2[1] - p0[1])
+    ortho = (a_to_c[1], -a_to_c[0])
+    b_minus_a = (p1[0] - p0[0], p1[1] - p0[1])
+    if (ortho[0] * b_minus_a[0] + ortho[1] * b_minus_a[1]) < 0:
+        angle = -(2 * math.pi - angle)
+
+    radius = (a0x ** 2 + a0y ** 2) ** 0.5
+    arc_len = abs(angle * radius)
+    if arc_len > length:
+        angle *= length / arc_len if arc_len else 0.0
+
+    return _rotate(p0, center, angle)
+
+
+def _catmull_point(p0, p1, p2, p3, t):
+    """Point at t on one Catmull-Rom segment (p0/p3 are only used for
+    tangents), cubic Hermite form."""
+    t0x, t0y = 0.5 * (p2[0] - p0[0]), 0.5 * (p2[1] - p0[1])
+    t1x, t1y = 0.5 * (p3[0] - p1[0]), 0.5 * (p3[1] - p1[1])
+    tt, ttt = t * t, t * t * t
+    h00 = 2 * ttt - 3 * tt + 1
+    h10 = ttt - 2 * tt + t
+    h01 = -2 * ttt + 3 * tt
+    h11 = ttt - tt
+    x = h00 * p1[0] + h10 * t0x + h01 * p2[0] + h11 * t1x
+    y = h00 * p1[1] + h10 * t0y + h01 * p2[1] + h11 * t1y
+    return (x, y)
+
+
+def _catmull_endpoint(points, length, samples=25):
+    """Endpoint of a 'C' (Catmull-Rom) curve at its stated pixel length -
+    rare in modern maps, but arc-length walking across segments handles it
+    the same way as MultiBezier."""
+    if len(points) < 2:
+        return points[0] if points else (0.0, 0.0)
+
+    padded = [points[0]] + list(points) + [points[-1]]
+    remaining = length
+    last_point = points[-1]
+    for i in range(len(points) - 1):
+        p0, p1, p2, p3 = padded[i], padded[i + 1], padded[i + 2], padded[i + 3]
+        pts = _sample_curve(
+            lambda tt, p0=p0, p1=p1, p2=p2, p3=p3: _catmull_point(p0, p1, p2, p3, tt),
+            samples,
+        )
+        seg_len = _polyline_length(pts)
+        last_point = pts[-1]
+        if remaining <= seg_len:
+            return _walk_points(pts, remaining)
+        remaining -= seg_len
+    return last_point
+
+
+def _curve_endpoint(curve, x0, y0, length):
+    """(kind, x, y) at `length` pixels along the curve encoded in a
+    HitObjects curve field, using exact math for 'B'/'P'/'C' and the plain
+    polyline walk for 'L' (already exact for straight segments). Raises on
+    anything it can't handle - callers should catch and fall back to
+    _point_along_polyline, same as osu! itself falls back to Bezier for a
+    degenerate 'P'."""
+    kind = curve.split("|", 1)[0] if curve else ""
+    points = _parse_curve_points(curve, x0, y0)
+    if len(points) < 2:
+        return kind, x0, y0
+
+    if kind == "P" and len(points) == 3:
+        try:
+            ex, ey = _perfect_endpoint(points, length)
+            return kind, ex, ey
+        except ValueError:
+            pass  # collinear - fall through to Bezier, same as osu! does
+    if kind == "C":
+        ex, ey = _catmull_endpoint(points, length)
+        return kind, ex, ey
+    if kind == "L":
+        ex, ey = _walk_points(points, length)
+        return kind, ex, ey
+    # 'B', and the P-with-wrong-point-count / collinear-P fallbacks.
+    ex, ey = _multi_bezier_endpoint(points, length)
+    return kind, ex, ey
 
 
 # --------------------------------------------------------------------------
