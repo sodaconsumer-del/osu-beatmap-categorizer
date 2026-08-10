@@ -126,6 +126,87 @@ live path and the `--from-csv` rebuild go through it — they used to carry
 separate copies that could drift. `--from-csv` reproducing a byte-identical
 `collection.db` is a good regression check.
 
+### `category_of()` decision order
+
+Evaluated top to bottom, first match wins:
+
+1. `has_streams` AND (no jumps, OR stream coverage ≥ jump coverage) → **Streams**
+2. Jumps and bursts both present → jump coverage > burst coverage ?
+   **Jumps with bursts** : `burst_or_stream()` (see 5)
+3. Bursts present (no jumps) → `burst_or_stream()` (see 5)
+4. Jumps present (no bursts) → **Jumps (no bursts)**
+5. `burst_or_stream()`: a run ≥ `burst_promote_stream_len` (12) exists →
+   **Streams**, else **Bursts**
+6. Nothing matched → **Misc**
+
+`has_streams` itself already requires ≥15% coverage (`stream_pct_threshold`) —
+it is not raw presence. So a map can contain a 10-note stream run and still
+have `has_streams == False` if that run is a small fraction of the map; it
+only shows up via step 5's `burst_promote_stream_len` check, which looks at
+`max_stream_len` directly rather than coverage. This is deliberate — see
+"Except: a burst map that streams once" above.
+
+### `DEFAULT_PARAMS` reference
+
+All in `classify_diff`'s signature and `DEFAULT_PARAMS` at module level, all
+CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
+
+| param | default | meaning |
+|---|---|---|
+| `max_gap_ms` | 140.0 | max ms between taps to count as "fast" (stream BPM = 15000/ms) |
+| `gap_consistency_tol` | 0.18 | max fractional deviation from a run's running-mean gap before it splits |
+| `tight_diam_ratio` | 1.35 | dist/diameter ≤ this = "tight" (stacked) spacing |
+| `spaced_diam_ratio` | 2.0 | dist/diameter ≤ this = "spaced" (still stream-like); above = jump-wide |
+| `burst_min` | 3 | fewest notes to count as a burst |
+| `burst_max` | 9 | most notes still a burst; above is `stream_min` territory |
+| `stream_min` | 10 | fewest notes to count as a stream run |
+| `jump_velocity_ratio` | 0.75 | jump speed cutoff, diameters per 100ms |
+| `jump_pct_threshold` | 15.0 | min % of transitions flagged as jumps before `has_jumps` |
+| `jump_min_transitions` | 40 | floor on in-play transitions before `jump_pct` can decide anything |
+| `jump_gap_cap_ms` | 1000.0 | gaps longer than this are breaks, excluded from `jump_pct`'s denominator |
+| `stream_pct_threshold` | 15.0 | min % of a map's notes in stream runs before `has_streams` |
+| `run_wide_fraction_max` | 0.4 | max fraction of a run's transitions that may be jump-wide before it's rejected as a stream/burst |
+| `mean_diam_ratio_max` | 1.5 | max *average* dist/diameter across a run before it's rejected |
+| `cut_max_multiple` | 3.0 | largest skipped-note gap multiple still treated as a cut inside one stream |
+
+Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
+`category_of()` parameter, not a `classify_diff()` one, since it operates on
+already-computed run lengths). `INT_PARAMS` in `classify_maps.py` lists which
+of the above must parse as `int` rather than `float` when read from CLI/GUI
+text: `burst_min`, `burst_max`, `stream_min`, `jump_min_transitions`.
+
+### Mod math
+
+`mod_adjustments(mods, circle_size)` → `(rate, effective_circle_size)`.
+Verified against `ModDoubleTime.cs` / `OsuModHardRock.cs` in ppy/osu:
+
+| mod | effect |
+|---|---|
+| DT / NC | rate × 1.5 |
+| HT / DC | rate × 0.75 |
+| HR | circle_size × 1.3, capped at 10.0 |
+| EZ | circle_size / 2.0 |
+
+`rate` divides every time value (gaps, durations); `effective_circle_size`
+feeds the diameter that all spacing ratios are measured against. HR's
+`ReflectVerticallyAlongPlayfield` is deliberately not modelled — reflecting
+every object is an isometry, so pairwise distances are unchanged and nothing
+spacing-based can tell the difference.
+
+### `report.csv` columns
+
+`title, diff_name, bpm, has_bursts, has_streams, has_jumps, has_cutstreams,
+burst_runs, stream_runs, cutstream_runs, max_burst_len, max_stream_len,
+jump_pct, burst_note_total, stream_note_total, total_note_count,
+ranked_status, star_rating, online_id, mods, category, path`
+
+`category` is written by the live run (via `category_of()`) so a re-read
+doesn't need to recompute it — `eval_classifier.py` and `collection_from_csv`
+both prefer this column and only fall back to recomputing from the raw flags
+for CSVs from before it existed. `online_id`/`star_rating`/`ranked_status`
+read `"unknown"` when the scan path couldn't supply them (a bare folder walk
+never can — see "Three scan paths").
+
 ## Testing
 
 ```
@@ -163,6 +244,33 @@ The helper build is `continue-on-error`, so a green check does **not** mean it
 shipped. Check the assemble step's log. Tagged releases hard-fail when it's
 missing, because a release without it silently degrades every lazer user to
 the slow path.
+
+## Known limitations
+
+- **Custom stable Songs location isn't detected.** `find_stable_db()` only
+  looks for `Songs/` sitting next to `osu!.db`. A user who moved their Songs
+  folder via `BeatmapDirectory` in `osu!.<user>.cfg` gets silently routed to
+  the slow folder-walk fallback instead of an error — worth fixing if it comes
+  up, by reading that cfg key when the default `Songs/` isn't there.
+- **Jump vs. stream coverage compares two different measures.** `jump_pct` is
+  a percentage of *transitions*; stream/burst coverage is a percentage of
+  *notes*. They're compared directly in `category_of()` (step 2 above)
+  because that's the basis the original burst-vs-jump rule already used, but
+  it's a proportion-vs-proportion judgement, not an exact one, and may lean
+  systematically toward one side. Flagged but not fixed as of the last
+  classification pass — see the `a6eab84`/`fed982c` commit messages for the
+  measurements that motivated the current thresholds anyway.
+- **No labelled eval set ships with the repo.** `eval_classifier.py` needs a
+  `labels.csv` the user builds themselves (hand-labelled mapsets, or osu!
+  API `online_id`s with known categories). There's no bundled ground truth,
+  so "does this threshold change help" can only be answered by whoever has
+  labels on hand.
+- **`realm-reader` is prebuilt and can lag the Python.** Column counts in its
+  tab-separated output have grown twice (added `online_id`, before that
+  `star_rating`). Every consumer (`scan_lazer_realm`) checks `len(parts)`
+  before indexing, so this is handled — but if you add a new column, add it
+  at the end and keep the length checks, or old compiled binaries floating
+  around break silently instead of falling back.
 
 ## Conventions
 

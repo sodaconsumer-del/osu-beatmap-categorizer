@@ -12,97 +12,36 @@ If you wish to contact me, you can find me on osu! ( [-soda-](https://osu.ppy.sh
 
 ##
 
+## What it does
+
+Scans your osu! beatmap library and sorts every difficulty into **Streams**, **Bursts**, **Jumps with bursts**, **Jumps (no bursts)**, or **Misc**, based on the actual note patterns — not tags, not star rating. Works with both osu!stable and osu!lazer, no export step needed. Writes an osu!stable-compatible `collection.db` plus a `report.csv` you should check before trusting the result.
+
+See [AGENTS.md](AGENTS.md) for how the classification actually works and why.
+
+##
+
 ## Download
 
-Grab the latest zip from [Releases](../../releases) and extract it. **Windows
-only** for now. No Python needed.
+Grab the latest zip from [Releases](../../releases) and extract it. **Windows only** for now. No Python needed.
 
-Inside you'll find `osu-beatmap-categorizer.exe` — that's the one to run — next
-to a `realm-reader` folder. Leave that folder where it is: it holds the helper
-that reads osu!lazer's database directly, and without it a lazer scan falls
-back to a much slower method.
+Run `osu-beatmap-categorizer.exe`. Keep the `realm-reader` folder next to it — it's the helper that reads osu!lazer's database directly; without it, lazer scans fall back to a slower method.
 
-> **Windows will probably warn you the first time.** The app isn't code-signed
-> (certificates cost money), so SmartScreen shows "Windows protected your PC".
-> *More info → Run anyway.* Some antivirus also flags PyInstaller-built
-> executables as suspicious — that's a known false positive with how PyInstaller
-> packs Python apps, not something specific to this tool. If you'd rather not
-> take my word for it, the source is right here and you can run it with
-> `python gui.py` instead.
+> **Windows will probably warn you the first time** (SmartScreen — the app isn't code-signed). *More info → Run anyway.* If you'd rather not take that on faith, the source is right here — run it with `python gui.py` instead.
 
 ##
 
 ## Quick start
 
-1. Point it at your beatmap folder:
-   - **stable**: your osu! install folder or its `Songs` folder — either works. If `osu!.db` is found next to `Songs`, the beatmap list is read straight from it instead of walking the disk, which is far faster and also gives you ranked status, star ratings and beatmap IDs
-   - **lazer**: your osu! data folder — the one with `client.realm` (`%appdata%\osu` on Windows by default). If you've moved your library to another drive, `%appdata%\osu` is just a stub containing a `storage.ini` that points at the real folder; that redirect is followed automatically, but you can also point straight at the real folder.
-
+1. Point it at your beatmap folder (stable install/`Songs`, or lazer's data folder — either works, redirects are followed automatically).
 2. Choose an export folder and which categories you want.
-
 3. Hit **Run classification**.
-
-4. Check `report.csv` before trusting the result, then **back up your existing `collection.db`** before replacing it. ( or import via [CollectionManager](https://github.com/Piotrekol/CollectionManager) instead of copying the file directly.)
-
-##
-
-## Categories
-
-| Category | Meaning |
-|---|---|
-| Streams | Streams cover 15%+ of the map, or a burst map streams once (12+ notes). Cutstreams count as streams |
-| Bursts | Has 3-9 note burst(s), and never streams |
-| Jumps with bursts | Has both, but jumps cover more of the map |
-| Jumps (no bursts) | Jump-heavy, no bursts or streams |
-| Misc | None of the above |
-
-Three notes is enough to be a burst — short bursts are everywhere in jump, aim-control and flow-aim maps.
-
-You can filter to specific categories, and split ranked from unranked maps. Thresholds are adjustable via CLI flags or in the GUI.
-
-## How it decides
-
-Speed is measured in **absolute milliseconds between taps**, not as a ratio to the map's stored BPM — plenty of maps are authored at a deliberately doubled tempo, and anything keyed to the stored value gets those wrong. Stream BPM is just `15000 / ms`, so the 140ms default is roughly "a 107 BPM stream or faster".
-
-A run also has to be **rhythmically consistent**: a real stream doesn't change tapping speed partway through. A stream broken by a skipped beat is rejoined before lengths are judged, so a cut stream stays one stream instead of becoming two bursts.
-
-A **burst map that streams even once is a stream map**. Bursts and streams are the same motion, so what matters to a burst player isn't how much of the map streams but whether it ever demands sustained stream stamina at all — one run of 12+ notes does. This applies only to burst maps: a short run inside a jump map is usually tightly-spaced jumps rather than real streaming.
-
-Patterns also have to **cover enough of the map to own it**. One 10-note run in a 400-note jump map doesn't make it a stream map, so streams need at least 15% of the map's notes before they count at all — and even then they still have to out-cover the jumps. This is what stops tightly-spaced jump maps (NiNo-style diffs are the classic case, where the jumps sit close enough together to look like a stream) from being filed under Streams.
-
-Spacing is measured from each object's **end** position. Sliders are around 30% of a typical library, and measuring from the head makes a long slider whose tail sits beside the next note read as a full-screen jump. Spinners are skipped — their stored position is a placeholder, not where you actually move.
+4. Check `report.csv`, then **back up your existing `collection.db`** before replacing it — or import via [CollectionManager](https://github.com/Piotrekol/CollectionManager) instead of copying the file directly.
 
 ##
 
-### Mods
+## Building from source
 
-`--mods DT`, `--mods HR`, or any combination (checkboxes in the GUI). NM is the baseline. Only two things a mod does can change what a pattern *is*: rate (DT/NC/HT/DC) and circle size (HR/EZ). HR's vertical flip is ignored on purpose — reflecting every object preserves the distances between them.
-
-##
-
-## Accuracy
-
-These are heuristics, so there's tooling to measure them rather than argue about them. Synthetic unit tests:
-
-```
-python test_classify.py
-```
-
-To score against real maps, hand-label a few dozen mapsets you know well into a `labels.csv` of `online_id,label`, then:
-
-```
-python eval_classifier.py --csv report.csv --labels labels.csv
-```
-
-That prints per-category precision/recall and a confusion matrix. Add `--baseline old_report.csv` to check whether a threshold change actually helped instead of just moving errors around. `online_id` comes from `osu!.db` on stable and `client.realm` on lazer, so a plain folder scan won't have it.
-
-Scraping osu!'s community beatmap tags was tried and dropped: outside the most popular few hundred maps, almost nothing carries a usertag, so the coverage is far too thin to tune against.
-
-##
-
-## Running from source
-
-Needs Python 3.8+ and nothing else — the app is pure standard library.
+Needs Python 3.8+ and nothing else — pure standard library.
 
 ```
 python gui.py
@@ -116,28 +55,22 @@ python classify_maps.py "C:/Users/you/AppData/Roaming/osu" --csv report.csv --ou
 
 `python classify_maps.py --help` lists every option.
 
-The `realm-reader` helper is optional and only speeds up osu!lazer scans. To
-build it you need the .NET 8 SDK:
+The `realm-reader` helper is optional (speeds up lazer scans) and needs the .NET 8 SDK to build:
 
 ```
 dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader-dist
 ```
 
-`realm-reader-dist/` is gitignored and picked up automatically — don't publish
-into `realm-reader/` itself, or ~190 runtime DLLs land on top of the source.
+`realm-reader-dist/` is gitignored and picked up automatically — don't publish into `realm-reader/` itself, or ~190 runtime DLLs land on top of the source.
 
 ##
 
 ## Credits
 
 - [Piotrekol's CollectionManager](https://github.com/Piotrekol/CollectionManager) — `collection.db` and `osu!.db` format reference, and the approach of reading the game's own databases directly
-
 - [kabiiQ's BeatmapExporter](https://github.com/kabiiQ/BeatmapExporter) — alternative lazer export tool
-
 - [ppy/osu](https://github.com/ppy/osu) — `client.realm` schema reference
-
 - [Realm .NET SDK](https://github.com/realm/realm-dotnet) — powers the `realm-reader` fast path
-
 - [osu!'s official beatmap tags](https://osu.ppy.sh/wiki/en/Beatmap/Beatmap_tags) — reference for what counts as a burst/stream/jump
 
 ##
