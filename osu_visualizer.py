@@ -236,13 +236,11 @@ def _decimate_frames(frames, min_gap_ms=12):
     return out
 
 
-def build_widget_html(diff, replay, mods_override=None):
-    """Returns a self-contained HTML fragment (SVG playfield + JS playback)
-    driven by the replay's real cursor frames, with AR-correct approach
-    circles and mod-adjusted CS/AR/OD/rate. mods_override lets you replay
-    the same recording against a different mod combo than it was actually
-    set (e.g. show what the NM-recorded path would look like under DT) -
-    defaults to the replay's own recorded mods."""
+def compute_render_data(diff, replay, mods_override=None):
+    """Everything the renderer needs, mod/AR/OD/rate-adjusted, as plain
+    JSON-able data - shared by build_widget_html (HTML+JS playback) and
+    osu_visualizer_preview.py (static PNG keyframes for a no-browser look
+    at the map). Keep drawing logic out of here; this is data only."""
     mods = mods_override if mods_override is not None else replay["mods"]
     rate, eff_cs, eff_ar, eff_od = mod_visual_adjustments(
         mods, diff.circle_size, diff.approach_rate, diff.overall_difficulty)
@@ -269,8 +267,18 @@ def build_widget_html(diff, replay, mods_override=None):
         "title": f"{diff.title} [{diff.diff_name}]",
         "synthesized": replay["player"] == "(synthesized - no replay)",
     }
-    data_json = json.dumps(data)
+    return data
 
+
+def build_widget_html(diff, replay, mods_override=None):
+    """Returns a self-contained HTML fragment (SVG playfield + JS playback)
+    driven by the replay's real cursor frames, with AR-correct approach
+    circles and mod-adjusted CS/AR/OD/rate. mods_override lets you replay
+    the same recording against a different mod combo than it was actually
+    set (e.g. show what the NM-recorded path would look like under DT) -
+    defaults to the replay's own recorded mods."""
+    data = compute_render_data(diff, replay, mods_override=mods_override)
+    data_json = json.dumps(data)
     return WIDGET_TEMPLATE.replace("__DATA__", data_json)
 
 

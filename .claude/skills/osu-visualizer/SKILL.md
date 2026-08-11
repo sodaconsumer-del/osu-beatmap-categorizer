@@ -20,24 +20,55 @@ can be checked against real gameplay instead of just numbers.
 
 ## Actually look at it - don't generate blind
 
-Building the HTML and calling it done is not enough - the whole point is
-seeing the pattern, and desyncs/bugs in this renderer are visual bugs a
-numeric check can miss (a real one already shipped once: object times were
-wrongly divided by a mod rate while replay frame times weren't, and it took
-the user actually watching it to catch it). After publishing:
+The end goal of this whole tool is that YOU can see osu! maps, not just
+generate a page for the user to check. Building the HTML/PNGs and calling it
+done is not enough - desyncs/bugs in this renderer are visual bugs a numeric
+check can miss (a real one already shipped once: object times were wrongly
+divided by a mod rate while replay frame times weren't; it took actually
+watching it to catch it). Always look before reporting anything as working.
 
-1. Open the artifact URL with the Browser tool (`preview_start` or
-   `navigate`). If `computer{action:"screenshot"}` fails with "Browser pane
-   is not displayed", ask the user to open the Browser pane and retry - it
-   is not optional, do not skip the check because of this.
-2. Click Play, `wait` a couple seconds, screenshot again. Confirm: approach
-   circles are visibly shrinking toward hit circles, the cursor ring tracks
-   through/near the circles it should be hitting (not offset from them),
-   and circles disappear promptly after being hit rather than lingering.
-3. If anything looks wrong, don't guess at the fix from the code alone -
-   compute the same numeric check that caught the original desync (compare
-   raw object timestamps against raw replay frame timestamps near the start
-   and end of the map) before changing anything.
+**Primary method - static PNG keyframes, no browser needed:**
+
+```bash
+pip install --quiet Pillow   # one-time, dev-only - see "Why two renderers" below
+python osu_visualizer_preview.py --osz set.osz --diff "Name" --osr replay.osr --out-dir keyframes/ --n-frames 6
+```
+
+Then `Read` each `keyframes/frame_*.png` directly - the Read tool displays
+images inline, so you see the actual render yourself with zero setup, no
+Browser pane, no local server. Check across several frames spread through
+the map: approach circles shrinking correctly, cursor tracking near/through
+the circle it's about to hit (not offset from it), circles gone instantly
+after their hit time (not lingering), correct 16:9 letterboxing.
+
+Pick `--n-frames` timestamps that land near real hits if you want to check
+a specific pattern - `render_keyframes(..., timestamps=[...])` from Python
+if the default even spacing doesn't land where you need it (e.g. spread
+across a specific burst cluster you're investigating).
+
+**Fallback - the interactive HTML/JS widget** (`build_widget_html` /
+`osu_visualizer.py`'s CLI): still the right choice when a human needs to
+watch it play back with controls, or to publish something shareable. The
+Browser tool *can* screenshot it (`preview_start`/`navigate` to the
+published Artifact URL, then `computer{action:"screenshot"}`) but has been
+unreliable in practice (the pane repeatedly failed to composite frames) and
+a local server was explicitly rejected as unnecessary friction for what
+should be a zero-setup skill - don't reach for either unless the PNG
+keyframe route above doesn't answer the question.
+
+**Why two renderers**: the HTML/JS one is what a human watches; the PNG one
+is what lets Claude see without any browser dependency at all. Both read
+`compute_render_data()` for the underlying numbers, but each has its own
+drawing logic (SVG+JS vs Pillow) - if you change render behavior (fade
+timing, colors, letterbox math) in one, change it in the other, or what
+Claude sees will silently drift from what the human sees.
+
+If anything looks wrong in either renderer, don't guess at the fix from the
+code alone - compute the same numeric check that caught the original desync
+(compare raw object timestamps against raw replay frame timestamps near the
+start and end of the map, or cross-correlate object position against replay
+cursor position at hit time to find any residual time offset) before
+changing anything.
 
 ## How to run it
 

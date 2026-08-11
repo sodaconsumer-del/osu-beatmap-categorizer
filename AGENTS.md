@@ -28,6 +28,7 @@ writes a *new* file to an export folder; it never overwrites the live one.
 | `test_classify.py` | Synthetic unit tests. `python test_classify.py`, no pytest needed |
 | `eval_classifier.py` | Scores a `report.csv` against hand-labelled maps |
 | `osu_visualizer.py` | Replay-driven (`.osr`) beatmap viewer for sanity-checking a classification against real gameplay — see `.claude/skills/osu-visualizer/SKILL.md` |
+| `osu_visualizer_preview.py` | Static PNG keyframe renderer (needs `Pillow`, dev-only, not shipped) — how the agent looks at a map itself, no browser needed |
 | `test_osu_visualizer.py` | Unit tests for `osu_visualizer.py`'s pure functions (AR/OD formulas, mod adjustments, frame decimation) |
 | `realm-reader/` | C# helper that reads osu!lazer's `client.realm` |
 
