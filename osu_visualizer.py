@@ -250,7 +250,14 @@ def build_widget_html(diff, replay, mods_override=None):
     preempt, fade_in = preempt_fadein_ms(eff_ar)
     great = great_window_ms(eff_od)
 
-    objs = [[round(o[0] / rate), round(o[1] / rate), round(o[2], 1),
+    # Object times, replay frame times, and AR/OD-derived ms are all on the
+    # SAME nominal map clock (osu!'s internal track time) - raw .osu
+    # timestamps require no rate division to line up with a replay's frames,
+    # confirmed against real data (last object t=64399 vs last replay frame
+    # t=64584, ~185ms apart raw-to-raw with no scaling). rate only matters
+    # for how fast that shared nominal clock should be fast-forwarded during
+    # PLAYBACK here, which is handled in JS, not by rescaling the data.
+    objs = [[round(o[0]), round(o[1]), round(o[2], 1),
              round(o[3], 1), round(o[4], 1), round(o[5], 1)] for o in diff.objs]
     frames = _decimate_frames(replay["frames"])
     frames = [[f[0], round(f[1], 1), round(f[2], 1), f[3]] for f in frames]
@@ -258,8 +265,9 @@ def build_widget_html(diff, replay, mods_override=None):
     data = {
         "objs": objs, "frames": frames, "radius": round(radius, 2),
         "preempt": round(preempt), "fadeIn": round(fade_in),
-        "great": round(great, 1), "mods": mods,
+        "great": round(great, 1), "mods": mods, "rate": rate,
         "title": f"{diff.title} [{diff.diff_name}]",
+        "synthesized": replay["player"] == "(synthesized - no replay)",
     }
     data_json = json.dumps(data)
 
@@ -290,7 +298,7 @@ WIDGET_TEMPLATE = r"""
 </div>
 <script>
 const DATA = __DATA__;
-document.getElementById('modsOut').textContent = DATA.title + (DATA.mods.length ? ' +' + DATA.mods.join('') : ' NM');
+document.getElementById('modsOut').textContent = DATA.title + (DATA.mods.length ? ' +' + DATA.mods.join('') : ' NM') + (DATA.synthesized ? ' · synthesized path' : '');
 const objsG = document.getElementById('objs');
 const cursor = document.getElementById('cursor'), dot = document.getElementById('cursorDot');
 const playBtn = document.getElementById('playBtn'), timeOut = document.getElementById('timeOut');
@@ -328,14 +336,15 @@ function findFrame(t){
   return [t, a[1] + (b[1]-a[1])*f, a[2] + (b[2]-a[2])*f, a[3]];
 }
 let playing = false, startPerf = 0, pausedAt = 0;
+const RATE = DATA.rate || 1.0;
 function frame(now){
   if (!playing) return;
-  const t = (now - startPerf) + pausedAt;
+  const t = (now - startPerf) * RATE + pausedAt;
   if (t >= totalMs) { playing = false; playBtn.innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play'; pausedAt = 0; return; }
   for (let i = 0; i < DATA.objs.length; i++) {
     const o = DATA.objs[i], e = els[i];
     const appear = o[0] - PRE, hit = o[0], end = o[1];
-    if (t < appear || t > end + 150) { e.g.style.opacity = 0; continue; }
+    if (t < appear || t > end) { e.g.style.opacity = 0; continue; }
     e.g.style.opacity = Math.min(1, (t - appear) / FADE);
     const shrink = Math.max(0, Math.min(1, (hit - t) / PRE));
     e.ac.setAttribute('r', R + shrink * R * 2);
@@ -351,7 +360,7 @@ function frame(now){
   requestAnimationFrame(frame);
 }
 playBtn.onclick = () => {
-  if (playing) { playing = false; playBtn.innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play'; pausedAt += performance.now() - startPerf; return; }
+  if (playing) { playing = false; playBtn.innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play'; pausedAt += (performance.now() - startPerf) * RATE; return; }
   playing = true; startPerf = performance.now(); playBtn.innerHTML = '<i class="ti ti-player-pause" aria-hidden="true"></i> Pause';
   requestAnimationFrame(frame);
 };
@@ -359,13 +368,42 @@ playBtn.onclick = () => {
 """
 
 
+def synthesize_frames(diff, sample_ms=12):
+    """Fallback cursor path for when there's no real replay: straight-line
+    interpolation between each object's end position and the next object's
+    start, sampled every sample_ms. Mechanically smooth and NOT how a real
+    player moves (no acceleration curve, no overshoot on jumps) - real
+    replay data is always better when available. Good enough to see note
+    density/spacing/pattern shape without needing a recorded play."""
+    objs = diff.objs
+    if not objs:
+        return []
+    frames = [(round(objs[0][0]), objs[0][2], objs[0][3], 0)]
+    for i in range(1, len(objs)):
+        p, c = objs[i - 1], objs[i]
+        t0, t1 = p[1], c[0]
+        if t1 <= t0:
+            continue
+        n = max(1, int((t1 - t0) / sample_ms))
+        for k in range(1, n + 1):
+            f = k / n
+            t = t0 + (t1 - t0) * f
+            x = p[4] + (c[2] - p[4]) * f
+            y = p[5] + (c[3] - p[5]) * f
+            frames.append((round(t), x, y, 1 if f >= 0.97 else 0))
+    return frames
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--osu", help="Path to a single .osu file")
     ap.add_argument("--osz", help="Path to a .osz archive (use with --diff)")
     ap.add_argument("--diff", help="Difficulty name to pick out of --osz")
-    ap.add_argument("--osr", required=True, help="Path to the .osr replay")
-    ap.add_argument("--mods", help="Comma-separated mod override, e.g. DT or HR,HD")
+    ap.add_argument("--osr", help="Path to a .osr replay - omit for a synthesized "
+                     "(interpolated, approximate) cursor path instead")
+    ap.add_argument("--mods", help="Comma-separated mod override, e.g. DT or HR,HD - "
+                     "required (defaults to NM) when --osr is omitted, since there's "
+                     "no recorded replay to read mods from")
     ap.add_argument("--output", required=True, help="Output HTML fragment path")
     args = ap.parse_args()
 
@@ -376,13 +414,19 @@ def main():
     if diff is None:
         print("Could not find that difficulty.", file=sys.stderr)
         sys.exit(1)
-    replay = parse_replay(args.osr)
     mods_override = [m.strip().upper() for m in args.mods.split(",")] if args.mods else None
+
+    if args.osr:
+        replay = parse_replay(args.osr)
+        source = "replay"
+    else:
+        replay = {"player": "(synthesized - no replay)", "mods": [], "frames": synthesize_frames(diff)}
+        source = "synthesized"
 
     html = build_widget_html(diff, replay, mods_override=mods_override)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"Wrote {args.output} ({len(diff.objs)} objects, {len(replay['frames'])} replay frames, "
+    print(f"Wrote {args.output} ({len(diff.objs)} objects, {len(replay['frames'])} {source} frames, "
           f"mods={mods_override or replay['mods']})")
 
 

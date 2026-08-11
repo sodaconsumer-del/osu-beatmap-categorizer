@@ -18,6 +18,27 @@ can be checked against real gameplay instead of just numbers.
 - You want to see how a diff plays differently under EZ/HR/DT/HT before
   reasoning about mod-adjusted classification.
 
+## Actually look at it - don't generate blind
+
+Building the HTML and calling it done is not enough - the whole point is
+seeing the pattern, and desyncs/bugs in this renderer are visual bugs a
+numeric check can miss (a real one already shipped once: object times were
+wrongly divided by a mod rate while replay frame times weren't, and it took
+the user actually watching it to catch it). After publishing:
+
+1. Open the artifact URL with the Browser tool (`preview_start` or
+   `navigate`). If `computer{action:"screenshot"}` fails with "Browser pane
+   is not displayed", ask the user to open the Browser pane and retry - it
+   is not optional, do not skip the check because of this.
+2. Click Play, `wait` a couple seconds, screenshot again. Confirm: approach
+   circles are visibly shrinking toward hit circles, the cursor ring tracks
+   through/near the circles it should be hitting (not offset from them),
+   and circles disappear promptly after being hit rather than lingering.
+3. If anything looks wrong, don't guess at the fix from the code alone -
+   compute the same numeric check that caught the original desync (compare
+   raw object timestamps against raw replay frame timestamps near the start
+   and end of the map) before changing anything.
+
 ## How to run it
 
 ```bash
@@ -26,7 +47,15 @@ python osu_visualizer.py --osu path/to/diff.osu --osr path/to/replay.osr --outpu
 python osu_visualizer.py --osz path/to/set.osz --diff "Difficulty Name" --osr path/to/replay.osr --output out.html
 # override the mods the replay is shown under (independent of what it was actually recorded with):
 python osu_visualizer.py --osz set.osz --diff "Name" --osr replay.osr --mods DT --output out.html
+# no replay available: --osr is optional - falls back to a synthesized
+# (linearly interpolated, NOT a real player's motion) cursor path, useful
+# for seeing note density/spacing/pattern shape when no .osr exists:
+python osu_visualizer.py --osu path/to/diff.osu --mods DT --output out.html
 ```
+
+Prefer a real replay whenever one exists - synthesized paths are clearly
+labeled in the UI ("synthesized path") but are a straight-line approximation,
+not real movement.
 
 Finding real replay files: osu!stable keeps them in `<install>/Replays/*.osr`,
 named `<player> - <artist> - <title> [<diff>] (<date>) <mode>.osr`. Match the
