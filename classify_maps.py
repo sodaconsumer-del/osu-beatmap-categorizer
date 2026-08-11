@@ -101,6 +101,11 @@ class DiffInfo:
     burst_note_total: int = 0
     stream_note_total: int = 0
     total_note_count: int = 0
+    # Denominator jump_pct is measured against (transitions not excluded as
+    # breaks - see jump_gap_cap_ms). Exists so category_of() can compare
+    # burst coverage against jump coverage on the SAME basis (transitions)
+    # instead of notes vs transitions - see category_of()'s docstring.
+    counted_gaps: int = 0
 
     # multi-label - a diff can be any combination of these, not mutually exclusive
     has_bursts: bool = False
@@ -665,6 +670,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     diff.max_burst_len = max(bursts, default=0)
     diff.max_stream_len = max(streams, default=0)
     diff.jump_pct = (jump_count / counted_gaps * 100) if counted_gaps else 0.0
+    diff.counted_gaps = counted_gaps
     diff.burst_note_total = sum(bursts)
     diff.stream_note_total = sum(streams)
     diff.total_note_count = len(objs)
@@ -1555,7 +1561,7 @@ def is_ranked(status):
 def category_of(has_streams, has_bursts=None, has_jumps=None,
                  burst_note_total=0, total_note_count=0, jump_pct=0.0,
                  stream_note_total=0, stream_run_count=0, max_stream_len=0,
-                 burst_promote_stream_len=12):
+                 burst_promote_stream_len=12, burst_run_count=0, counted_gaps=0):
     """
     The one place the dominant-pattern rules live.
 
@@ -1571,11 +1577,25 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     inconsistent with the coverage comparison bursts had always been subject
     to. Streams now face the same test.
 
-    Coverage is notes-in-runs over total notes, compared against jump_pct.
-    The two aren't measured identically (one counts notes, the other counts
-    transitions), so this is a proportion-vs-proportion judgement rather than
-    an exact comparison - but it's the same basis bursts vs jumps has always
-    used, and it separates the obvious cases cleanly.
+    Coverage is measured in TRANSITIONS for all three patterns when
+    counted_gaps is available (the DiffInfo path always has it) - jump_pct
+    was already transitions-based, and burst/stream coverage used to be
+    notes-based, which isn't the same basis: a note is shared between two
+    adjacent runs at their boundary (see AGENTS.md), and more importantly a
+    map built from alternating burst-cluster-then-jump sections (see the
+    ai-classification branch's investigation) drives burst-notes and
+    jump-transitions to near-identical counts by construction, making a
+    notes-vs-transitions comparison between them essentially coin-flip noise
+    at the exact point (a near-tie) where the comparison actually matters.
+    Converting a run's note count to a transition count is exact and free -
+    a run of N notes is N-1 transitions, summed over however many runs
+    contributed to burst_note_total/stream_note_total via burst_run_count/
+    stream_run_count.
+
+    Falls back to the old notes-over-notes basis when counted_gaps isn't
+    supplied (0) - the CSV-rebuild path for CSVs written before this field
+    existed has no way to recover it, so it keeps the original comparison
+    rather than silently mixing bases.
     """
     if hasattr(has_streams, "has_streams"):
         d = has_streams
@@ -1585,10 +1605,18 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
         stream_note_total = d.stream_note_total
         stream_run_count = d.stream_count
         max_stream_len = d.max_stream_len
+        burst_run_count = d.burst_count
+        counted_gaps = d.counted_gaps
 
     jump_coverage = jump_pct / 100.0
-    stream_coverage = (stream_note_total / total_note_count) if total_note_count else 0.0
-    burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
+    if counted_gaps:
+        stream_transitions = max(0, stream_note_total - stream_run_count)
+        burst_transitions = max(0, burst_note_total - burst_run_count)
+        stream_coverage = stream_transitions / counted_gaps
+        burst_coverage = burst_transitions / counted_gaps
+    else:
+        stream_coverage = (stream_note_total / total_note_count) if total_note_count else 0.0
+        burst_coverage = (burst_note_total / total_note_count) if total_note_count else 0.0
 
     # A burst map containing a genuine stream run is a stream map. Bursts and
     # streams are the same motion, so the question for a burst player isn't
@@ -1955,7 +1983,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
                             "max_stream_len", "jump_pct", "burst_note_total", "stream_note_total",
-                            "total_note_count",
+                            "total_note_count", "counted_gaps",
                             "ranked_status", "star_rating", "online_id", "mods", "category", "path"])
                 def safe_round(x, ndigits=None):
                     # round() raises OverflowError on inf and ValueError on
@@ -1969,7 +1997,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                     w.writerow([d.title, d.diff_name, safe_round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
                                 d.max_stream_len, safe_round(d.jump_pct, 1), d.burst_note_total,
-                                d.stream_note_total, d.total_note_count,
+                                d.stream_note_total, d.total_note_count, d.counted_gaps,
                                 d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown",
                                 d.online_id if d.online_id is not None else "unknown", mods_str,
                                 category_of(d), d.path])
@@ -2069,16 +2097,24 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                     stream_runs = int(row.get("stream_runs") or 0)
                     max_stream_len = int(row.get("max_stream_len") or 0)
                     jump_pct = float(row.get("jump_pct") or 0)
+                    # Both added after counted_gaps existed - "or 0" makes a
+                    # CSV written before this field existed fall back to
+                    # category_of()'s notes-basis comparison automatically
+                    # (counted_gaps=0 there means "unknown, use the old way").
+                    burst_runs = int(row.get("burst_runs") or 0)
+                    counted_gaps = int(row.get("counted_gaps") or 0)
                 except ValueError:
                     burst_note_total = stream_note_total = total_note_count = 0
                     stream_runs = max_stream_len = 0
                     jump_pct = 0.0
+                    burst_runs = counted_gaps = 0
                 category = category_of(
                     row.get("has_streams") == "True",
                     row.get("has_bursts") == "True",
                     row.get("has_jumps") == "True",
                     burst_note_total, total_note_count, jump_pct, stream_note_total,
                     stream_runs, max_stream_len,
+                    burst_run_count=burst_runs, counted_gaps=counted_gaps,
                 )
             groups[category].append(entry)
 
