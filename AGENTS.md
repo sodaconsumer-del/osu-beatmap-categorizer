@@ -98,8 +98,65 @@ own frames.
 
 ## Classification
 
-`classify_diff` is the product. It's tuned heuristics, so treat threshold
-changes as claims that need evidence.
+"Classification" here means one specific thing: scanning a beatmap
+difficulty's hit objects and sorting it into exactly one category — Streams,
+Bursts, Jumps with bursts, Jumps (no bursts), or Misc — based on the *shape*
+of the movement/tapping it asks for, not its difficulty or star rating. A
+5-star jump map and a 2-star jump map both classify as some flavor of
+"Jumps" if the pattern shape matches; star rating never enters the decision.
+`classify_diff()` is the function that does this; `category_of()` turns its
+output flags into the single final category name.
+
+The vocabulary, for anyone new to osu! pattern terms or this codebase:
+
+- **Hit object** — a circle, slider, or spinner in a difficulty. Spinners are
+  dropped before classification (their stored position is a meaningless
+  placeholder, not where the cursor goes).
+- **Transition** — the movement from one hit object to the next: a gap in
+  time (`tap_gap`), a travel time (`move_time`, differs from `tap_gap` only
+  on sliders), and a distance (`dist`), measured from the *previous* object's
+  END position, not its start — see "Spacing is measured from..." below.
+- **Run** — a sequence of consecutive transitions that are both fast (gap
+  under `max_gap_ms`) and rhythmically consistent (gap doesn't drift more
+  than `gap_consistency_tol` from the run's own running average). Runs are
+  built from TIMING alone; what kind of run it is (see below) is then
+  decided by SPACING. This split matters: a fast, evenly-spaced sequence of
+  wide jumps is still a "run" by the timing test, but its spacing marks it as
+  a jump run, not a burst or stream.
+- **Burst** — a run of 3–9 notes.
+- **Stream** — a run of 10+ notes. "Spaced stream" is the same thing with
+  non-overlapping but still deliberate, readable spacing (spacing tier
+  "spaced" below) — still a stream, not a jump.
+- **Cutstream** — a stream broken by one skipped beat (a gap that's a clean
+  whole-number multiple of the run's own tempo) and rejoined into one run
+  rather than scored as two shorter ones.
+- **Jump** — spacing-only, independent of speed or run membership: a
+  transition whose distance is genuinely wide relative to circle size *and*
+  whose distance/time ratio is high. A map can be jump-heavy at any snap
+  speed, and jumps can coexist with bursts/streams in the same difficulty
+  (hence "Jumps with bursts" as its own category, separate from "Jumps (no
+  bursts)").
+- **Spacing tiers** — every transition's distance, relative to hit-circle
+  diameter, falls into one of three tiers: **tight** (stacked/overlapping,
+  ≤ `tight_diam_ratio`), **spaced** (readable gap but still stream-like, ≤
+  `spaced_diam_ratio`), or **jump-wide** (beyond that). A run is only
+  rejected as "actually a jump, not a burst/stream" if too much of it falls
+  in the jump-wide tier — see `run_wide_fraction_max`/`mean_diam_ratio_max`
+  in the params table.
+- **Coverage** — what fraction of the *map* (by note count, for
+  bursts/streams; by transition count, for jumps) a pattern actually
+  occupies. Classification cares about coverage, not mere presence — a
+  single 10-note stream buried in an otherwise pure jump map does not make
+  the map a "stream map"; see "Patterns must out-cover each other" below.
+- **NM (no mod)** — the baseline every classification runs against by
+  default. Mods (DT/HT/HR/EZ) are opt-in via `--mods`/the GUI and rescale
+  timing and/or circle size before the same logic runs — see "Mod math"
+  below. There is currently no mod-aware classification LOGIC beyond that
+  rescaling (see `osu-visualizer`/AI-classification branch work for the
+  ongoing "does DT change what category this deserves" investigation).
+
+`classify_diff` itself is tuned heuristics, so treat threshold changes as
+claims that need evidence.
 
 Decisions that look odd but aren't:
 
