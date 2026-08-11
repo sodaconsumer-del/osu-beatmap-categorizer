@@ -27,8 +27,6 @@ writes a *new* file to an export folder; it never overwrites the live one.
 | `gui.py` | tkinter front end over `run_pipeline` |
 | `test_classify.py` | Synthetic unit tests. `python test_classify.py`, no pytest needed |
 | `eval_classifier.py` | Scores a `report.csv` against hand-labelled maps |
-| `osu_visualizer.py` | Replay-driven (`.osr`) beatmap viewer for sanity-checking a classification against real gameplay — see `.claude/skills/osu-visualizer/SKILL.md` |
-| `test_osu_visualizer.py` | Unit tests for `osu_visualizer.py`'s pure functions (AR/OD formulas, mod adjustments, frame decimation) |
 | `realm-reader/` | C# helper that reads osu!lazer's `client.realm` |
 
 Pure standard library on the Python side. Keep it that way — the app ships as
