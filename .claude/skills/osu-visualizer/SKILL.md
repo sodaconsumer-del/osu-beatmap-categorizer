@@ -31,20 +31,31 @@ watching it to catch it). Always look before reporting anything as working.
 
 ```bash
 pip install --quiet Pillow   # one-time, dev-only - see "Why two renderers" below
-python osu_visualizer_preview.py --osz set.osz --diff "Name" --osr replay.osr --out-dir keyframes/ --n-frames 6
+
+# whole-map overview (sparse - 20 evenly-spaced frames by default, NOT real
+# motion, just checkpoints across the map):
+python osu_visualizer_preview.py --osz set.osz --diff "Name" --osr replay.osr --out-dir keyframes/
+
+# zoom mode - dense frames around one specific moment, actual motion
+# resolution (default 15fps over a 2s window - tune --fps/--window-ms):
+python osu_visualizer_preview.py --osz set.osz --diff "Name" --osr replay.osr --center-ms 8000 --window-ms 1500 --fps 15 --out-dir zoom/
 ```
 
-Then `Read` each `keyframes/frame_*.png` directly - the Read tool displays
-images inline, so you see the actual render yourself with zero setup, no
-Browser pane, no local server. Check across several frames spread through
-the map: approach circles shrinking correctly, cursor tracking near/through
-the circle it's about to hit (not offset from it), circles gone instantly
-after their hit time (not lingering), correct 16:9 letterboxing.
+Then `Read` each `keyframes/frame_*.png` (or `zoom/frame_*.png`) directly -
+the Read tool displays images inline, so you see the actual render yourself
+with zero setup, no Browser pane, no local server.
 
-Pick `--n-frames` timestamps that land near real hits if you want to check
-a specific pattern - `render_keyframes(..., timestamps=[...])` from Python
-if the default even spacing doesn't land where you need it (e.g. spread
-across a specific burst cluster you're investigating).
+**Use the overview to find where to look, then zoom into it** - this is the
+actual point of the tool: identify the pattern yourself from the frames (is
+this really a burst-then-jump, a spaced stream, a technical angle change?),
+compare that to what `classify_diff()` called it, and if they disagree,
+that's a real discrepancy to chase down in `classify_maps.py` - not
+something to explain away. Don't reach for classification code to tell you
+what a section is when you can just look at it.
+
+For scripted/custom timestamps (Python, not CLI):
+`render_keyframes(diff, replay, out_dir, timestamps=[...])`, or build a
+window with `window_timestamps(center_ms, window_ms, fps)`.
 
 **Fallback - the interactive HTML/JS widget** (`build_widget_html` /
 `osu_visualizer.py`'s CLI): still the right choice when a human needs to

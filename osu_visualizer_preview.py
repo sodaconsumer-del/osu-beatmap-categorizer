@@ -89,7 +89,19 @@ def render_frame(data, t):
     return img
 
 
-def render_keyframes(diff, replay, out_dir, mods_override=None, n_frames=6, timestamps=None):
+def window_timestamps(center_ms, window_ms, fps):
+    """Dense, evenly-spaced timestamps covering [center-window/2, center+window/2]
+    at the given fps - for zooming into one specific pattern (a burst cluster,
+    a jump run) at real motion resolution instead of the sparse whole-map
+    overview render_keyframes gives by default. A 2s window at 15fps is 30
+    frames - enough to actually see the shape of a run, not just snapshots."""
+    step = 1000.0 / fps
+    start = center_ms - window_ms / 2
+    n = max(1, round(window_ms / step))
+    return [round(start + i * step) for i in range(n + 1)]
+
+
+def render_keyframes(diff, replay, out_dir, mods_override=None, n_frames=20, timestamps=None):
     data = compute_render_data(diff, replay, mods_override=mods_override)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -100,6 +112,7 @@ def render_keyframes(diff, replay, out_dir, mods_override=None, n_frames=6, time
         first_appear = (data["objs"][0][0] - data["preempt"]) if data["objs"] else 0
         timestamps = [round(first_appear + (total - first_appear) * i / (n_frames - 1))
                       for i in range(n_frames)]
+    timestamps = list(timestamps)
 
     paths = []
     for i, t in enumerate(timestamps):
@@ -118,7 +131,12 @@ def main():
     ap.add_argument("--osr", help="omit for a synthesized cursor path")
     ap.add_argument("--mods")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--n-frames", type=int, default=6)
+    ap.add_argument("--n-frames", type=int, default=20, help="whole-map overview frame count "
+                     "(ignored if --center-ms is given)")
+    ap.add_argument("--center-ms", type=int, help="zoom mode: dense frames centered on this "
+                     "map timestamp instead of a sparse whole-map overview")
+    ap.add_argument("--window-ms", type=int, default=2000, help="zoom mode window width")
+    ap.add_argument("--fps", type=float, default=15.0, help="zoom mode sample rate")
     args = ap.parse_args()
 
     if not args.osu and not args.osz:
@@ -133,8 +151,12 @@ def main():
     else:
         replay = {"player": "(synthesized - no replay)", "mods": [], "frames": synthesize_frames(diff)}
 
+    timestamps = None
+    if args.center_ms is not None:
+        timestamps = window_timestamps(args.center_ms, args.window_ms, args.fps)
+
     paths, data = render_keyframes(diff, replay, args.out_dir, mods_override=mods_override,
-                                    n_frames=args.n_frames)
+                                    n_frames=args.n_frames, timestamps=timestamps)
     for p in paths:
         print(p)
 
