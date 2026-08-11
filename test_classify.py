@@ -412,6 +412,46 @@ def test_jumps_vs_bursts_is_decided_by_coverage():
     assert cm.category_of(False, True, True, 80, 100, 20.0) == "Bursts"
 
 
+def test_burst_vs_jump_coverage_uses_matching_denominators_when_available():
+    # burst_note_total (30) and the jump count implied by jump_pct (30% of
+    # 100 counted_gaps = 30) are numerically equal, but burst_note_total
+    # counts NOTES while jump_pct counts TRANSITIONS - comparing them
+    # without a shared basis is comparing different units. Real maps built
+    # from alternating burst-cluster-then-jump sections drive these two
+    # counts to near-equality by construction (ai-classification branch
+    # investigation: e.g. burst_note_total=265 vs implied jump_count=262 on
+    # one real map), making the old notes-vs-notes comparison essentially
+    # coin-flip noise at exactly the point it's supposed to decide.
+    #
+    # With counted_gaps supplied, burst coverage is measured the same way
+    # jump coverage always was: burst_run_count=6 separate 5-note bursts is
+    # 24 transitions (each run of N notes is N-1 transitions), so burst
+    # coverage becomes 24/100 = 24%, cleanly under jump's 30% - the SHAPE of
+    # the map decides this now, not which measure happened to round up.
+    assert cm.category_of(False, True, True, 30, 100, 30.0, 0, 0, 0,
+                           burst_run_count=6, counted_gaps=100) == "Jumps with bursts"
+    # Same raw numbers, no counted_gaps (an old CSV written before this
+    # field existed has no way to recover it): falls back to the original
+    # notes-vs-notes tie, which resolves to Bursts (the ">" test doesn't
+    # award a tie to jumps) - same map, different verdict, entirely because
+    # of which basis was available to compare on.
+    assert cm.category_of(False, True, True, 30, 100, 30.0) == "Bursts"
+
+
+def test_counted_gaps_is_populated_and_matches_jump_pcts_own_denominator():
+    # Wiring check: classify_diff() must actually fill in counted_gaps (not
+    # just leave the dataclass default), and it has to be the exact same
+    # denominator jump_pct itself was computed against - if these ever
+    # drift apart, category_of()'s transitions-basis comparison silently
+    # goes back to comparing incompatible numbers.
+    d = classify(circles(20, step=75, dx=8))  # one dense, no-break run
+    assert d.counted_gaps == len(d.objs) - 1
+    assert d.jump_pct == 0.0  # tight spacing - no jumps to compute a % from
+    if d.counted_gaps:
+        implied_jump_count = round(d.jump_pct / 100 * d.counted_gaps)
+        assert implied_jump_count == 0
+
+
 # --- osu!stable database ---------------------------------------------------
 
 def _uleb(n):

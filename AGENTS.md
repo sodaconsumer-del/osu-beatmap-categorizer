@@ -203,6 +203,17 @@ only shows up via step 5's `burst_promote_stream_len` check, which looks at
 `max_stream_len` directly rather than coverage. This is deliberate — see
 "Except: a burst map that streams once" above.
 
+**Coverage comparisons (steps 1 and 2) use TRANSITIONS as the common basis**,
+not notes, when `counted_gaps` is available (always true for a real scan;
+only unavailable when rebuilding from a CSV written before this field
+existed). `jump_pct` was always transitions-based; stream/burst coverage
+used to be notes-based, which isn't the same thing being measured twice - a
+run of N notes is N-1 transitions, so `stream_note_total`/`burst_note_total`
+are converted (`- stream_run_count`/`- burst_run_count`) before dividing by
+`counted_gaps`, matching exactly how `jump_pct` itself was computed. See
+"Jump vs. stream coverage" under Known limitations for why this mattered in
+practice, not just in principle.
+
 ### `DEFAULT_PARAMS` reference
 
 All in `classify_diff`'s signature and `DEFAULT_PARAMS` at module level, all
@@ -267,8 +278,16 @@ spacing-based can tell the difference.
 
 `title, diff_name, bpm, has_bursts, has_streams, has_jumps, has_cutstreams,
 burst_runs, stream_runs, cutstream_runs, max_burst_len, max_stream_len,
-jump_pct, burst_note_total, stream_note_total, total_note_count,
+jump_pct, burst_note_total, stream_note_total, total_note_count, counted_gaps,
 ranked_status, star_rating, online_id, mods, category, path`
+
+`counted_gaps` (new on this branch) is jump_pct's own denominator, carried
+through so a `--from-csv` rebuild can use the same transitions-basis
+coverage comparison `category_of()` uses live - see "Coverage comparisons"
+under `category_of()` decision order above. A CSV written before this column
+existed reads as `0` (`row.get(...) or 0`), which is exactly the signal
+`category_of()` uses to fall back to the old notes-basis comparison instead
+of silently mixing bases.
 
 `category` is written by the live run (via `category_of()`) so a re-read
 doesn't need to recompute it — `eval_classifier.py` and `collection_from_csv`
@@ -322,14 +341,26 @@ the slow path.
   folder via `BeatmapDirectory` in `osu!.<user>.cfg` gets silently routed to
   the slow folder-walk fallback instead of an error — worth fixing if it comes
   up, by reading that cfg key when the default `Songs/` isn't there.
-- **Jump vs. stream coverage compares two different measures.** `jump_pct` is
-  a percentage of *transitions*; stream/burst coverage is a percentage of
-  *notes*. They're compared directly in `category_of()` (step 2 above)
-  because that's the basis the original burst-vs-jump rule already used, but
-  it's a proportion-vs-proportion judgement, not an exact one, and may lean
-  systematically toward one side. Flagged but not fixed as of the last
-  classification pass — see the `a6eab84`/`fed982c` commit messages for the
-  measurements that motivated the current thresholds anyway.
+- **Jump vs. stream/burst coverage used to compare two different measures -
+  fixed on this branch.** `jump_pct` was always a percentage of
+  *transitions*; stream/burst coverage used to be a percentage of *notes*.
+  Comparing them directly in `category_of()` was a proportion-vs-proportion
+  judgement, not an exact one - and it turned out to matter concretely, not
+  just in principle: maps built from alternating burst-cluster-then-jump
+  sections (a common style - see the `osu_visualizer`-driven investigation
+  on this branch) drive burst-note-count and jump-transition-count to
+  near-equal RAW numbers by construction, which made the old notes-vs-
+  transitions comparison between them essentially coin-flip noise at exactly
+  the point it was supposed to decide something. `counted_gaps` (new
+  `DiffInfo` field, same denominator `jump_pct` already used) lets
+  `category_of()` convert stream/burst coverage to the same transitions
+  basis. Measured effect on a real ~9,300-map library: 428 categories
+  changed (4.6%), every single one moving toward "Jumps with bursts" (311
+  from Streams, 117 from Bursts, zero the other direction) - a one-directional
+  bias correction, not noise, which is the signature you'd expect from fixing
+  a systematic measurement mismatch rather than nudging a threshold. Falls
+  back to the old notes-vs-notes comparison when `counted_gaps` isn't
+  available (CSVs written before this field existed).
 - **No labelled eval set ships with the repo.** `eval_classifier.py` needs a
   `labels.csv` the user builds themselves (hand-labelled mapsets, or osu!
   API `online_id`s with known categories). There's no bundled ground truth,
