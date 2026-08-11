@@ -77,6 +77,14 @@ class DiffInfo:
     circle_size: float
     bpm: float
     slider_multiplier: float = 1.4
+    # Neither is consulted by classify_diff (pattern content doesn't depend
+    # on approach time or hit windows) - carried through for consumers that
+    # do need them, e.g. osu_visualizer.py's approach-circle/hit-window
+    # rendering. approach_rate falls back to overall_difficulty when the
+    # .osu has no ApproachRate key, matching osu!'s own pre-AR-field
+    # behaviour (maps saved before AR was split out from OD).
+    overall_difficulty: float = 5.0
+    approach_rate: float = 5.0
 
     burst_count: int = 0
     stream_count: int = 0
@@ -135,6 +143,8 @@ def parse_osu_bytes(raw, display_name, path=None):
     cs_m = re.search(r"^CircleSize:(.*)$", text, re.M)
     mode_m = re.search(r"^Mode:(.*)$", text, re.M)
     sm_m = re.search(r"^SliderMultiplier:(.*)$", text, re.M)
+    od_m = re.search(r"^OverallDifficulty:(.*)$", text, re.M)
+    ar_m = re.search(r"^ApproachRate:(.*)$", text, re.M)
 
     mode = int(mode_m.group(1).strip()) if mode_m else 0
     if mode != 0:
@@ -143,6 +153,14 @@ def parse_osu_bytes(raw, display_name, path=None):
     title = title_m.group(1).strip() if title_m else display_name
     diff_name = diff_m.group(1).strip() if diff_m else "?"
     cs = float(cs_m.group(1).strip()) if cs_m else 4.0
+    try:
+        od = float(od_m.group(1).strip()) if od_m else 5.0
+    except ValueError:
+        od = 5.0
+    try:
+        ar = float(ar_m.group(1).strip()) if ar_m else od  # pre-AR maps: AR follows OD
+    except ValueError:
+        ar = od
     try:
         slider_multiplier = float(sm_m.group(1).strip()) if sm_m else 1.4
     except ValueError:
@@ -236,6 +254,8 @@ def parse_osu_bytes(raw, display_name, path=None):
         circle_size=cs,
         bpm=bpm,
         slider_multiplier=slider_multiplier,
+        overall_difficulty=od,
+        approach_rate=ar,
     )
 
 
