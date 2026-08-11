@@ -289,11 +289,14 @@ WIDGET_TEMPLATE = r"""
   <span style="font-size:13px;color:var(--ov-text2,var(--text-secondary))" id="modsOut"></span>
   <span style="font-size:13px;color:var(--ov-text2,var(--text-secondary));margin-left:auto;font-variant-numeric:tabular-nums" id="timeOut">0.0s</span>
 </div>
-<div style="position:relative;width:100%;max-width:512px;margin:0 auto">
-  <svg id="field" viewBox="0 0 512 384" style="width:100%;height:auto;background:#0b0b0d;border-radius:8px;display:block">
-    <g id="objs"></g>
-    <circle id="cursor" r="8" fill="none" stroke="#7fd8dd" stroke-width="3"/>
-    <circle id="cursorDot" r="3" fill="#7fd8dd"/>
+<div style="position:relative;width:100%;max-width:683px;margin:0 auto">
+  <svg id="field" viewBox="0 0 682.6667 384" style="width:100%;height:auto;background:#000;border-radius:8px;display:block">
+    <rect x="85.3333" y="0" width="512" height="384" fill="#0b0b0d"/>
+    <g id="playfield" transform="translate(85.3333,0)">
+      <g id="objs"></g>
+      <circle id="cursor" r="8" fill="none" stroke="#7fd8dd" stroke-width="3"/>
+      <circle id="cursorDot" r="3" fill="#7fd8dd"/>
+    </g>
   </svg>
 </div>
 <script>
@@ -343,8 +346,12 @@ function frame(now){
   if (t >= totalMs) { playing = false; playBtn.innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play'; pausedAt = 0; return; }
   for (let i = 0; i < DATA.objs.length; i++) {
     const o = DATA.objs[i], e = els[i];
-    const appear = o[0] - PRE, hit = o[0], end = o[1];
-    if (t < appear || t > end) { e.g.style.opacity = 0; continue; }
+    // Hide right at hit time, not slider end - a static head-position
+    // marker sitting there for the whole slider duration (while the real
+    // replay cursor has already moved on along the slider path) reads as
+    // desync/lingering even though the underlying timing data is correct.
+    const appear = o[0] - PRE, hit = o[0];
+    if (t < appear || t > hit) { e.g.style.opacity = 0; continue; }
     e.g.style.opacity = Math.min(1, (t - appear) / FADE);
     const shrink = Math.max(0, Math.min(1, (hit - t) / PRE));
     e.ac.setAttribute('r', R + shrink * R * 2);
