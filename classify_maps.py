@@ -1191,6 +1191,7 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     back to scan_folder() in that case.
     """
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     def log(msg):
         if log_cb:
@@ -1214,37 +1215,66 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     results = []
     errors = []
     missing = 0
-    for i, e in enumerate(entries):
-        if cancel_event is not None and cancel_event.is_set():
-            raise ScanCancelled()
-        wait_if_paused(pause_event, cancel_event)
 
+    def _read(e):
         full = os.path.join(songs_dir, e["folder"], e["filename"])
         try:
-            diff = parse_osu_file(full)
+            return parse_osu_file(full), None
         except OSError:
-            missing += 1
-            diff = None
+            return None, "missing"
         except Exception as exc:
-            errors.append((full, str(exc)))
-            diff = None
+            return None, str(exc)
 
-        if not is_junk_diff(diff):
-            # osu!.db already knows these, so take them rather than
-            # recomputing or leaving them blank as a folder scan would.
-            diff.ranked_status = e["ranked_status"]
-            diff.star_rating = e["star_rating"]
-            diff.online_id = e["map_id"]
-            if e["md5"]:
-                diff.version_hash = e["md5"]
-            results.append(diff)
-            if on_parsed:
-                on_parsed(diff)
+    # A single open()+read() here is a few KB, but on a real Songs/ folder
+    # each one still costs tens to hundreds of ms one at a time - real-time
+    # antivirus scanning each newly-opened file and per-file seeks on a
+    # mechanical drive both dominate over the actual (tiny) parse work.
+    # open()/read() release the GIL while blocked on I/O, so a small thread
+    # pool overlaps that wait across several files at once instead of
+    # paying it file-by-file - this is the whole reason stable was slower
+    # than lazer despite using the same fast-path shape (both were fully
+    # serial; lazer's realm-reader helper just front-loads the equivalent
+    # work into one subprocess call instead of N python-level opens).
+    # Submitted in bounded windows rather than one big pool.map() over the
+    # whole library so cancel actually stops promptly (map() would otherwise
+    # queue every remaining file's read immediately).
+    workers = min(8, (os.cpu_count() or 4) * 2)
+    window = workers * 4
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        i = 0
+        for start in range(0, len(entries), window):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
+            wait_if_paused(pause_event, cancel_event)
 
-        if progress_cb and (i + 1) % 25 == 0:
-            progress_cb(i + 1, len(entries))
-        if log_cb and (i + 1) % 5000 == 0:
-            log(f"  ... {i + 1}/{len(entries)} parsed")
+            batch = entries[start:start + window]
+            for e, (diff, err) in zip(batch, pool.map(_read, batch)):
+                if err == "missing":
+                    missing += 1
+                elif err is not None:
+                    full = os.path.join(songs_dir, e["folder"], e["filename"])
+                    errors.append((full, err))
+
+                if not is_junk_diff(diff):
+                    # osu!.db already knows these, so take them rather than
+                    # recomputing or leaving them blank as a folder scan would.
+                    diff.ranked_status = e["ranked_status"]
+                    diff.star_rating = e["star_rating"]
+                    diff.online_id = e["map_id"]
+                    if e["md5"]:
+                        diff.version_hash = e["md5"]
+                    results.append(diff)
+                    if on_parsed:
+                        on_parsed(diff)
+
+                i += 1
+                if progress_cb and i % 25 == 0:
+                    progress_cb(i, len(entries))
+                if log_cb and i % 5000 == 0:
+                    log(f"  ... {i}/{len(entries)} parsed")
+    finally:
+        pool.shutdown(wait=True)
 
     if progress_cb:
         progress_cb(len(entries), len(entries))
