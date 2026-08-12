@@ -178,6 +178,24 @@ def test_real_break_does_not_merge():
     assert d.burst_count == 2
 
 
+def test_cutstream_rejoin_is_rejected_when_the_cut_itself_is_a_jump():
+    # Identical timing shape to test_cut_stream_counts_as_one_stream (clean
+    # 2x skipped-beat gap, same speed both sides) but the skipped-beat
+    # transition itself covers a huge distance - two separate stream
+    # clusters on opposite sides of the playfield, not one continuous
+    # stream with a quietly skipped note. Real example (ai-classification
+    # branch): Night of Knights [TAG4] has cuts up to 6.8x hit-circle
+    # diameter between two clusters ~430px apart on the 512px playfield -
+    # visually confirmed to be a genuine jump, not a timing artifact.
+    first = circles(6, x0=32)
+    gap_t = 1000 + 6 * 75 + 150  # same clean 2x-gap timing as the cut-stream test
+    second = circles(6, t0=gap_t, x0=464)  # far side of the playfield
+    d = classify(first + second)
+    assert not d.has_streams, "a real jump between two clusters must not silently rejoin as one stream"
+    assert d.burst_count == 2
+    assert not d.has_cutstreams
+
+
 # --- mods ------------------------------------------------------------------
 
 def test_dt_turns_half_tapping_into_a_stream():
