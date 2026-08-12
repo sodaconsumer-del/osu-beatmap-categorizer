@@ -438,6 +438,29 @@ def test_burst_vs_jump_coverage_uses_matching_denominators_when_available():
     assert cm.category_of(False, True, True, 30, 100, 30.0) == "Bursts"
 
 
+def test_a_single_incidental_burst_does_not_win_jumps_with_bursts():
+    # One 3-note burst run (burst_run_count=1) buried in an otherwise pure
+    # jump map - visually confirmed on real examples (ai-classification
+    # branch) to read as plain jump maps, not maps with a real "bursts"
+    # character. jump_coverage (80%) trivially beats burst_coverage (a
+    # single run's worth of transitions, ~2%), so without the recurrence
+    # gate this would win "Jumps with bursts" on presence alone.
+    assert cm.category_of(False, True, True, 3, 100, 80.0,
+                           burst_run_count=1, counted_gaps=100) == "Jumps (no bursts)"
+    # Two separate burst runs clears the recurrence floor - back to the
+    # normal coverage comparison.
+    assert cm.category_of(False, True, True, 8, 100, 80.0,
+                           burst_run_count=2, counted_gaps=100) == "Jumps with bursts"
+
+
+def test_burst_run_count_zero_means_not_supplied_not_genuinely_zero():
+    # burst_run_count defaults to 0, same as every pre-existing direct
+    # category_of(...) call in this file uses (never passes it) - those
+    # calls must keep working exactly as before, i.e. the recurrence gate
+    # must NOT fire just because burst_run_count wasn't given.
+    assert cm.category_of(False, True, True, 5, 100, 60.0) == "Jumps with bursts"
+
+
 def test_counted_gaps_is_populated_and_matches_jump_pcts_own_denominator():
     # Wiring check: classify_diff() must actually fill in counted_gaps (not
     # just leave the dataclass default), and it has to be the exact same
