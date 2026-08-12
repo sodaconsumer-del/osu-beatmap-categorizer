@@ -189,6 +189,27 @@ Decisions that look odd but aren't:
   `cut_max_dist_ratio` (4.0 - roughly 2x the normal "still readable"
   spacing ceiling, since a cut spans two note-hops merged into one) rejects
   the merge when the cut itself is that far.
+- **A slider whose computed tail lands after the next object's start time is
+  excluded from jump detection entirely**, not measured. `move_time` (the
+  cursor's actual travel time) is floored at 1ms to avoid a divide-by-zero,
+  but when the *unfloored* value is negative - the previous slider's own
+  duration formula puts its tail after the next object already started -
+  there is no real "how far did the cursor move in how long" to compute; the
+  floor was manufacturing a huge, meaningless velocity out of it instead.
+  This is real on real maps, not a hypothetical: an inherited (SV) timing
+  point landing on exactly the same timestamp as a slider's own start is
+  legal osu! and does happen (confirmed on "Logical Stimulus [Marselo's
+  Extra]" - a green line at the slider's own 55471ms recomputes its velocity
+  and yields a mathematically correct ~527ms duration that still runs past
+  the next circle at 55552ms). The slider-duration formula itself checks out
+  against the file's own timing data; it's the transition model built on top
+  of it that can't make sense of two objects overlapping in time. Real
+  library check: 2,577 diffs had at least one such overlapping transition
+  (27,918 total), 18 direct category flips - all moving away from
+  "Jumps"/"Jumps with bursts" toward Streams/Bursts/Misc, the direction
+  you'd expect from removing manufactured jumps, and disproportionately on
+  maps whose names say what they are ("XNOR XNOR XNOR", "Shitpost Set 2",
+  "mapping styles").
 
 `category_of()` is the single source of truth for category rules. Both the
 live path and the `--from-csv` rebuild go through it — they used to carry

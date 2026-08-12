@@ -518,9 +518,20 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         p = objs[i - 1]
         c = objs[i]
         tap_gap = (c[0] - p[0]) / rate
-        move_time = max((c[0] - p[1]) / rate, 1.0)
+        raw_move = (c[0] - p[1]) / rate
+        move_time = max(raw_move, 1.0)
         dist = ((c[2] - p[4]) ** 2 + (c[3] - p[5]) ** 2) ** 0.5
-        transitions.append((tap_gap, move_time, dist))
+        # A negative raw_move means the previous slider's own computed tail
+        # time is AFTER the next object's start - the two are overlapping in
+        # time, not sequential. That happens on real (if unusual) maps with
+        # an SV change landing on a slider's own timestamp, or similar. When
+        # it does, "how far the cursor moved in how long" is meaningless: the
+        # 1ms floor turns a merely-large distance into a manufactured
+        # near-infinite velocity, which is what was hijacking jump detection
+        # here - not the slider-duration math, which checks out against the
+        # file's own timing data (see AGENTS.md).
+        overlapping = raw_move < 0
+        transitions.append((tap_gap, move_time, dist, overlapping))
 
     # --- jump density ------------------------------------------------------
     # Velocity is in diameters per 100ms. That unit is BPM-independent, which
@@ -528,11 +539,16 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # default threshold was re-derived rather than carried over.
     jump_count = 0
     counted_gaps = 0
-    for tap_gap, move_time, dist in transitions:
+    for tap_gap, move_time, dist, overlapping in transitions:
         # Gaps longer than the cap are breaks and section boundaries, not
         # gameplay. Leaving them in the denominator quietly diluted dense
         # maps and inflated sparse ones.
         if tap_gap > jump_gap_cap_ms:
+            continue
+        # A temporally overlapping transition (see above) has no meaningful
+        # velocity to measure - excluded the same way breaks are, rather
+        # than let the floor manufacture a jump out of it.
+        if overlapping:
             continue
         counted_gaps += 1
         norm_dist = dist / diam
@@ -548,7 +564,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     raw_runs = []
     cur = []
     cur_sum = 0.0
-    for idx, (tap_gap, _, _) in enumerate(transitions):
+    for idx, (tap_gap, _, _, _) in enumerate(transitions):
         if tap_gap > max_gap_ms:
             if cur:
                 raw_runs.append(cur)
