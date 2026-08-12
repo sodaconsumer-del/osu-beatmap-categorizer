@@ -423,7 +423,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    jump_min_transitions=40, jump_gap_cap_ms=1000.0,
                    stream_pct_threshold=15.0,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
-                   cut_max_multiple=3.0, mods=None):
+                   cut_max_multiple=3.0, cut_max_dist_ratio=4.0, mods=None):
     """
     Terminology (matching osu!'s official beatmap tags):
       - burst  : 3-9 note run. Three notes really is enough - short 3-note
@@ -599,6 +599,20 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                 break  # not a clean skipped-note gap, just a pause
             if abs(mean_gap(nxt) - note_gap) / note_gap > gap_consistency_tol:
                 break  # the other side is at a different speed
+            # A cut spans what would normally be TWO note-hops merged into
+            # one (the skipped note sits between them), so up to roughly
+            # 2x the normal "still readable, not a jump" ceiling is
+            # expected even for a genuine skipped-note stream. Real
+            # library check (ai-classification branch): 1979 maps had at
+            # least one "cut" whose distance was >3x a hit circle diameter,
+            # some past 9x - visually confirmed on Night of Knights [TAG4]
+            # (a well-known real stream map) that a 6.8x-diameter "cut" is
+            # actually two separate stream clusters on opposite sides of
+            # the playfield joined by a genuine full-screen jump, not one
+            # continuous stream with a quietly skipped note. Reject the
+            # merge rather than disguise a real jump as a timing artifact.
+            if transitions[between][2] > diam * cut_max_dist_ratio:
+                break
             run = run + [between] + list(nxt)
             cuts.add(between)
             i += 1
@@ -1857,6 +1871,13 @@ DEFAULT_PARAMS = dict(
     # Largest skipped-note gap that still counts as a cut within one stream
     # rather than a genuine break between two runs.
     cut_max_multiple=3.0,
+    # Largest cut-transition distance, as a multiple of hit-circle diameter,
+    # that still counts as "a skipped note" rather than a real jump hiding
+    # inside what would otherwise read as one continuous cutstream. A cut
+    # spans two normal note-hops merged into one, so ~2x the ordinary
+    # "still readable" spacing ceiling (spaced_diam_ratio) is expected even
+    # for a genuine skip - beyond that it's a jump, not a timing artifact.
+    cut_max_dist_ratio=4.0,
 )
 
 # Params that must stay integers when parsed from a string (CLI/GUI).
@@ -2276,6 +2297,9 @@ def main():
     ap.add_argument("--cut-max-multiple", type=float, default=DEFAULT_PARAMS["cut_max_multiple"],
                      help="Largest skipped-note gap still treated as a cut inside one stream rather than "
                           "a break between two separate runs")
+    ap.add_argument("--cut-max-dist-ratio", type=float, default=DEFAULT_PARAMS["cut_max_dist_ratio"],
+                     help="Largest cut-transition distance (as a multiple of hit-circle diameter) still "
+                          "treated as a skipped note rather than a real jump between two separate runs")
     ap.add_argument("--mods", default=None,
                      help="Classify as if these mods were active, e.g. --mods DT or --mods HR,DT. "
                           "NM (no mods) is the baseline and the default. Only DT/NC, HT/DC, HR and EZ "

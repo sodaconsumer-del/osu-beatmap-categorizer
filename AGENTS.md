@@ -177,6 +177,18 @@ Decisions that look odd but aren't:
 - **Except: a burst map that streams once (12+ notes) is a stream map.**
   Scoped to burst outcomes only — deliberately not extended to jump maps,
   where a stray run is usually tightly-spaced jumps rather than streaming.
+- **A cut's own distance is checked too, not just its timing.** Rejoining
+  across a skipped beat used to check only that the gap was a clean
+  whole-number multiple of the run's tempo - never how FAR the cut
+  transition actually traveled. Real library check (ai-classification
+  branch): 1979 maps had at least one cut exceeding 3x a hit-circle
+  diameter, some past 9x. Visually confirmed on Night of Knights [TAG4] (a
+  well-known real map) that a 6.8x-diameter cut is two separate stream
+  clusters on opposite sides of the playfield joined by a genuine
+  full-screen jump, not one continuous stream with a quietly skipped note.
+  `cut_max_dist_ratio` (4.0 - roughly 2x the normal "still readable"
+  spacing ceiling, since a cut spans two note-hops merged into one) rejects
+  the merge when the cut itself is that far.
 
 `category_of()` is the single source of truth for category rules. Both the
 live path and the `--from-csv` rebuild go through it — they used to carry
@@ -236,6 +248,7 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `run_wide_fraction_max` | 0.4 | max fraction of a run's transitions that may be jump-wide before it's rejected as a stream/burst |
 | `mean_diam_ratio_max` | 1.5 | max *average* dist/diameter across a run before it's rejected |
 | `cut_max_multiple` | 3.0 | largest skipped-note gap multiple still treated as a cut inside one stream |
+| `cut_max_dist_ratio` | 4.0 | largest cut-transition distance (× hit-circle diameter) still treated as a skipped note rather than a real jump between two separate runs |
 
 Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
 `category_of()` parameter, not a `classify_diff()` one, since it operates on

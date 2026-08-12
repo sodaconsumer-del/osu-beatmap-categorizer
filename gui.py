@@ -467,6 +467,7 @@ class ClassifierGUI(tk.Tk):
             ("burst_max", "Burst max notes", cm.DEFAULT_PARAMS["burst_max"]),
             ("stream_min", "Stream min notes", cm.DEFAULT_PARAMS["stream_min"]),
             ("cut_max_multiple", "Max cut gap multiple", cm.DEFAULT_PARAMS["cut_max_multiple"]),
+            ("cut_max_dist_ratio", "Max cut jump distance ratio", cm.DEFAULT_PARAMS["cut_max_dist_ratio"]),
             ("tight_diam_ratio", "Tight spacing ratio", cm.DEFAULT_PARAMS["tight_diam_ratio"]),
             ("spaced_diam_ratio", "Spaced stream ratio", cm.DEFAULT_PARAMS["spaced_diam_ratio"]),
             ("jump_velocity_ratio", "Jump vel. (diam/100ms)", cm.DEFAULT_PARAMS["jump_velocity_ratio"]),
