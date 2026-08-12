@@ -289,6 +289,39 @@ def test_breaks_stay_out_of_the_jump_denominator():
     assert abs(with_break.jump_pct - base) < 1.0
 
 
+def test_overlapping_slider_tail_is_not_a_manufactured_jump():
+    # A slider whose computed tail time lands AFTER the next note's start
+    # time - real on maps where an SV change lands exactly on the slider's
+    # own timestamp (see AGENTS.md) - has no meaningful "how far did the
+    # cursor move in how long" to measure. The 1ms move_time floor used to
+    # turn that into a manufactured, near-infinite velocity: any spacing at
+    # all became a "jump", no matter how far the tail really was.
+    wide = [f"{100 + (i % 2) * 300},100,{1000 + i * 200},1,0" for i in range(60)]
+    base = classify(wide)
+
+    overlap_pair = [
+        # 300px path, 300ms/beat, SliderMultiplier 1.4 -> ~643ms duration,
+        # tail near (400,100) at t~5643.
+        "100,100,5000,2,0,L|400:100,1,300",
+        # Starts at t=5100 - long before the slider's own computed end - and
+        # far from its tail (424px away, vs. a ~73px hit-circle diameter).
+        "100,400,5100,1,0",
+    ]
+    with_overlap = classify(wide + overlap_pair)
+
+    # Only the transition INTO the slider joins the denominator; the
+    # overlapping slider->next transition must be excluded, not counted.
+    assert with_overlap.counted_gaps == base.counted_gaps + 1
+    # jump_count isn't stored directly - reconstruct it from jump_pct's own
+    # denominator (exact, since jump_pct = jump_count / counted_gaps * 100).
+    base_jumps = round(base.jump_pct / 100.0 * base.counted_gaps)
+    with_jumps = round(with_overlap.jump_pct / 100.0 * with_overlap.counted_gaps)
+    # The huge, but meaningless, slider->next spacing must not itself
+    # register as a jump - allow at most the one legitimate new jump from
+    # the wide-pattern transition leading into the slider.
+    assert with_jumps <= base_jumps + 1
+
+
 # --- category rules --------------------------------------------------------
 
 def test_category_of_accepts_a_diff_or_raw_values():
