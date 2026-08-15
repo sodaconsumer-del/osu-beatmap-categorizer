@@ -430,10 +430,36 @@ def mod_adjustments(mods, circle_size):
 # since they work from already-computed CSV columns).
 MIN_OBJECTS_TO_CLASSIFY = 10
 
+# No human plays a sustained average faster than this. Real library check
+# (ai-classification branch): note density (object count / time span) across
+# ~58,400 real diffs decays continuously up to ~27/sec, then a genuine gap -
+# nothing between 28 and 30/sec - before a separate cluster of 11 outliers
+# from 30/sec up to 3968/sec, all confirmed troll/audio-visualizer content by
+# title ("u cant even stream 1000bpm u pleb", "unbeatable", "cancerstream")
+# and star rating (up to 356 - real maps top out around 9-10). Visually
+# confirmed via osu_visualizer_preview.py on "Left Behind [god has forasken
+# us]" (74,948 notes averaging 487/sec): dozens of notes stacked at each of
+# four fixed points, firing far faster than any cursor could move or click -
+# not gameplay, an audio visualizer built out of hit objects. 30 sits in the
+# gap itself, so it doesn't touch the real (if extreme) tail below it.
+MAX_SUSTAINED_NOTES_PER_SEC = 30.0
+
 
 def is_junk_diff(diff):
-    """True if `diff` has too few hit objects to be worth keeping at all."""
-    return diff is None or len(diff.objs) < MIN_OBJECTS_TO_CLASSIFY
+    """
+    True if `diff` isn't worth keeping at all - too few hit objects to mean
+    anything, or a note density no human could play (see
+    MAX_SUSTAINED_NOTES_PER_SEC above).
+    """
+    if diff is None or len(diff.objs) < MIN_OBJECTS_TO_CLASSIFY:
+        return True
+    span_ms = diff.objs[-1][0] - diff.objs[0][0]
+    if span_ms <= 0:
+        # Every object crammed into a single instant - not a real timeline.
+        return True
+    if len(diff.objs) / (span_ms / 1000.0) > MAX_SUSTAINED_NOTES_PER_SEC:
+        return True
+    return False
 
 
 def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
@@ -518,6 +544,13 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # burst_min floor.
     diff.total_note_count = len(objs)
     if len(objs) < MIN_OBJECTS_TO_CLASSIFY:
+        return diff
+    span_ms = objs[-1][0] - objs[0][0]
+    if span_ms <= 0 or len(objs) / (span_ms / 1000.0) > MAX_SUSTAINED_NOTES_PER_SEC:
+        # Mirrors is_junk_diff() - a second line of defense for direct
+        # classify_diff() callers that bypass the scan-path filtering (see
+        # is_junk_diff's docstring). Left with default/blank pattern flags,
+        # same as the too-few-objects case above.
         return diff
 
     rate, eff_cs = mod_adjustments(mods, diff.circle_size)

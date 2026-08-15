@@ -336,6 +336,26 @@ for any caller that bypasses the scan-level gate). `total_note_count` is set
 before that internal check, not after, so a direct `classify_diff()` call
 still reports the real count even though nothing else runs.
 
+`is_junk_diff()` also rejects a diff whose note density (object count /
+time span) sustains above `MAX_SUSTAINED_NOTES_PER_SEC` (30, same
+module-constant treatment as `MIN_OBJECTS_TO_CLASSIFY` - a hard floor, not
+a threshold to tune per-user). No human plays faster than that averaged
+across a whole diff. Real library check: density decays continuously up to
+~27/sec across ~58,400 real diffs, then a genuine gap - nothing between 28
+and 30/sec - before a separate cluster of 11 outliers from 30/sec up to
+3968/sec, all troll/audio-visualizer content confirmed by title
+("u cant even stream 1000bpm u pleb", "unbeatable", "Miracle Tower
+(175000bpm)") and star rating (up to 356 - real maps top out around 9-10).
+Visually confirmed via `osu_visualizer_preview.py` on "Left Behind [god has
+forasken us]" (74,948 notes averaging 487/sec, `star_rating` 356.09): dozens
+of notes stacked at each of four fixed points, firing far faster than a
+cursor could move between them - an audio visualizer built out of hit
+objects, not gameplay. `classify_diff()` enforces this independently too,
+same defense-in-depth reasoning as the object-count floor above. 30 sits in
+the gap itself, so it doesn't touch the real (if extreme) tail below it -
+same "only fix the unambiguous population" discipline as the burst-
+recurrence and stack-run fixes earlier in this document.
+
 ### Mod math
 
 `mod_adjustments(mods, circle_size)` → `(rate, effective_circle_size)`.

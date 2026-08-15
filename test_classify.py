@@ -144,6 +144,33 @@ def test_is_junk_diff():
     assert cm.is_junk_diff(None)
 
 
+def test_impossible_note_density_is_junk():
+    # 20 notes, 25ms apart = 40/sec - well past MAX_SUSTAINED_NOTES_PER_SEC
+    # (30), and past any real player's sustained tapping speed. Real library
+    # check: 74,948-note "Left Behind [god has forasken us]" averaged
+    # 487/sec - visually confirmed via osu_visualizer_preview.py to be an
+    # audio visualizer built out of hit objects, not gameplay (see
+    # AGENTS.md).
+    fast = build(circles(20, step=25))
+    assert cm.is_junk_diff(fast)
+
+    # Same note count, comfortably under the line (25/sec) - a real, if very
+    # hard, difficulty must not get caught by the same gate.
+    slow = build(circles(20, step=40))
+    assert not cm.is_junk_diff(slow)
+
+
+def test_impossible_note_density_classifies_as_blank_not_a_pattern():
+    # Mirrors test_sub_floor_diffs_are_not_classified_at_all - a direct
+    # classify_diff() call (bypassing the scan-path is_junk_diff filter)
+    # must also refuse to invent a pattern verdict for impossible density.
+    d = classify(circles(20, step=25))
+    assert not d.has_bursts
+    assert not d.has_streams
+    assert not d.has_jumps
+    assert cm.category_of(d) == "Misc"
+
+
 def test_junk_diffs_never_reach_scan_results():
     # The actual behaviour that matters: a sub-floor diff isn't just
     # classified as Misc, it's dropped before it's ever added to a scan's
