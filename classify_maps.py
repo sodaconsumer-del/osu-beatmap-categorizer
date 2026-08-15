@@ -1571,7 +1571,8 @@ def is_ranked(status):
 def category_of(has_streams, has_bursts=None, has_jumps=None,
                  burst_note_total=0, total_note_count=0, jump_pct=0.0,
                  stream_note_total=0, stream_run_count=0, max_stream_len=0,
-                 burst_promote_stream_len=12, burst_run_count=0, counted_gaps=0):
+                 burst_promote_stream_len=12, burst_run_count=0, counted_gaps=0,
+                 burst_recurrence_min=2):
     """
     The one place the dominant-pattern rules live.
 
@@ -1606,6 +1607,34 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     supplied (0) - the CSV-rebuild path for CSVs written before this field
     existed has no way to recover it, so it keeps the original comparison
     rather than silently mixing bases.
+
+    has_bursts, unlike has_streams, has never required clearing any bar -
+    pure presence, len(bursts) > 0. That's the same shape of bug the
+    has_streams coverage floor was added to fix, and measured on a real
+    ~9,300-map library it's not rare: 176 "Jumps with bursts" results came
+    from a SINGLE burst run (median coverage 1.13% of the map, e.g. one
+    3-note cluster in a 1493-note, 96.7%-jump difficulty) - visually
+    confirmed on several real examples via osu_visualizer_preview.py to be
+    plain jump maps at every sampled moment, not maps with a real "bursts"
+    character. burst_recurrence_min=2 kills exactly that population: a
+    single incidental cluster isn't recurring content.
+
+    Deliberately NOT a coverage-percentage floor like has_streams got.
+    Burst coverage vs. run count doesn't have the same clean bimodal split
+    stream coverage did (2.5-12.9% vs 55-96% for real/fake NiNo streams) -
+    it's a smooth continuum (median coverage rises roughly with run count,
+    from 1.13% at 1 run to 16.53% at 10+ runs, no natural gap anywhere in
+    between), because a burst is capped at 9 notes by definition and can
+    never dominate a map's note count the way one long stream run can. So
+    only the unambiguous run_count==1 case is fixed here; where exactly the
+    line should sit for run_count 2-9 is a real open question, deliberately
+    left alone rather than picking an unmeasured number.
+
+    burst_run_count == 0 is treated as "not supplied" (skip this gate, old
+    presence-only behaviour) rather than "genuinely zero runs" - the two
+    are indistinguishable from the parameter alone, but harmlessly so: a
+    real zero-run map already has has_bursts == False, so this gate would
+    never have mattered for it anyway.
     """
     if hasattr(has_streams, "has_streams"):
         d = has_streams
@@ -1617,6 +1646,9 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
         max_stream_len = d.max_stream_len
         burst_run_count = d.burst_count
         counted_gaps = d.counted_gaps
+
+    if burst_run_count and burst_run_count < burst_recurrence_min:
+        has_bursts = False
 
     jump_coverage = jump_pct / 100.0
     if counted_gaps:
