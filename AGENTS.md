@@ -234,6 +234,28 @@ Decisions that look odd but aren't:
   you'd expect from removing manufactured jumps, and disproportionately on
   maps whose names say what they are ("XNOR XNOR XNOR", "Shitpost Set 2",
   "mapping styles").
+- **A run where every note sits on the exact same spot is not a burst or a
+  stream.** `wide_fraction`/`mean_diam_ratio_max` only ever capped how FAR
+  apart a run's notes could be; nothing floored how CLOSE, so a stack (2+
+  circles on identical (x,y), a completely ordinary mapping technique for
+  emphasis) sailed through every spacing check with a trivial `dist == 0`
+  and got counted as a real burst/stream run. Reported by the user on "ESSE
+  CARA! [INSANE!]": six "burst" runs, all four-note stacks on one point,
+  called `has_bursts` with zero actual movement in any of them - confirmed
+  visually via `osu_visualizer_preview.py`. Real library check: 33.5% of
+  EVERY burst run ever counted (665,952 of 1,986,316) had `mean_dist_ratio
+  == 0.0` - and it's a clean population, not a threshold call: exactly-zero
+  outnumbers the entire (0, 0.05) range combined roughly 55x (668,768 vs
+  12,117), with that small remainder spread thinly rather than clustered
+  near zero. Fix rejects a run outright when `mean_dist_ratio == 0.0` -
+  deliberately exact equality, not an epsilon, since the population itself
+  is exact (raw file coordinates, not float noise) and the ambiguous
+  near-zero-but-real sliver is small enough to leave alone rather than
+  guess at. Measured effect: 7,076 category flips (12.1% of the library) -
+  by far the largest of any fix this session, consistent with a bug that
+  hit a third of all burst content. Largest single moves: 2,937 "Jumps with
+  bursts" → "Jumps (no bursts)" and 2,689 "Bursts" → "Misc" (maps whose
+  only "burst" was entirely stacks).
 
 `category_of()` is the single source of truth for category rules. Both the
 live path and the `--from-csv` rebuild go through it — they used to carry

@@ -683,6 +683,19 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
             # stream, regardless of what fraction of individual transitions
             # technically dodged the wide-fraction check.
             continue
+        if mean_dist_ratio == 0.0:
+            # Every transition in this run measured exactly zero distance -
+            # every note sits on the same (x,y) as the last, i.e. a stack,
+            # not a burst/stream. Real library check: 33.5% of ALL burst
+            # runs (665,952 of 1,986,316) were exactly this - and it's a
+            # clean population, not a threshold call: 0.0 outnumbers the
+            # entire (0, 0.05) range combined by ~55x (668,768 vs 12,117),
+            # with that remainder spread thinly and continuously rather than
+            # clustered near zero. Confirmed visually via
+            # osu_visualizer_preview.py on "ESSE CARA! [INSANE!]" - a
+            # "burst" the classifier reported was four notes stacked on one
+            # point, not a cluster a player would ever call a burst.
+            continue
         if burst_min <= length <= burst_max:
             bursts.append(length)
         elif length >= stream_min:

@@ -102,6 +102,19 @@ def test_two_notes_is_not_a_burst():
     assert not d.has_bursts
 
 
+def test_a_pure_stack_is_not_a_burst():
+    # Same shape as test_three_notes_is_a_burst, but every note sits on the
+    # exact same (x,y) - zero measured distance, not a cluster a player
+    # would ever call a burst. Real library check: 33.5% of ALL burst runs
+    # (665,952 of 1,986,316) were exactly this before the fix - confirmed
+    # visually on "ESSE CARA! [INSANE!]" (see AGENTS.md).
+    filler = [f"100,100,{2000 + i * 500},1,0" for i in range(7)]
+    d = classify(circles(3, dx=0) + filler)
+    assert d.total_note_count == 10
+    assert not d.has_bursts
+    assert d.burst_count == 0
+
+
 def test_sub_floor_diffs_are_not_classified_at_all():
     # 9 fast, tight notes - exactly what burst_max (9) would call a single
     # burst if classification ran. But MIN_OBJECTS_TO_CLASSIFY is 10, and
