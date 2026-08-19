@@ -26,14 +26,24 @@ Categories (default thresholds, all tunable via CLI flags):
     - Misc               : none of the above (low density / normal play)
 
 A note-to-note transition only counts toward a burst/stream run if BOTH:
-    1. It's fast in ABSOLUTE terms (<= max_gap_ms between taps). Speed is
-       deliberately not judged as a ratio to the map's stored BPM, because
-       plenty of maps store a doubled tempo. Stream BPM = 15000 / ms.
+    1. It's fast in ABSOLUTE terms (<= max_gap_ms between taps). Stream BPM
+       is 15000 / ms, so 140ms is roughly a 107 BPM stream.
     2. It's rhythmically consistent with the rest of the run - a real stream
        doesn't change tapping speed halfway through.
+The run as a whole must then be a FAST SNAP for its map, not merely fast in
+milliseconds: at most burst_beat_fraction_max (0.4) of a beat per note, which
+admits 1/4 and 1/3 and rejects 1/2. Without that, a 240 BPM jump map's
+ordinary 1/2 tapping (125ms - under the cap) reads as wall-to-wall bursts.
+The stored tempo still isn't trusted blindly, because plenty of maps notate a
+doubled or halved one: runs at or under burst_always_fast_ms (110ms) skip the
+snap test entirely, and halved notation is folded back out first (see
+effective_beat_ms). So the snap test only ever decides the 110-140ms band.
+
 Spacing then decides what KIND of run it is. Fast-but-far transitions are
 jumps, not bursts, regardless of how tight the timing is (e.g. 1/4-snap jump
-streams at high BPM are NOT bursts).
+streams at high BPM are NOT bursts). Spacing sets no lower bound: a stacked
+1/4 triple - every note on one point, the commonest burst shape there is -
+is a burst.
 
 Spacing is measured from the previous object's END, so a long slider whose
 tail sits next to the following note isn't mistaken for a full-screen jump.
@@ -462,6 +472,61 @@ def is_junk_diff(diff):
     return False
 
 
+# Shortest beat length that could be a real notated tempo (100ms = 600 BPM).
+# Past this the file is describing something no song does, and the honest
+# answer is that its tempo is unknown rather than absurdly fast.
+MIN_PLAUSIBLE_BEAT_MS = 100.0
+
+
+def effective_beat_ms(beat_ms, min_notated_bpm=125.0):
+    """
+    Beat length in ms with halved-BPM notation folded back out.
+
+    A mapper is free to notate a song at half its real tempo - write 118 when
+    the song is really 236 - and osu! plays exactly the same either way, so
+    nothing in the file says which was meant. It matters here because
+    burst/stream detection asks "is this run faster than 1/2 snap?", and under
+    halved notation the run that a player feels as plain 1/2 tapping is
+    written as 1/4 and sails through.
+
+    Folding is one-directional: a too-LONG beat gets halved until the notated
+    tempo reaches min_notated_bpm, and a short one is left alone. Doubled
+    notation (a 90 BPM song written as 180) needs no correction, because the
+    absolute max_gap_ms gate judges the same milliseconds either way - it is
+    only the too-slow direction that lets a slow rhythm masquerade as a fast
+    snap. Halving a genuinely fast tempo would be actively harmful: a real
+    250 BPM map taps 1/1 at 240ms and 1/2 at 120ms, and folding it to 125
+    would turn that ordinary 1/2 into a "1/4 burst" - exactly the bug this
+    function exists to prevent.
+
+    The blast radius is small and worth stating: under a 140ms absolute cap,
+    the only maps whose 1/4 can be admitted at all sit at 107-125 notated BPM
+    (1/4 = 120-140ms). Below 107 the 1/4 is already too slow to count; at or
+    above 125 nothing is folded. So this only ever changes the verdict for
+    maps notated in that narrow band - which is precisely where halved
+    notation lives.
+    """
+    # 0.0 means "this file has no usable tempo" - callers skip the snap test
+    # rather than measure against a number that isn't one. A subnormal or
+    # negative beatLength is the parse-level corruption
+    # test_tiny_beat_length_does_not_produce_infinite_bpm covers; anything
+    # under MIN_PLAUSIBLE_BEAT_MS is a "tempo" no song has, so the safe
+    # reading is that the timing data is junk, not that every run in the map
+    # is too slow to be a burst.
+    if beat_ms < MIN_PLAUSIBLE_BEAT_MS or not math.isfinite(beat_ms):
+        return 0.0
+    if min_notated_bpm <= 0:
+        return beat_ms
+    longest = 60000.0 / min_notated_bpm
+    # Bounded rather than `while` - a pathological beat length would
+    # otherwise spin for hundreds of iterations before reaching the band.
+    for _ in range(8):
+        if beat_ms <= longest:
+            break
+        beat_ms /= 2.0
+    return beat_ms
+
+
 def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    tight_diam_ratio=1.35, spaced_diam_ratio=2.0,
                    burst_min=3, burst_max=9, stream_min=10,
@@ -469,7 +534,9 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    jump_min_transitions=40, jump_gap_cap_ms=1000.0,
                    stream_pct_threshold=15.0,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
-                   cut_max_multiple=3.0, cut_max_dist_ratio=4.0, mods=None):
+                   cut_max_multiple=3.0, cut_max_dist_ratio=4.0,
+                   burst_beat_fraction_max=0.4, burst_always_fast_ms=110.0,
+                   min_notated_bpm=125.0, mods=None):
     """
     Terminology (matching osu!'s official beatmap tags):
       - burst  : 3-9 note run. Three notes really is enough - short 3-note
@@ -502,6 +569,15 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     Working in milliseconds sidesteps the whole problem, because it never
     consults the stored tempo. Stream BPM is just 15000 / ms_per_note, so
     max_gap_ms = 140 is "roughly a 107 BPM stream or faster".
+
+    That is still true, but it is not SUFFICIENT, which is what the rhythm
+    gate further down now handles. Milliseconds cannot distinguish a burst
+    from a fast map's own pulse: at 240 BPM an ordinary 1/2 tap is 125ms and
+    clears this cap, so every high-BPM jump map grew bursts out of its plain
+    tapping. The gate asks the question this cap can't - is the run a step UP
+    from the beat it sits on - and is deliberately confined to the 110-140ms
+    band where notation could mislead, so the "never trust the stored tempo"
+    principle above still holds everywhere it was actually load-bearing.
 
     The second gate is CONSISTENCY: every gap in a run must stay within
     gap_consistency_tol of the run's running mean. A real stream does not
@@ -716,19 +792,49 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
             # stream, regardless of what fraction of individual transitions
             # technically dodged the wide-fraction check.
             continue
-        if mean_dist_ratio == 0.0:
-            # Every transition in this run measured exactly zero distance -
-            # every note sits on the same (x,y) as the last, i.e. a stack,
-            # not a burst/stream. Real library check: 33.5% of ALL burst
-            # runs (665,952 of 1,986,316) were exactly this - and it's a
-            # clean population, not a threshold call: 0.0 outnumbers the
-            # entire (0, 0.05) range combined by ~55x (668,768 vs 12,117),
-            # with that remainder spread thinly and continuously rather than
-            # clustered near zero. Confirmed visually via
-            # osu_visualizer_preview.py on "ESSE CARA! [INSANE!]" - a
-            # "burst" the classifier reported was four notes stacked on one
-            # point, not a cluster a player would ever call a burst.
-            continue
+        # --- rhythm gate: is this run a FAST SNAP, or just the map's pulse? --
+        # The absolute max_gap_ms cap alone can't tell those apart. At 240 BPM
+        # a plain 1/2 tap is 125ms, comfortably under the 140ms cap, so every
+        # ordinary 1/2 jump pattern in a high-BPM map arrived here looking
+        # like a burst. That is the single biggest source of false bursts:
+        # across the user's mislabelled set, eleven "Jumps with bursts"
+        # verdicts on maps a player hears no bursts in were ALL 1/2-snap runs
+        # at 120-135ms in 223-250 BPM maps.
+        #
+        # A burst is a rhythmic step UP from the map's own pulse, so judge the
+        # run against the beat it sits on: at most burst_beat_fraction_max of
+        # a beat per note. 0.4 admits 1/4 (0.25) and 1/3 (0.33) - both real
+        # burst rhythms - and rejects 1/2 (0.5) with 20% headroom for timing
+        # that isn't perfectly snapped.
+        #
+        # But the stored tempo is NOT authoritative about snap (the reason the
+        # original design refused to consult it at all), so the gate is scoped
+        # to where notation can actually mislead:
+        #
+        #   - Runs at or under burst_always_fast_ms skip it entirely. At 110ms
+        #     a note that is a ~136 BPM stream - fast enough that it is burst
+        #     tapping whatever the file calls the snap. This is what keeps
+        #     DOUBLED notation working: a 200 BPM song written as 400 taps its
+        #     1/4 at 75ms, which the file calls a 1/2, and it sails through on
+        #     speed alone exactly as it did before this gate existed.
+        #   - effective_beat_ms() folds HALVED notation back out before the
+        #     fraction is taken, which is the other direction and the one
+        #     speed can't rescue - see that function.
+        #
+        # So the gate only decides runs in the 110-140ms band, which is
+        # precisely the ambiguous stretch: too slow to be self-evidently a
+        # burst, fast enough to slip under the absolute cap.
+        #
+        # Measured over `spacing`, not `run`: a cut junction spans a skipped
+        # note, so its gap is 2-3x the run's own, and averaging it in would
+        # push a genuine cutstream over the line that rejoining it was meant
+        # to survive. Same exclusion, same reason, as the spacing checks above.
+        run_gap = mean_gap(spacing)
+        if run_gap > burst_always_fast_ms:
+            beat_ms = effective_beat_ms(
+                _beat_length_at(objs[run[0]][0], diff.timing_points), min_notated_bpm) / rate
+            if beat_ms > 0 and run_gap > beat_ms * burst_beat_fraction_max:
+                continue
         if burst_min <= length <= burst_max:
             bursts.append(length)
         elif length >= stream_min:
@@ -802,6 +908,29 @@ def wait_if_paused(pause_event, cancel_event):
         _time.sleep(0.1)
 
 
+# Threads used to overlap per-file reads during a scan. Deliberately NOT tied
+# to os.cpu_count(): these threads spend essentially all their time blocked in
+# open()/read() with the GIL released, so the pool's job is hiding I/O
+# LATENCY, not using cores, and core count says nothing about how many reads a
+# storage stack will service at once. Tying it to CPUs was the original
+# mistake - it capped a 12-core machine at 8 concurrent reads.
+#
+# Measured on a real osu!stable library (59,129 difficulties on a 7200rpm
+# SATA HDD, Defender real-time scanning on), 4 cold 1000-diff slices per
+# setting, alternating order so disk region and warm-up can't favour either:
+#
+#     8 workers (the old cap):  50, 51, 40, 43 diffs/sec  (median 46.6)
+#    64 workers:                64, 62, 70, 70 diffs/sec  (median 66.7)
+#
+# Every 64-run beat every 8-run - a 1.43x speedup with no overlap between
+# the two sets, taking that library from 21.1 to 14.8 minutes. 16 and 32 sat
+# inside 8's noise band and 96 was erratic, so 64 is where the evidence
+# actually is, not a round number picked for looking bold.
+#
+# ThreadPoolExecutor spawns threads lazily, so a small library never creates
+# more threads than it has files.
+SCAN_READ_WORKERS = 64
+
 _OSU_MAGIC = b"osu file format"
 
 
@@ -842,6 +971,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
     """
     import zipfile
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     def log(msg):
         if log_cb:
@@ -949,29 +1079,64 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
             f"(this is where a lazer files/ folder spends most of its time)...")
     t_peek_start = time.time()
     matched = 0
-    for full in peek_candidates:
-        check_cancel()
+
+    def _peek(full):
+        """
+        Read-and-parse one blob store candidate. Returns (diff, error) with
+        diff None for anything that isn't a beatmap - the magic-header check
+        rejects the great majority (audio, images, skin assets) after 24
+        bytes, without reading the rest.
+        """
         try:
             with open(full, "rb") as f:
                 head = f.read(24)
-            if head.startswith(_OSU_MAGIC):
-                with open(full, "rb") as f:
-                    raw = f.read()
-                diff = parse_osu_bytes(raw, display_name=os.path.basename(full), path=full)
-                if not is_junk_diff(diff):
+            if not head.startswith(_OSU_MAGIC):
+                return None, None
+            with open(full, "rb") as f:
+                raw = f.read()
+            return parse_osu_bytes(raw, display_name=os.path.basename(full), path=full), None
+        except Exception as exc:
+            return None, str(exc)
+
+    # Same reasoning as the thread pool in scan_stable_db, and the same shape
+    # - see the long comment there. This loop is the single slowest phase of
+    # any lazer scan (a 180k-file store is ~180k opens), and it is pure I/O
+    # wait: measured at 23 files/sec serially on a mechanical drive, i.e.
+    # over two hours, with the CPU essentially idle the whole time. The
+    # stable path got this treatment on the assumption lazer was already
+    # covered by the realm-reader helper - but the helper is optional (it
+    # needs a .NET build), and without it every lazer user lands here.
+    #
+    # Bounded windows rather than one pool.map() over all 180k so cancel and
+    # pause are still honored promptly, and so results stay in walk order.
+    # emit()/results/errors stay on the calling thread: on_parsed runs
+    # classification and mutates caller-owned state, and it is CPU-bound
+    # anyway, so there is nothing to win by moving it and a data race to lose.
+    peek_workers = SCAN_READ_WORKERS
+    peek_window = peek_workers * 4
+    peek_pool = ThreadPoolExecutor(max_workers=peek_workers)
+    try:
+        for start in range(0, len(peek_candidates), peek_window):
+            check_cancel()
+            batch = peek_candidates[start:start + peek_window]
+            for full, (diff, err) in zip(batch, peek_pool.map(_peek, batch)):
+                check_cancel()
+                if err is not None:
+                    errors.append((full, err))
+                elif diff is not None and not is_junk_diff(diff):
                     results.append(emit(diff))
                     matched += 1
-        except Exception as e:
-            errors.append((full, str(e)))
-        done += 1
-        if progress_cb and done % 200 == 0:
-            progress_cb(done, total)
-        if log_cb and done % 20000 == 0:
-            checked = done - len(osu_paths) - len(osz_paths)
-            elapsed = time.time() - t_peek_start
-            rate = checked / elapsed if elapsed > 0 else 0
-            log(f"  ... {checked}/{len(peek_candidates)} checked, "
-                f"{matched} beatmap files found so far ({rate:.0f} files/sec)")
+                done += 1
+                if progress_cb and done % 200 == 0:
+                    progress_cb(done, total)
+                if log_cb and done % 20000 == 0:
+                    checked = done - len(osu_paths) - len(osz_paths)
+                    elapsed = time.time() - t_peek_start
+                    rate = checked / elapsed if elapsed > 0 else 0
+                    log(f"  ... {checked}/{len(peek_candidates)} checked, "
+                        f"{matched} beatmap files found so far ({rate:.0f} files/sec)")
+    finally:
+        peek_pool.shutdown(wait=False)
 
     if progress_cb:
         progress_cb(total, total)
@@ -1278,6 +1443,11 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     errors = []
     missing = 0
 
+    def check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
+        wait_if_paused(pause_event, cancel_event)
+
     def _read(e):
         full = os.path.join(songs_dir, e["folder"], e["filename"])
         try:
@@ -1300,18 +1470,22 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     # Submitted in bounded windows rather than one big pool.map() over the
     # whole library so cancel actually stops promptly (map() would otherwise
     # queue every remaining file's read immediately).
-    workers = min(8, (os.cpu_count() or 4) * 2)
+    workers = SCAN_READ_WORKERS
     window = workers * 4
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         i = 0
         for start in range(0, len(entries), window):
-            if cancel_event is not None and cancel_event.is_set():
-                raise ScanCancelled()
-            wait_if_paused(pause_event, cancel_event)
-
+            check_cancel()
             batch = entries[start:start + window]
             for e, (diff, err) in zip(batch, pool.map(_read, batch)):
+                # Per item, not just per window. The window is 4x the worker
+                # count, so raising SCAN_READ_WORKERS to 64 stretched it from
+                # 32 files to 256 - about four seconds of "Cancel does
+                # nothing" at measured throughput, where it used to be under
+                # one. Checking here costs one predictable call per file and
+                # keeps cancel/pause as responsive as they were before.
+                check_cancel()
                 if err == "missing":
                     missing += 1
                 elif err is not None:
@@ -1336,7 +1510,10 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
                 if log_cb and i % 5000 == 0:
                     log(f"  ... {i}/{len(entries)} parsed")
     finally:
-        pool.shutdown(wait=True)
+        # wait=False so a cancel unwinds now rather than after every in-flight
+        # read completes. Workers only read and parse; results/errors are
+        # appended on this thread alone, so abandoning them races nothing.
+        pool.shutdown(wait=False)
 
     if progress_cb:
         progress_cb(len(entries), len(entries))
@@ -1642,6 +1819,13 @@ def write_collection_db(path, collections, db_version=20211103):
 
 CATEGORIES = ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]
 
+# The two categories that are both "a jump map", differing only in whether
+# bursts show up alongside the jumps. combine_jumps writes an extra
+# collection holding both, for players who just want every jump map in one
+# place - see build_output_collections().
+JUMP_CATEGORIES = ("Jumps with bursts", "Jumps (no bursts)")
+COMBINED_JUMPS_LABEL = "Jumps"
+
 # Which osu! online statuses count as "ranked" for filtering and splitting.
 #
 # Ranked and Approved are the two that award pp. Loved and Qualified do NOT:
@@ -1668,7 +1852,7 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
                  burst_note_total=0, total_note_count=0, jump_pct=0.0,
                  stream_note_total=0, stream_run_count=0, max_stream_len=0,
                  burst_promote_stream_len=12, burst_run_count=0, counted_gaps=0,
-                 burst_recurrence_min=2):
+                 burst_recurrence_min=1):
     """
     The one place the dominant-pattern rules live.
 
@@ -1704,27 +1888,38 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     existed has no way to recover it, so it keeps the original comparison
     rather than silently mixing bases.
 
-    has_bursts, unlike has_streams, has never required clearing any bar -
-    pure presence, len(bursts) > 0. That's the same shape of bug the
-    has_streams coverage floor was added to fix, and measured on a real
-    ~9,300-map library it's not rare: 176 "Jumps with bursts" results came
-    from a SINGLE burst run (median coverage 1.13% of the map, e.g. one
-    3-note cluster in a 1493-note, 96.7%-jump difficulty) - visually
-    confirmed on several real examples via osu_visualizer_preview.py to be
-    plain jump maps at every sampled moment, not maps with a real "bursts"
-    character. burst_recurrence_min=2 kills exactly that population: a
-    single incidental cluster isn't recurring content.
+    has_bursts, unlike has_streams, is pure presence - len(bursts) > 0, no
+    coverage bar to clear. burst_recurrence_min briefly raised that to 2 runs,
+    on the reasoning that 176 "Jumps with bursts" results in a ~9,300-map
+    library came from a SINGLE burst run at a median 1.13% coverage, and
+    sampled examples looked like plain jump maps. It is back to 1, because
+    that reasoning was fixing the wrong layer.
 
-    Deliberately NOT a coverage-percentage floor like has_streams got.
-    Burst coverage vs. run count doesn't have the same clean bimodal split
-    stream coverage did (2.5-12.9% vs 55-96% for real/fake NiNo streams) -
-    it's a smooth continuum (median coverage rises roughly with run count,
-    from 1.13% at 1 run to 16.53% at 10+ runs, no natural gap anywhere in
-    between), because a burst is capped at 9 notes by definition and can
-    never dominate a map's note count the way one long stream run can. So
-    only the unambiguous run_count==1 case is fixed here; where exactly the
-    line should sit for run_count 2-9 is a real open question, deliberately
-    left alone rather than picking an unmeasured number.
+    Those single runs were mostly not bursts at all - they were the two
+    detection bugs since fixed: 1/2-snap tapping in high-BPM maps admitted by
+    an absolute-ms speed test with no notion of snap (see the rhythm gate in
+    classify_diff), and stacked triples wrongly rejected, which suppressed the
+    genuine runs that would have kept the honest maps above a count of 2. A
+    recurrence floor was compensating for a noisy detector by discarding its
+    output wholesale, which also discards the true positives.
+
+    With detection fixed, the user's hand-sorted set settles the question
+    directly: of thirteen maps they filed as "jumps with bursts" that the
+    classifier had called "jumps with no bursts", five contain exactly ONE
+    burst run - a single 1/4 triple in a 120-280 note map, ~1-2% coverage -
+    and they are labelled "Jumps with bursts" all the same. One real burst is
+    enough; the category means "this jump map has bursts in it", not "bursts
+    are a recurring theme".
+
+    The parameter stays rather than being deleted so the behaviour is still
+    reachable, and because where the line should sit for run counts 2-9 was
+    always an open question - it just isn't one worth answering with a floor
+    that costs real maps. Burst coverage has no clean bimodal split to key on
+    the way stream coverage did (2.5-12.9% vs 55-96% for real/fake NiNo
+    streams): median coverage rises smoothly with run count, 1.13% at 1 run to
+    16.53% at 10+, no natural gap anywhere - a burst is capped at 9 notes by
+    definition and can never dominate a note count the way one long stream
+    run can.
 
     burst_run_count == 0 is treated as "not supplied" (skip this gate, old
     presence-only behaviour) rather than "genuinely zero runs" - the two
@@ -1836,7 +2031,7 @@ def derive_collections(diffs):
 
 
 def build_output_collections(groups, include_categories=None, ranked_mode="all_together",
-                              min_star=None, max_star=None, log_cb=None):
+                              min_star=None, max_star=None, combine_jumps=False, log_cb=None):
     """
     Applies category selection, star rating range, and ranked-status
     handling on top of the dominant-pattern groups from derive_collections().
@@ -1856,6 +2051,16 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
       - "unranked_only": drop any diff that IS ranked/approved/qualified/loved
       - "split"         : each category becomes two, e.g. "Streams - Ranked" /
                           "Streams - Unranked"
+
+    combine_jumps adds an EXTRA "Jumps" collection holding every diff from
+    both jump categories, without removing either of them - so a jumps+bursts
+    map lands in "Jumps with bursts" and in "Jumps". It changes only how the
+    output is grouped; no diff is reclassified, and report.csv still records
+    the specific category. It is applied after category and star filtering
+    (so unchecking a jump category keeps those maps out of the combined one
+    too - unchecking means "I don't want these maps") and before ranked
+    handling (so "split" splits the combined collection the same way it
+    splits every other one).
 
     Ranked status is only known when the diffs came from the osu!lazer realm
     fast path - anything else has ranked_status=None, which is treated as
@@ -1892,6 +2097,22 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
             return True
 
         groups = {label: [d for d in members if in_range(d)] for label, members in groups.items()}
+
+    if combine_jumps:
+        combined = [d for label in JUMP_CATEGORIES for d in groups.get(label, [])]
+        if combined:
+            # Rebuilt in order rather than appended so the combined collection
+            # sits with the jump categories it summarises instead of after
+            # Misc - collection.db preserves insertion order and osu! shows
+            # them in that order.
+            rebuilt = {}
+            for label, members in groups.items():
+                rebuilt[label] = members
+                if label == JUMP_CATEGORIES[-1]:
+                    rebuilt[COMBINED_JUMPS_LABEL] = combined
+            if COMBINED_JUMPS_LABEL not in rebuilt:
+                rebuilt[COMBINED_JUMPS_LABEL] = combined
+            groups = rebuilt
 
     if ranked_mode == "all_together":
         return groups
@@ -1960,7 +2181,74 @@ DEFAULT_PARAMS = dict(
     # "still readable" spacing ceiling (spaced_diam_ratio) is expected even
     # for a genuine skip - beyond that it's a jump, not a timing artifact.
     cut_max_dist_ratio=4.0,
+    # Rhythm gate. A run has to be a step UP from the map's own pulse to be a
+    # burst, not just fast in the abstract: at most this fraction of a beat
+    # per note. 0.4 admits 1/4 (0.25) and 1/3 (0.33) and rejects 1/2 (0.5).
+    # Without it, a 240 BPM map's ordinary 1/2 tapping (125ms) cleared the
+    # 140ms absolute cap and every jump map at that tempo grew phantom bursts.
+    burst_beat_fraction_max=0.4,
+    # ...but only for runs slower than this. At 110ms a note (a ~136 BPM
+    # stream) a run is burst tapping regardless of what snap the file calls
+    # it, which is what keeps doubled-BPM notation working - see the rhythm
+    # gate in classify_diff().
+    burst_always_fast_ms=110.0,
+    # Notated tempos below this are treated as halved notation and folded
+    # back up before the beat fraction is taken. See effective_beat_ms().
+    min_notated_bpm=125.0,
 )
+
+# Named starting points for the GUI's "Detection sensitivity" control, so the
+# common case is one click instead of nineteen numbers.
+#
+# Only four knobs move. They are the ones that actually answer "how much gets
+# flagged": how fast a run has to be, how much of a rhythm step-up a burst
+# needs, and how much of a map streams/jumps must cover to own it. Everything
+# else describes what a pattern IS rather than how eager we are to find one,
+# and moving those would change the definitions rather than the sensitivity.
+#
+# "Balanced" is exactly DEFAULT_PARAMS - the measured, evidence-backed
+# defaults. The other two are deliberate over- and under-shoots for people who
+# want a different trade, NOT rival claims about what is correct. Anything
+# these set is still individually editable underneath.
+SENSITIVITY_PRESETS = {
+    "Balanced": {},
+    "Stricter": dict(
+        max_gap_ms=120.0,               # ~125 BPM stream before it counts as fast
+        burst_beat_fraction_max=0.30,   # 1/4 only - drops 1/3 snap
+        stream_pct_threshold=25.0,      # streams must cover a quarter of the map
+        jump_pct_threshold=20.0,
+    ),
+    "Looser": dict(
+        max_gap_ms=160.0,               # ~94 BPM stream still counts as fast
+        burst_beat_fraction_max=0.45,   # allows sloppier-than-1/3 snapping
+        stream_pct_threshold=10.0,
+        jump_pct_threshold=12.0,
+    ),
+}
+DEFAULT_SENSITIVITY = "Balanced"
+
+
+def params_for_sensitivity(name):
+    """Full param dict for a named preset. Unknown names fall back to defaults."""
+    params = dict(DEFAULT_PARAMS)
+    params.update(SENSITIVITY_PRESETS.get(name, {}))
+    return params
+
+
+def sensitivity_of(params):
+    """
+    Which preset `params` corresponds to, or None if it matches none of them
+    (i.e. the user has hand-edited something). Lets the GUI show "Custom"
+    honestly rather than keeping a preset selected that no longer describes
+    the settings.
+    """
+    for name in SENSITIVITY_PRESETS:
+        if all(abs(float(params[k]) - float(v)) < 1e-9
+               for k, v in params_for_sensitivity(name).items()
+               if k in params and isinstance(v, (int, float))):
+            return name
+    return None
+
 
 # Params that must stay integers when parsed from a string (CLI/GUI).
 INT_PARAMS = ("burst_min", "burst_max", "stream_min", "jump_min_transitions")
@@ -1969,7 +2257,8 @@ INT_PARAMS = ("burst_min", "burst_max", "stream_min", "jump_min_transitions")
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                   params=None, progress_cb=None, log_cb=None, cancel_event=None,
                   include_categories=None, ranked_mode="all_together",
-                  min_star=None, max_star=None, pause_event=None, mods=None):
+                  min_star=None, max_star=None, combine_jumps=False,
+                  pause_event=None, mods=None):
     """
     Core pipeline used by both the CLI and the GUI:
       1. scan_folder() over .osu/.osz files
@@ -2156,7 +2445,8 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         try:
             output_groups = build_output_collections(groups, include_categories=include_categories,
                                                        ranked_mode=ranked_mode, min_star=min_star,
-                                                       max_star=max_star, log_cb=log)
+                                                       max_star=max_star, combine_jumps=combine_jumps,
+                                                       log_cb=log)
             collections = {label: [d.version_hash for d in members] for label, members in output_groups.items() if members}
             if not collections:
                 log("WARNING: no maps matched your combined filters (categories/ranked/star range) - "
@@ -2172,7 +2462,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
 
 def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=None, ranked_mode="all_together",
-                         min_star=None, max_star=None):
+                         min_star=None, max_star=None, combine_jumps=False):
     """
     Rebuilds a collection.db from a previously-generated report.csv, without
     rescanning the library. Useful if a run produced the CSV successfully
@@ -2295,6 +2585,22 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
 
         groups = {label: [e for e in entries if in_range(e)] for label, entries in groups.items()}
 
+    # Same placement and reasoning as build_output_collections()'s copy: after
+    # category/star filtering, before ranked handling. This path can't share
+    # that function because it works on (md5, status, stars) tuples read back
+    # from the CSV rather than DiffInfo objects.
+    if combine_jumps:
+        combined = [e for label in JUMP_CATEGORIES for e in groups.get(label, [])]
+        if combined:
+            rebuilt = {}
+            for label, entries in groups.items():
+                rebuilt[label] = entries
+                if label == JUMP_CATEGORIES[-1]:
+                    rebuilt[COMBINED_JUMPS_LABEL] = combined
+            if COMBINED_JUMPS_LABEL not in rebuilt:
+                rebuilt[COMBINED_JUMPS_LABEL] = combined
+            groups = rebuilt
+
     if ranked_mode != "all_together":
         any_known = any(status is not None for entries in groups.values() for _, status, _ in entries)
         if not any_known:
@@ -2382,6 +2688,22 @@ def main():
     ap.add_argument("--cut-max-dist-ratio", type=float, default=DEFAULT_PARAMS["cut_max_dist_ratio"],
                      help="Largest cut-transition distance (as a multiple of hit-circle diameter) still "
                           "treated as a skipped note rather than a real jump between two separate runs")
+    ap.add_argument("--burst-beat-fraction-max", type=float, default=DEFAULT_PARAMS["burst_beat_fraction_max"],
+                     help="Slowest snap that still counts as burst/stream tapping, as a fraction of a beat "
+                          "per note. 0.4 admits 1/4 and 1/3 snap and rejects 1/2, which stops a high-BPM "
+                          "jump map's ordinary 1/2 tapping from reading as bursts")
+    ap.add_argument("--burst-always-fast-ms", type=float, default=DEFAULT_PARAMS["burst_always_fast_ms"],
+                     help="Runs at or under this ms per note skip the beat-fraction check entirely - they "
+                          "are fast enough to be burst tapping whatever snap the file calls them. This is "
+                          "what keeps doubled-BPM notation working")
+    ap.add_argument("--min-notated-bpm", type=float, default=DEFAULT_PARAMS["min_notated_bpm"],
+                     help="Tempos notated below this are treated as halved-BPM authoring and doubled back "
+                          "up before the beat-fraction check, so a 118 BPM file that plays at 236 is not "
+                          "credited with 1/4 bursts it does not have")
+    ap.add_argument("--combine-jumps", action="store_true",
+                     help="Also write a single \"Jumps\" collection containing every jump map, on top of "
+                          "the separate \"Jumps with bursts\" and \"Jumps (no bursts)\" ones. Nothing is "
+                          "reclassified - a jumps+bursts map simply appears in both.")
     ap.add_argument("--mods", default=None,
                      help="Classify as if these mods were active, e.g. --mods DT or --mods HR,DT. "
                           "NM (no mods) is the baseline and the default. Only DT/NC, HT/DC, HR and EZ "
@@ -2408,7 +2730,8 @@ def main():
     if args.from_csv:
         collection_from_csv(args.from_csv, args.output, log_cb=print,
                              include_categories=include_categories, ranked_mode=args.ranked_mode,
-                             min_star=args.min_star, max_star=args.max_star)
+                             min_star=args.min_star, max_star=args.max_star,
+                             combine_jumps=args.combine_jumps)
         return
 
     if not args.songs_folder:
@@ -2437,6 +2760,7 @@ def main():
         ranked_mode=args.ranked_mode,
         min_star=args.min_star,
         max_star=args.max_star,
+        combine_jumps=args.combine_jumps,
         mods=mods,
     )
 

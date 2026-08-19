@@ -102,17 +102,112 @@ def test_two_notes_is_not_a_burst():
     assert not d.has_bursts
 
 
-def test_a_pure_stack_is_not_a_burst():
+def test_a_stacked_quarter_triple_is_a_burst():
     # Same shape as test_three_notes_is_a_burst, but every note sits on the
-    # exact same (x,y) - zero measured distance, not a cluster a player
-    # would ever call a burst. Real library check: 33.5% of ALL burst runs
-    # (665,952 of 1,986,316) were exactly this before the fix - confirmed
-    # visually on "ESSE CARA! [INSANE!]" (see AGENTS.md).
+    # exact same (x,y). This is the single most common way a 1/4 triple is
+    # written in 2014-2017 Insanes, and osu!'s stack leniency renders it as a
+    # small staircase, so it plays as a burst and players call it one.
+    #
+    # A previous fix rejected zero-distance runs outright, on the strength of
+    # one diff ("ESSE CARA! [INSANE!]") and a large population statistic (33.5%
+    # of all burst runs). The statistic was real but not evidence of a bug -
+    # a third of bursts being stacked triples is what you would expect, given
+    # that is the normal shape. Thirteen hand-sorted maps supplied by the user
+    # as "jumps with bursts that got called jumps with no bursts" were all
+    # this exact pattern - stacked triples at 78-94ms in 160-200 BPM maps -
+    # and the blanket rejection was why every one of them missed. It also only
+    # half-worked on its own example: [INSANE!] came out clean, but [HARD!]
+    # and [SPECIAL!] in the same mapset still reported 4 and 2 false bursts,
+    # because those runs carried enough movement to dodge a spacing test.
+    #
+    # What that rejection was reaching for is now handled directly by the
+    # rhythm gate below: a stack tapped at the map's ordinary 1/2 pulse is not
+    # a burst, and that is a statement about its RHYTHM, not its spacing.
     filler = [f"100,100,{2000 + i * 500},1,0" for i in range(7)]
     d = classify(circles(3, dx=0) + filler)
     assert d.total_note_count == 10
+    assert d.has_bursts
+    assert d.burst_count == 1
+
+
+# --- rhythm gate: a burst is a step up from the map's own pulse -------------
+
+def test_half_snap_tapping_in_a_fast_map_is_not_a_burst():
+    # 240 BPM (250ms beat), notes 125ms apart: ordinary 1/2 tapping, and the
+    # bread and butter of every high-BPM jump map. It clears the 140ms
+    # absolute cap, so before the rhythm gate existed every such map grew
+    # phantom bursts - eleven of the user's hand-sorted "no bursts" maps
+    # were exactly this, all at 120-135ms in 223-250 BPM maps.
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    d = build(circles(3, step=125, dx=8) + filler, bl=250.0)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
     assert not d.has_bursts
     assert d.burst_count == 0
+
+
+def test_quarter_snap_at_the_same_speed_is_a_burst():
+    # The control for the test above: near-identical 120ms tapping, but the
+    # map is 125 BPM (480ms beat) so those notes are a 1/4 - a genuine step up
+    # from the map's pulse. Same milliseconds, opposite verdict; the rhythm is
+    # what changed, which is the whole point of the gate.
+    #
+    # 125 BPM is deliberately the slowest tempo this can be demonstrated at:
+    # one notch below it, min_notated_bpm reads the file as halved notation
+    # and folds the beat, at which point the same notes are a 1/2 again. That
+    # ambiguity is real and not resolvable from the file - a 120 BPM map
+    # tapping 1/4 and a 240 BPM map tapping 1/2 are the same timestamps - and
+    # the fold resolves it toward the far more common authoring choice. See
+    # test_halved_bpm_notation_does_not_manufacture_bursts.
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    d = build(circles(3, step=120, dx=8) + filler, bl=480.0)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert d.has_bursts
+
+
+def test_halved_bpm_notation_does_not_manufacture_bursts():
+    # A mapper may notate a 236 BPM song as 118 (508ms beat). What the file
+    # calls a 1/4 (127ms) is the 1/2 a player actually feels, so it is not a
+    # burst - but a naive snap test would credit it as one. effective_beat_ms
+    # folds the notation back out first. Real example: "Chug Jug With You
+    # [Cote's Zero Build Match...]", notated 118 BPM, no bursts in it.
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    d = build(circles(3, step=127, dx=8) + filler, bl=508.47)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert not d.has_bursts
+
+
+def test_doubled_bpm_notation_still_finds_bursts():
+    # The other direction, and the reason the gate is scoped rather than
+    # absolute: a 200 BPM song notated as 400 (150ms beat) writes its 1/4 at
+    # 75ms, which the file calls a 1/2. burst_always_fast_ms lets it through
+    # on speed alone - at 75ms a note nothing else needs asking.
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    d = build(circles(3, step=75, dx=8) + filler, bl=150.0)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert d.has_bursts
+
+
+def test_corrupt_timing_does_not_suppress_every_run():
+    # A subnormal beatLength would make `beat * burst_beat_fraction_max`
+    # smaller than any real gap, silently rejecting every run in the map.
+    # effective_beat_ms reports "no usable tempo" (0.0) below
+    # MIN_PLAUSIBLE_BEAT_MS instead, and the gate stands down rather than
+    # measuring against a number that isn't a tempo.
+    assert cm.effective_beat_ms(1e-320) == 0.0
+    assert cm.effective_beat_ms(float("inf")) == 0.0
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    d = build(circles(3, step=120, dx=8) + filler, bl=1e-320)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert d.has_bursts
+
+
+def test_the_fold_only_ever_shortens_a_beat():
+    # Halving a genuinely fast tempo would turn a real 250 BPM map's ordinary
+    # 1/2 (120ms) into a "1/4 burst" - the exact bug the fold exists to stop.
+    assert cm.effective_beat_ms(240.0) == 240.0     # 250 BPM, left alone
+    assert cm.effective_beat_ms(150.0) == 150.0     # 400 BPM, left alone
+    assert cm.effective_beat_ms(508.47) == 508.47 / 2   # 118 BPM -> 236
+    assert cm.effective_beat_ms(1000.0) == 250.0        # 60 BPM -> 240, folded twice
 
 
 def test_sub_floor_diffs_are_not_classified_at_all():
@@ -196,6 +291,63 @@ def test_junk_diffs_never_reach_scan_results():
         assert not errors
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_lazer_blob_store_scan_finds_beatmaps_among_other_files():
+    # scan_folder's extensionless "peek" path - how a lazer files/ store is
+    # read when realm-reader isn't built. It reads through a thread pool in
+    # bounded windows, and nothing covered it before: the test above only
+    # exercises plain .osu files.
+    #
+    # Deliberately more files than one window (SCAN_READ_WORKERS * 4) so the
+    # batching actually loops, and deliberately mixed with non-beatmap blobs
+    # (a lazer store is mostly audio and images) so the magic-header check is
+    # doing real work rather than passing everything through.
+    import shutil
+    import tempfile
+
+    n_maps = cm.SCAN_READ_WORKERS * 4 + 17   # crosses a window boundary
+    tmpdir = tempfile.mkdtemp(prefix="cm_blob_test_")
+    try:
+        real_text = HEADER.format(cs=4, bl=300, extra="") + "\n".join(circles(12))
+        for i in range(n_maps):
+            # Hash-style names, no extension - exactly how lazer stores them.
+            with open(os.path.join(tmpdir, f"{i:064x}"), "w", encoding="utf-8") as f:
+                f.write(real_text)
+        for i in range(50):
+            with open(os.path.join(tmpdir, f"n{i:063x}"), "wb") as f:
+                f.write(b"ID3" + bytes(210))   # not a beatmap
+        # One that IS a beatmap but is junk-sized: must be dropped by the same
+        # is_junk_diff gate the serial version applied.
+        with open(os.path.join(tmpdir, "f" * 64), "w", encoding="utf-8") as f:
+            f.write(HEADER.format(cs=4, bl=300, extra="") + "\n".join(circles(9)))
+
+        seen = []
+        results, errors = cm.scan_folder(tmpdir, on_parsed=seen.append)
+        assert not errors, errors
+        assert len(results) == n_maps, f"expected {n_maps} beatmaps, got {len(results)}"
+        # Every blob that matched must have been parsed in full, not just
+        # header-sniffed - a threading bug that dropped or truncated reads
+        # would show up here rather than in the count.
+        assert all(len(r.objs) == 12 for r in results)
+        # on_parsed is how run_pipeline classifies inline, and it must fire
+        # once per kept diff from the calling thread.
+        assert len(seen) == n_maps
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_scan_pools_are_not_sized_by_cpu_count():
+    # These threads sit blocked in read() with the GIL released - the pool
+    # hides I/O latency, it does not use cores. The old min(8, cpu*2) capped
+    # a 12-core machine at 8 concurrent reads and cost ~1.4x on a real
+    # library (see AGENTS.md, "Scan throughput").
+    assert cm.SCAN_READ_WORKERS == 64
+    # The point isn't the literal 64 so much as that it is a fixed I/O
+    # concurrency figure: on this repo's own dev machine a cpu_count-derived
+    # value would be 8, so if these ever coincide again the reasoning has
+    # been lost.
+    assert cm.SCAN_READ_WORKERS > (os.cpu_count() or 4) * 2 or (os.cpu_count() or 4) * 2 > 64
 
 
 # --- cut streams -----------------------------------------------------------
@@ -477,6 +629,178 @@ def test_split_puts_loved_on_the_unranked_side():
     assert [d.ranked_status for d in out["Streams - Unranked"]] == ["loved"]
 
 
+# --- sensitivity presets ---------------------------------------------------
+
+def test_balanced_preset_is_exactly_the_defaults():
+    # The GUI's default selection must not quietly change any threshold - if
+    # Balanced ever diverges from DEFAULT_PARAMS, opening the GUI and pressing
+    # Run would silently classify differently from the CLI's defaults.
+    assert cm.params_for_sensitivity("Balanced") == cm.DEFAULT_PARAMS
+
+
+def test_presets_only_move_the_sensitivity_knobs():
+    # The other settings describe what a pattern IS, not how eager we are to
+    # find one. A preset that moved those would be changing the definitions.
+    expected = {"max_gap_ms", "burst_beat_fraction_max",
+                "stream_pct_threshold", "jump_pct_threshold"}
+    for name, overrides in cm.SENSITIVITY_PRESETS.items():
+        assert set(overrides) <= expected, f"{name} moves something it shouldn't: {set(overrides) - expected}"
+
+
+def test_presets_are_complete_and_ordered_as_advertised():
+    # Every preset must produce a full param set the classifier can take...
+    for name in cm.SENSITIVITY_PRESETS:
+        assert set(cm.params_for_sensitivity(name)) == set(cm.DEFAULT_PARAMS)
+    # ...and "stricter" must actually be stricter in every direction it moves,
+    # otherwise the labels are lying to the user.
+    strict = cm.params_for_sensitivity("Stricter")
+    loose = cm.params_for_sensitivity("Looser")
+    base = cm.DEFAULT_PARAMS
+    for key in ("max_gap_ms", "burst_beat_fraction_max"):
+        assert strict[key] < base[key] < loose[key], key   # lower = harder to qualify
+    for key in ("stream_pct_threshold", "jump_pct_threshold"):
+        assert strict[key] > base[key] > loose[key], key   # higher = must cover more
+
+
+def test_sensitivity_of_recognises_presets_and_hand_edits():
+    # Drives the GUI's "Custom" indicator: a hand-edited threshold must stop
+    # a preset radio from claiming to describe the settings.
+    for name in cm.SENSITIVITY_PRESETS:
+        assert cm.sensitivity_of(cm.params_for_sensitivity(name)) == name
+    edited = dict(cm.DEFAULT_PARAMS)
+    edited["max_gap_ms"] = 133.0
+    assert cm.sensitivity_of(edited) is None
+
+
+def test_unknown_preset_name_falls_back_to_defaults():
+    assert cm.params_for_sensitivity("nonsense") == cm.DEFAULT_PARAMS
+
+
+def test_every_param_is_editable_in_the_gui():
+    """
+    Adding a param to DEFAULT_PARAMS without adding it to gui.py's `sections`
+    list leaves it silently uneditable in the GUI - the run path would read
+    self.param_vars, not find it, and fall back to the default with no error.
+    Builds the real window (never shown) and compares the two sets.
+
+    Skipped rather than failed where there is no display, so this stays safe
+    to run in headless CI.
+    """
+    try:
+        import tkinter
+        import gui
+    except ImportError:
+        print("      (skipped - tkinter not available)")
+        return
+    try:
+        app = gui.ClassifierGUI()
+    except tkinter.TclError:
+        print("      (skipped - no display)")
+        return
+    try:
+        app.withdraw()
+        app.update_idletasks()
+        missing = set(cm.DEFAULT_PARAMS) - set(app.param_vars)
+        extra = set(app.param_vars) - set(cm.DEFAULT_PARAMS)
+        assert not missing, f"params with no GUI field: {sorted(missing)}"
+        assert not extra, f"GUI fields with no such param: {sorted(extra)}"
+
+        # The disclosure must actually toggle, and a preset must reach the
+        # fields the run path reads - otherwise picking one does nothing.
+        assert app.adv_open is False, "advanced panel should start collapsed"
+        app._toggle_advanced()
+        assert app.adv_open is True
+        app._toggle_advanced()
+        assert app.adv_open is False
+
+        app.sensitivity_var.set("Stricter")
+        app._apply_sensitivity()
+        want = cm.params_for_sensitivity("Stricter")
+        for key, var in app.param_vars.items():
+            assert abs(float(var.get()) - float(want[key])) < 1e-9, key
+
+        # A hand-edit must surface as Custom, and undoing it must clear that.
+        app.param_vars["max_gap_ms"].set("133")
+        app.update_idletasks()
+        assert "Custom" in app.custom_sens_label.cget("text")
+        app._reset_defaults()
+        app.update_idletasks()
+        assert app.custom_sens_label.cget("text") == ""
+        assert app.sensitivity_var.get() == cm.DEFAULT_SENSITIVITY
+    finally:
+        app.destroy()
+
+
+# --- combined "Jumps" collection ------------------------------------------
+
+class _JumpDiff:
+    """Minimal stand-in - build_output_collections only reads these two."""
+    def __init__(self, name, status=None, stars=None):
+        self.name = name
+        self.ranked_status = status
+        self.star_rating = stars
+
+
+def _jump_groups():
+    return {
+        "Streams": [_JumpDiff("s1")],
+        "Jumps with bursts": [_JumpDiff("jb1"), _JumpDiff("jb2")],
+        "Jumps (no bursts)": [_JumpDiff("jn1")],
+        "Misc": [_JumpDiff("m1")],
+    }
+
+
+def test_combine_jumps_is_off_by_default():
+    out = cm.build_output_collections(_jump_groups())
+    assert cm.COMBINED_JUMPS_LABEL not in out
+
+
+def test_combine_jumps_adds_a_collection_without_removing_either():
+    out = cm.build_output_collections(_jump_groups(), combine_jumps=True)
+    # Both originals survive untouched - a jumps+bursts map is in two
+    # collections, which is the point.
+    assert [d.name for d in out["Jumps with bursts"]] == ["jb1", "jb2"]
+    assert [d.name for d in out["Jumps (no bursts)"]] == ["jn1"]
+    assert [d.name for d in out["Jumps"]] == ["jb1", "jb2", "jn1"]
+    # ...and nothing non-jump leaks in.
+    assert [d.name for d in out["Streams"]] == ["s1"]
+
+
+def test_combined_jumps_sits_with_the_categories_it_summarises():
+    # collection.db preserves insertion order and osu! displays them in it,
+    # so "Jumps" belongs next to the jump categories, not after Misc.
+    out = cm.build_output_collections(_jump_groups(), combine_jumps=True)
+    labels = list(out)
+    assert labels.index("Jumps") == labels.index("Jumps (no bursts)") + 1
+    assert labels.index("Jumps") < labels.index("Misc")
+
+
+def test_combined_jumps_respects_category_filtering():
+    # Unchecking a category means "I don't want these maps", so they must not
+    # reappear inside the combined collection by the back door.
+    out = cm.build_output_collections(
+        _jump_groups(), include_categories=["Jumps with bursts"], combine_jumps=True)
+    assert [d.name for d in out["Jumps"]] == ["jb1", "jb2"]
+    assert "Jumps (no bursts)" not in out
+
+
+def test_combined_jumps_is_split_by_ranked_status_like_any_other():
+    groups = {
+        "Jumps with bursts": [_JumpDiff("jb1", "ranked"), _JumpDiff("jb2", "graveyard")],
+        "Jumps (no bursts)": [_JumpDiff("jn1", "ranked")],
+    }
+    out = cm.build_output_collections(groups, ranked_mode="split", combine_jumps=True)
+    assert [d.name for d in out["Jumps - Ranked"]] == ["jb1", "jn1"]
+    assert [d.name for d in out["Jumps - Unranked"]] == ["jb2"]
+
+
+def test_combined_jumps_is_absent_when_there_are_no_jump_maps():
+    groups = {"Streams": [_JumpDiff("s1")], "Misc": [_JumpDiff("m1")],
+              "Jumps with bursts": [], "Jumps (no bursts)": []}
+    out = cm.build_output_collections(groups, combine_jumps=True)
+    assert cm.COMBINED_JUMPS_LABEL not in out
+
+
 def test_streams_win_when_they_cover_the_map():
     # 50 of 100 notes in streams vs 20% jumps - a stream map.
     assert cm.category_of(True, True, True, 10, 100, 20.0, 50) == "Streams"
@@ -529,19 +853,26 @@ def test_burst_vs_jump_coverage_uses_matching_denominators_when_available():
     assert cm.category_of(False, True, True, 30, 100, 30.0) == "Bursts"
 
 
-def test_a_single_incidental_burst_does_not_win_jumps_with_bursts():
-    # One 3-note burst run (burst_run_count=1) buried in an otherwise pure
-    # jump map - visually confirmed on real examples (ai-classification
-    # branch) to read as plain jump maps, not maps with a real "bursts"
-    # character. jump_coverage (80%) trivially beats burst_coverage (a
-    # single run's worth of transitions, ~2%), so without the recurrence
-    # gate this would win "Jumps with bursts" on presence alone.
+def test_one_real_burst_is_enough_for_jumps_with_bursts():
+    # One 3-note burst run in an 80%-jump map is still "Jumps with bursts".
+    # burst_recurrence_min was briefly 2, on the reasoning that a lone run is
+    # incidental - but the user's hand-sorted set says otherwise: five of the
+    # thirteen maps they filed as wrongly-called "jumps with no bursts"
+    # contain exactly one burst run, ~1-2% of the map, and they belong in
+    # "Jumps with bursts" all the same. The population the floor was aimed at
+    # was bad DETECTION (1/2-snap runs and rejected stacked triples), and it
+    # is fixed where it belongs - see category_of's docstring.
     assert cm.category_of(False, True, True, 3, 100, 80.0,
-                           burst_run_count=1, counted_gaps=100) == "Jumps (no bursts)"
-    # Two separate burst runs clears the recurrence floor - back to the
-    # normal coverage comparison.
-    assert cm.category_of(False, True, True, 8, 100, 80.0,
-                           burst_run_count=2, counted_gaps=100) == "Jumps with bursts"
+                           burst_run_count=1, counted_gaps=100) == "Jumps with bursts"
+
+
+def test_the_recurrence_floor_is_still_reachable():
+    # Kept as a parameter even though the default is back to 1, so the
+    # stricter reading stays available without re-deriving it.
+    assert cm.category_of(False, True, True, 3, 100, 80.0, burst_run_count=1,
+                           counted_gaps=100, burst_recurrence_min=2) == "Jumps (no bursts)"
+    assert cm.category_of(False, True, True, 8, 100, 80.0, burst_run_count=2,
+                           counted_gaps=100, burst_recurrence_min=2) == "Jumps with bursts"
 
 
 def test_burst_run_count_zero_means_not_supplied_not_genuinely_zero():

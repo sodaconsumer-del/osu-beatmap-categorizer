@@ -75,6 +75,40 @@ recover.
 Every fallback is silent-by-design but **logged**. If you add a new failure
 mode, log it — see "silent phases" below for why.
 
+### Scan throughput: it's I/O latency, and the pool size is not about CPUs
+
+Every scan path is dominated by per-file `open()`/`read()` latency, not by
+parsing. On a real osu!stable library (59,129 difficulties, 7200rpm SATA HDD,
+Defender real-time scanning on) a *serial* read managed 22 diffs/sec — about
+45ms per file, roughly 3x what a seek alone accounts for, the rest being
+per-open overhead. Parsing is nowhere near that.
+
+So both read loops overlap their I/O with a `ThreadPoolExecutor`
+(`SCAN_READ_WORKERS`, 64). Two things worth knowing before touching it:
+
+- **The pool size is deliberately not derived from `os.cpu_count()`.** These
+  threads sit blocked in `read()` with the GIL released; the pool hides
+  latency, it doesn't use cores, and core count says nothing about how many
+  reads the storage stack will service at once. The original
+  `min(8, cpu_count * 2)` capped a 12-core machine at 8 concurrent reads.
+  Measured, 4 cold 1000-diff slices per setting with the order alternated:
+  8 workers gave 50/51/40/43 diffs/sec, 64 gave 64/62/70/70 — every 64-run
+  beat every 8-run, 1.43x, taking that library from 21.1 to 14.8 minutes.
+  16 and 32 sat inside 8's noise band; 96 was erratic.
+- **`scan_folder`'s lazer `files/` peek loop was serial until recently**, on
+  the assumption lazer was covered by the `realm-reader` fast path. That
+  helper is optional — it needs a .NET build — so a lazer user without it
+  lands in the folder walk, where a 180k-blob store took over two hours at
+  23 files/sec. It uses the same pool now. The blob store still scales far
+  worse than stable does (it is one flat hash-named heap, so every read is a
+  cold seek, where stable's diffs at least cluster by mapset folder), so if
+  someone reports a slow lazer scan the real answer is still **build
+  realm-reader** — the parallel walk is the fallback, not the fix.
+
+Cancel/pause are checked per *file* inside those loops, not just per window:
+the window is 4x the worker count, so at 64 workers a per-window-only check
+would leave Cancel doing nothing for ~4 seconds.
+
 ## Gotchas that cost real time
 
 **`storage.ini` redirects lazer's data folder.** When a user moves their lazer
@@ -146,7 +180,10 @@ The vocabulary, for anyone new to osu! pattern terms or this codebase:
   decided by SPACING. This split matters: a fast, evenly-spaced sequence of
   wide jumps is still a "run" by the timing test, but its spacing marks it as
   a jump run, not a burst or stream.
-- **Burst** — a run of 3–9 notes.
+- **Burst** — a run of 3–9 notes, at a snap that is a step up from the map's
+  own pulse (1/4 or 1/3, not 1/2 — see `burst_beat_fraction_max`). Speed alone
+  isn't enough: at 240 BPM an ordinary 1/2 tap is 125ms, which is fast in
+  milliseconds but is just what that map taps all the way through.
 - **Stream** — a run of 10+ notes. "Spaced stream" is the same thing with
   non-overlapping but still deliberate, readable spacing (spacing tier
   "spaced" below) — still a stream, not a jump.
@@ -188,6 +225,39 @@ Decisions that look odd but aren't:
   maps are authored at deliberately doubled tempo. Stream BPM is `15000 / ms`.
   An earlier ratio-based test was admitting roughly half its transitions at
   1/2 snap.
+- **...but absolute ms alone can't tell a burst from a fast map's own pulse,
+  so there is now a second, narrowly-scoped rhythm gate on top.** At 240 BPM
+  an ordinary 1/2 tap is 125ms, which clears the 140ms cap, so *every* jump
+  map at that tempo grew phantom bursts out of its plain 1/2 tapping. A burst
+  is a step UP from the map's own pulse, so a run must also come in at most
+  `burst_beat_fraction_max` (0.4) of a beat per note — which admits 1/4 (0.25)
+  and 1/3 (0.33) and rejects 1/2 (0.5) with 20% headroom for loose snapping.
+  The stored tempo is still not trusted on its own; the gate is deliberately
+  confined to the only band where it can matter:
+    - Runs at or under `burst_always_fast_ms` (110ms/note, a ~136 BPM stream)
+      skip it entirely. That is what keeps **doubled** notation working, and
+      it is the same argument as the bullet above: a 200 BPM song written as
+      400 taps its 1/4 at 75ms, the file calls that a 1/2, and it passes on
+      speed alone exactly as it always did. `test_stored_bpm_does_not_affect_
+      the_verdict` pins this.
+    - `effective_beat_ms()` folds **halved** notation back out before the
+      fraction is taken — the direction speed *can't* rescue, because halved
+      notation makes an ordinary 1/2 look like a 1/4. It only ever folds
+      downward (long beat → shorter), never the reverse: halving a genuine
+      250 BPM map would turn its real 1/2 (120ms) into a "1/4 burst", the
+      exact bug being fixed. Blast radius is small and bounded by the 140ms
+      cap — only maps notated at 107–125 BPM can have a 1/4 admitted at all,
+      which is precisely where halved notation lives.
+  So the gate only ever decides runs in the 110–140ms band: too slow to be
+  self-evidently burst tapping, fast enough to slip under the absolute cap.
+  Measured on the user's hand-sorted mislabel set: all 11 "Jumps with bursts"
+  verdicts on maps with no bursts were 1/2-snap runs at 120–135ms in 223–250
+  BPM maps, and all 11 are fixed. The twelfth (Chug Jug With You, notated 118
+  BPM but played at 236) is the halved-notation case and is fixed by the fold.
+  Real library check, the user's full osu!stable library (58,811
+  difficulties, old vs new end to end): 866 diffs move "Jumps with bursts" →
+  "Jumps (no bursts)". On a 7,572-diff lazer sample the gate rejected 14,339
+  runs that previously counted — 12,429 moving and 1,910 zero-distance.
 - **Runs must be rhythmically consistent.** A real stream doesn't change
   tapping speed partway through.
 - **Spacing is measured from the previous object's END.** Sliders are around
@@ -234,28 +304,120 @@ Decisions that look odd but aren't:
   you'd expect from removing manufactured jumps, and disproportionately on
   maps whose names say what they are ("XNOR XNOR XNOR", "Shitpost Set 2",
   "mapping styles").
-- **A run where every note sits on the exact same spot is not a burst or a
-  stream.** `wide_fraction`/`mean_diam_ratio_max` only ever capped how FAR
-  apart a run's notes could be; nothing floored how CLOSE, so a stack (2+
-  circles on identical (x,y), a completely ordinary mapping technique for
-  emphasis) sailed through every spacing check with a trivial `dist == 0`
-  and got counted as a real burst/stream run. Reported by the user on "ESSE
-  CARA! [INSANE!]": six "burst" runs, all four-note stacks on one point,
-  called `has_bursts` with zero actual movement in any of them - confirmed
-  visually via `osu_visualizer_preview.py`. Real library check: 33.5% of
-  EVERY burst run ever counted (665,952 of 1,986,316) had `mean_dist_ratio
-  == 0.0` - and it's a clean population, not a threshold call: exactly-zero
-  outnumbers the entire (0, 0.05) range combined roughly 55x (668,768 vs
-  12,117), with that small remainder spread thinly rather than clustered
-  near zero. Fix rejects a run outright when `mean_dist_ratio == 0.0` -
-  deliberately exact equality, not an epsilon, since the population itself
-  is exact (raw file coordinates, not float noise) and the ambiguous
-  near-zero-but-real sliver is small enough to leave alone rather than
-  guess at. Measured effect: 7,076 category flips (12.1% of the library) -
-  by far the largest of any fix this session, consistent with a bug that
-  hit a third of all burst content. Largest single moves: 2,937 "Jumps with
-  bursts" → "Jumps (no bursts)" and 2,689 "Bursts" → "Misc" (maps whose
-  only "burst" was entirely stacks).
+- **A stacked 1/4 triple IS a burst** — and a previous rejection of every
+  zero-distance run has been REVERTED. That rule fired when
+  `mean_dist_ratio == 0.0` (every note in the run on identical (x,y)), on the
+  strength of one map ("ESSE CARA! [INSANE!]", six four-note stacks) plus a
+  large population statistic: 33.5% of every burst run in the library
+  (665,952 of 1,986,316) was exactly zero-distance. The statistic was real
+  but was not evidence of a bug. A stacked triple is the single most common
+  way a 1/4 burst is written in 2014–2017 Insanes; osu!'s stack leniency
+  renders it as a small staircase, and it plays and reads as a burst. A third
+  of bursts being that shape is what you would expect.
+  Thirteen maps the user hand-sorted as "jumps with bursts that got called
+  jumps with no bursts" were all this exact pattern — stacked 1/4 triples at
+  78–94ms in 160–200 BPM maps — and the blanket rejection is why every single
+  one of them missed. What the rule was reaching for (a stack tapped at the
+  map's ordinary pulse isn't a burst) is a statement about RHYTHM, not
+  spacing, and is now made directly by the rhythm gate above.
+  ESSE CARA itself is the proof that the rhythm gate is the right layer, and
+  it is worth being precise about, since it is the evidence being overturned.
+  The mapset has a single timing point at 503.57ms (119.2 BPM), so the only
+  snap in it that can form a run at all is the notated 1/4 at 125.9ms — which
+  under halved notation is a 1/2, and the gate rejects it. Checked directly
+  against the diffs in the library:
+
+  | diff | with the stack rule | with the rhythm gate |
+  |---|---|---|
+  | `[INSANE!]` (the one cited) | 0 bursts → Jumps (no bursts) | 0 bursts → Jumps (no bursts) |
+  | `[HARD!]` | **4 bursts → Jumps with bursts** | 0 bursts → Jumps (no bursts) |
+  | `[SPECIAL!]` | **2 bursts → Jumps with bursts** | 0 bursts → Jumps (no bursts) |
+  | `[EXPERT!]` | 1 burst → Jumps (no bursts) | 0 bursts → Jumps (no bursts) |
+  | `[EASY!]`/`[NORMAL!]`/`[EXTRA!]`/`[EXTREME!]`/`[TOMA TOMA]`×2 | 0 bursts | 0 bursts |
+
+  So the stack rule did fix the diff it was checked against — but only that
+  one. Two others in the same mapset, `[HARD!]` and `[SPECIAL!]`, still
+  reported false bursts under it, because those particular runs happened to
+  carry a little movement and so dodged a spacing test. That is the tell: the
+  rule was aimed at the wrong property. It was simultaneously too broad
+  (throwing away ~90k real stacked triples) and too narrow (leaving false
+  bursts in its own motivating mapset). The rhythm gate gets all ten diffs
+  right, for the reason none of them is burst content: the rhythm, not the
+  spacing.
+  Real library check (7,572-diff sample): of the zero-distance runs that
+  survive the spacing checks, the rhythm gate keeps 90,082 and rejects 1,910
+  — and the kept ones pile up at 70–89ms per note, i.e. 1/4 at 160–200 BPM,
+  exactly the stacked-triple shape. Only 234 sit above 120ms. The blanket
+  rule was discarding ~90k genuine bursts to catch ~2k, and the gate catches
+  those 2k on their own merits. The kept runs are 89,862 bursts (3–9 notes)
+  against 220 streams (10+), so this is a burst-detection question almost
+  entirely — long stacks are a rounding error, not a population to worry
+  about.
+  The knock-on effect on Streams is a fix, not a side effect: across the full
+  stable library 837 diffs move INTO Streams (732 from "Jumps with bursts",
+  105 from "Misc") against 111 leaving, and they are maps whose stream runs
+  were being chopped up by the stacked segments inside them — Blue Zenith
+  [Faics' Extreme], Jinzou Enemy [Extra] (max run 58), Gigantic O.T.N
+  [Climax] (117), Everlasting Eternity (65). Calling Blue Zenith "Jumps with
+  bursts" was never right.
+  If you are tempted to reinstate a spacing floor here, note that the
+  wide-fraction and `mean_diam_ratio_max` caps still bound how far apart a
+  run may be, and `MAX_SUSTAINED_NOTES_PER_SEC` still catches the
+  audio-visualizer stacks that genuinely aren't gameplay.
+- **One real burst is enough for "Jumps with bursts"** — `burst_recurrence_min`
+  is back to 1 (it was briefly 2). The 176 single-burst-run "Jumps with
+  bursts" results that motivated the floor were mostly not bursts at all;
+  they were the two detection bugs above (1/2-snap runs admitted by a
+  snap-blind speed test, and genuine stacked triples rejected, which also
+  suppressed the second and third runs that would have kept honest maps over
+  the floor). A recurrence floor was compensating for a noisy detector by
+  discarding its output wholesale, true positives included. The user's
+  hand-sorted set is explicit on the point: five of their thirteen
+  "jumps with bursts" maps contain exactly ONE burst run at ~1–2% coverage.
+  The parameter is kept, not deleted, so the stricter reading stays reachable.
+  Scale of the change on its own: 154 diffs in a 7,572-diff sample (2.0%) have
+  jumps plus exactly one burst run.
+
+Whole-library effect of all three changes together, measured old vs new over
+the user's 58,811-difficulty osu!stable library: **9,574 diffs change category
+(16.3%)** — a 15.8% flip rate on an independent 7,572-diff lazer sample, so
+the two agree. The movement is where the user's mislabelled set says it should
+be:
+
+| flip | count |
+|---|---|
+| Jumps (no bursts) → Jumps with bursts | 3,727 |
+| Misc → Bursts | 3,005 |
+| Jumps with bursts → Jumps (no bursts) | 866 |
+| Jumps with bursts → Streams | 732 |
+| Jumps with bursts → Bursts | 424 |
+| Bursts → Misc | 295 |
+
+The two big movers are the two false-negative populations (stacked triples
+that were being discarded, in jump maps and in otherwise-quiet maps
+respectively); the 866 are the false positives the rhythm gate removes.
+
+### The combined "Jumps" collection
+
+`combine_jumps` (GUI checkbox, `--combine-jumps`) writes an EXTRA `Jumps`
+collection holding every diff from both jump categories, **in addition to**
+them, not instead. A jumps+bursts map therefore appears in two collections -
+that is the intent, not a bug. Nothing is reclassified; `report.csv` still
+records the specific category, and `category_of()` is untouched. This is
+purely an output-grouping option.
+
+It lives in `build_output_collections()`, applied **after** category and star
+filtering and **before** ranked handling. That ordering is deliberate:
+unchecking a jump category means "I don't want these maps", so they must not
+reappear inside the combined collection by the back door; and running before
+the ranked step means `ranked_mode="split"` splits `Jumps` into
+`Jumps - Ranked`/`Jumps - Unranked` like every other collection, for free.
+
+The `--from-csv` rebuild carries its own copy of this (it works on
+`(md5, status, stars)` tuples read back from the CSV rather than `DiffInfo`
+objects, so it can't call the same function). If you change one, change both -
+a live run and a `--from-csv` rebuild producing byte-identical `collection.db`
+files is the regression check, and it does currently hold with the flag on.
 
 `category_of()` is the single source of truth for category rules. Both the
 live path and the `--from-csv` rebuild go through it — they used to carry
@@ -316,12 +478,49 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `mean_diam_ratio_max` | 1.5 | max *average* dist/diameter across a run before it's rejected |
 | `cut_max_multiple` | 3.0 | largest skipped-note gap multiple still treated as a cut inside one stream |
 | `cut_max_dist_ratio` | 4.0 | largest cut-transition distance (× hit-circle diameter) still treated as a skipped note rather than a real jump between two separate runs |
+| `burst_beat_fraction_max` | 0.4 | slowest snap still counted as burst/stream tapping, as a fraction of a beat per note — admits 1/4 (0.25) and 1/3 (0.33), rejects 1/2 (0.5) |
+| `burst_always_fast_ms` | 110.0 | runs at or under this ms/note skip the beat-fraction check entirely — fast enough to be burst tapping whatever snap the file calls it |
+| `min_notated_bpm` | 125.0 | tempos notated below this are treated as halved-BPM authoring and doubled back up before the beat fraction is taken |
 
 Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
 `category_of()` parameter, not a `classify_diff()` one, since it operates on
 already-computed run lengths). `INT_PARAMS` in `classify_maps.py` lists which
 of the above must parse as `int` rather than `float` when read from CLI/GUI
 text: `burst_min`, `burst_max`, `stream_min`, `jump_min_transitions`.
+
+### Sensitivity presets
+
+Nineteen bare numbers named things like `mean_diam_ratio_max` told a GUI user
+nothing, so `SENSITIVITY_PRESETS` gives the common case a single click:
+**Stricter / Balanced / Looser**. Rules, all pinned by tests:
+
+- **`Balanced` is byte-for-byte `DEFAULT_PARAMS`.** If it ever diverges,
+  opening the GUI and pressing Run classifies differently from the CLI's
+  defaults for no stated reason.
+- **Presets move exactly four knobs** — `max_gap_ms`,
+  `burst_beat_fraction_max`, `stream_pct_threshold`, `jump_pct_threshold`.
+  Those are the ones that answer "how much gets flagged". Everything else
+  describes what a pattern *is*, and moving it would change the definitions
+  rather than the sensitivity.
+- **Stricter and Looser are trades, not rival claims** about what's correct.
+  Measured on the user's 24 hand-sorted maps: Balanced and Looser both get
+  24/24, Stricter gets 23/24 (one map falls to Misc under the raised
+  `jump_pct_threshold`) — which is what "stricter" is supposed to do, not a
+  regression.
+- `sensitivity_of(params)` returns the matching preset name or `None`. The GUI
+  uses it to show **Custom** the moment a threshold is hand-edited, rather
+  than leaving a radio button selected that no longer describes what will run.
+
+The GUI's per-threshold panel is collapsed behind a disclosure and every field
+carries a plain-language label plus a one-line explanation of what its number
+means. Nothing was removed — but if you add a param to `DEFAULT_PARAMS` you
+must also add it to a section in `gui.py`'s `sections` list, or it is silently
+uneditable there: the run path reads `self.param_vars`, wouldn't find it, and
+would fall back to the default with no error.
+`test_every_param_is_editable_in_the_gui` builds the real window and compares
+the two sets, so that mistake fails the suite rather than shipping. It skips
+itself (rather than failing) when there's no display, so CI stays green
+headless — which does mean a headless-only CI won't catch it for you.
 
 `MIN_OBJECTS_TO_CLASSIFY` (10, module-level constant, not in `DEFAULT_PARAMS`
 and not CLI/GUI-adjustable) treats a diff under 10 hit objects as junk - a
@@ -353,8 +552,11 @@ cursor could move between them - an audio visualizer built out of hit
 objects, not gameplay. `classify_diff()` enforces this independently too,
 same defense-in-depth reasoning as the object-count floor above. 30 sits in
 the gap itself, so it doesn't touch the real (if extreme) tail below it -
-same "only fix the unambiguous population" discipline as the burst-
-recurrence and stack-run fixes earlier in this document.
+same "only fix the unambiguous population" discipline the rest of these
+decisions try to follow. (Contrast the burst-recurrence and stack-run
+entries earlier in this document, which are recorded as REVERSALS - both
+generalised from a population statistic to a rule the user's own labels
+later contradicted. A large population is not by itself a bug.)
 
 ### Mod math
 
