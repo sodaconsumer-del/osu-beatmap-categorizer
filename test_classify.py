@@ -766,6 +766,77 @@ def test_ties_still_resolve_the_way_the_old_cascade_did():
                           burst_run_count=8, counted_gaps=100) == "Bursts"
 
 
+# --- Hybrid: streams and jumps in different parts of the map ---------------
+
+def _sectioned(stream_sections, jump_sections, active, **over):
+    """A DiffInfo-shaped stand-in with the section counts set directly."""
+    d = build(circles(12))
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    d.has_streams = d.has_jumps = True
+    d.active_sections = active
+    d.stream_sections = stream_sections
+    d.jump_sections = jump_sections
+    p = dict(cm.DEFAULT_PARAMS)
+    p.update(over)
+    # Recompute just the hybrid flag the way classify_diff does.
+    s, j = stream_sections / active, jump_sections / active
+    bigger = max(s, j)
+    bal = (min(s, j) / bigger) if bigger else 0.0
+    d.has_hybrid = (s >= p["hybrid_section_min"] and j >= p["hybrid_section_min"]
+                    and bal >= p["hybrid_balance_min"])
+    return d
+
+
+def test_a_balanced_mix_of_streams_and_jumps_is_hybrid():
+    # Both patterns own a comparable share of the map's sections. Coverage
+    # alone would hand this to whichever edged ahead; sections say it's both.
+    d = _sectioned(stream_sections=24, jump_sections=24, active=100)
+    assert d.has_hybrid
+    assert cm.category_of(d) == "Hybrid"
+
+
+def test_a_jump_map_with_one_stream_section_is_not_hybrid():
+    # 19% streams against 61% jumps clears a flat 15% bar on both sides, but
+    # jumps own three times as much - that is a jump map that has a stream
+    # section in it, not a mix. This is what hybrid_balance_min is for.
+    d = _sectioned(stream_sections=19, jump_sections=61, active=100)
+    assert not d.has_hybrid
+    assert cm.category_of(d) != "Hybrid"
+
+
+def test_a_stream_map_with_some_jumps_is_not_hybrid():
+    # The mirror image: 44% streams to 18% jumps.
+    d = _sectioned(stream_sections=44, jump_sections=18, active=100)
+    assert not d.has_hybrid
+
+
+def test_hybrid_needs_both_patterns_actually_present():
+    # Sections alone aren't enough - each pattern must still clear its own
+    # coverage bar, so a map is never promoted on evidence too thin to count.
+    d = _sectioned(stream_sections=30, jump_sections=30, active=100)
+    d.has_streams = False
+    assert cm.category_of(d) != "Hybrid"
+
+
+def test_hybrid_strictness_follows_the_sensitivity_preset():
+    # 12% each: a mix, but a thin one. Looser should take it, Balanced and
+    # Stricter should not.
+    for preset, want in (("Looser", True), ("Balanced", False), ("Stricter", False)):
+        d = _sectioned(12, 12, 100, **cm.params_for_sensitivity(preset))
+        assert d.has_hybrid is want, preset
+
+
+def test_sections_ignore_stretches_too_sparse_to_mean_anything():
+    # A couple of notes either side of a break must not register as whole
+    # sections - they'd swamp the proportions on a quiet map.
+    objs_eligible = [0, 1, 2]
+    label = {0: "j", 1: "j", 2: "j"}
+    objs = [(i * 100.0, i * 100.0, 0, 0, 0, 0) for i in range(4)]
+    active, s, b, j = cm.section_pattern_counts(
+        objs, objs_eligible, label, section_ms=2000.0, section_min_transitions=4)
+    assert active == 0 and j == 0
+
+
 # --- sensitivity presets ---------------------------------------------------
 
 def test_balanced_preset_is_exactly_the_defaults():
@@ -779,7 +850,8 @@ def test_presets_only_move_the_sensitivity_knobs():
     # The other settings describe what a pattern IS, not how eager we are to
     # find one. A preset that moved those would be changing the definitions.
     expected = {"max_gap_ms", "burst_beat_fraction_max",
-                "stream_pct_threshold", "jump_pct_threshold"}
+                "stream_pct_threshold", "jump_pct_threshold",
+                "hybrid_section_min"}
     for name, overrides in cm.SENSITIVITY_PRESETS.items():
         assert set(overrides) <= expected, f"{name} moves something it shouldn't: {set(overrides) - expected}"
 
@@ -795,7 +867,7 @@ def test_presets_are_complete_and_ordered_as_advertised():
     base = cm.DEFAULT_PARAMS
     for key in ("max_gap_ms", "burst_beat_fraction_max"):
         assert strict[key] < base[key] < loose[key], key   # lower = harder to qualify
-    for key in ("stream_pct_threshold", "jump_pct_threshold"):
+    for key in ("stream_pct_threshold", "jump_pct_threshold", "hybrid_section_min"):
         assert strict[key] > base[key] > loose[key], key   # higher = must cover more
 
 
@@ -811,6 +883,40 @@ def test_sensitivity_of_recognises_presets_and_hand_edits():
 
 def test_unknown_preset_name_falls_back_to_defaults():
     assert cm.params_for_sensitivity("nonsense") == cm.DEFAULT_PARAMS
+
+
+def test_every_param_has_a_cli_flag():
+    """
+    main() does `{key: getattr(args, key) for key in DEFAULT_PARAMS}`, so a
+    param added without a matching argparse flag doesn't degrade gracefully -
+    it makes the whole CLI die with AttributeError on every run. Caught in
+    practice when the section params were added.
+    """
+    import argparse
+    import contextlib
+    import io as _io
+
+    parser_holder = {}
+    real_parse = argparse.ArgumentParser.parse_args
+
+    def capture(self, *a, **kw):
+        parser_holder["p"] = self
+        raise SystemExit(0)      # stop before main() does any real work
+
+    argparse.ArgumentParser.parse_args = capture
+    try:
+        with contextlib.suppress(SystemExit), \
+                contextlib.redirect_stdout(_io.StringIO()), \
+                contextlib.redirect_stderr(_io.StringIO()):
+            cm.main()
+    finally:
+        argparse.ArgumentParser.parse_args = real_parse
+
+    parser = parser_holder.get("p")
+    assert parser is not None, "could not reach the argument parser"
+    dests = {a.dest for a in parser._actions}
+    missing = set(cm.DEFAULT_PARAMS) - dests
+    assert not missing, f"params with no CLI flag (the CLI will crash): {sorted(missing)}"
 
 
 def test_every_param_is_editable_in_the_gui():

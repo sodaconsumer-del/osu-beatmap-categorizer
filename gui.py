@@ -384,7 +384,10 @@ class ClassifierGUI(tk.Tk):
         row_cat = ttk.Frame(frame_cat)
         row_cat.pack(fill="x", padx=10, pady=8)
         self.category_vars = {}
-        for cat in ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]:
+        # Driven off cm.CATEGORIES rather than a second copy of the list -
+        # adding a category (Hybrid was the last one) should not need a second
+        # edit here that is easy to forget.
+        for cat in cm.CATEGORIES:
             var = tk.BooleanVar(value=True)
             ttk.Checkbutton(row_cat, text=cat, variable=var).pack(side="left", padx=(0, 16))
             self.category_vars[cat] = var
@@ -560,6 +563,24 @@ class ClassifierGUI(tk.Tk):
                  'a 30-note map being "20% jumps" is noise, not a finding.'),
                 ("jump_gap_cap_ms", "Gap that counts as a break rather than gameplay",
                  "milliseconds. Breaks are left out of the percentages entirely."),
+            ]),
+            ("Sections - where in the map a pattern lives", [
+                ("section_ms", "Length of one section",
+                 "milliseconds. About two bars at 200 BPM. Sections are how the Hybrid category "
+                 "tells 'jumps then streams' apart from 'both mixed evenly throughout' - coverage "
+                 "alone averages those to the same numbers."),
+                ("section_dominance", "How much of a section a pattern must hold to own it",
+                 "0.5 = half its notes. A section is owned by at most one pattern."),
+                ("hybrid_section_min", "Sections each side needs for \"Hybrid\"",
+                 "0.15 = streams must own 15% of the map's sections and jumps another 15%, before "
+                 "the map is called a mix of the two rather than one or the other."),
+                ("hybrid_balance_min", "How balanced that mix must be",
+                 "0.5 = the smaller side must own at least half as many sections as the larger. "
+                 "Without it, a map with 61% jump sections and 19% stream sections counts as a "
+                 "\"mix\" when it is plainly a jump map with a stream section in it."),
+                ("section_min_transitions", "Fewest notes for a section to count at all",
+                 "stops a map's sparse tail, or a couple of notes either side of a break, "
+                 "registering as full sections and skewing the proportions."),
             ]),
             ("Cut streams - a stream with a skipped beat", [
                 ("cut_max_multiple", "Biggest skipped-beat gap still inside one stream",

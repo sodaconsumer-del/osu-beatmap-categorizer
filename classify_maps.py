@@ -131,9 +131,21 @@ class DiffInfo:
     stream_transitions: int = 0
     jump_transitions: int = 0
 
+    # Sectional structure. Coverage alone says how MUCH of a map is streams
+    # and how much is jumps; it can't tell "alternating stream and jump
+    # sections" from "evenly mixed throughout", because both average out the
+    # same. These count how many sections of the map each pattern actually
+    # OWNS - which is what makes the Hybrid category possible. See
+    # section_pattern_counts().
+    active_sections: int = 0
+    stream_sections: int = 0
+    burst_sections: int = 0
+    jump_sections: int = 0
+
     # multi-label - a diff can be any combination of these, not mutually exclusive
     has_bursts: bool = False
     has_streams: bool = False
+    has_hybrid: bool = False
     has_jumps: bool = False
     has_cutstreams: bool = False
 
@@ -507,6 +519,60 @@ def usable_beat_ms(beat_ms):
     return beat_ms
 
 
+def section_pattern_counts(objs, eligible, label, section_ms=2000.0,
+                            section_dominance=0.5, section_min_transitions=4):
+    """
+    Split the map into fixed time sections and count how many each pattern
+    owns. Returns (active, stream, burst, jump).
+
+    Coverage says how much of a map is streams and how much is jumps. It
+    cannot distinguish "a jump half and a stream half" from "evenly mixed all
+    the way through" - both average to the same numbers - and those are very
+    different maps to play. Sections are what make that difference visible,
+    and they are what the Hybrid category is built on.
+
+    `label` maps a transition index to "s"/"b"/"j"; anything absent is
+    ordinary spaced tapping and counts toward the section's size but owns
+    nothing.
+
+    section_ms = 2000 was picked by looking, not by taste. osu!'s own
+    StrainSkill uses 400ms, but that is for strain peaks: at 200 BPM it is
+    barely one beat, and printing real maps at that length gives fragmented
+    noise with no visible structure. At 2000ms (roughly two bars at 200 BPM)
+    the structure of a map like FREEDOM DiVE [ENDLESS DiMENSiONS] reads
+    directly off the timeline - distinct jump passages and a long stream
+    passage, in the places the map actually has them.
+
+    A section must be at least section_min_transitions long to be counted at
+    all - otherwise the sparse tail of a map, or a couple of notes either
+    side of a break, would each register as a full "section" and swamp the
+    proportions.
+    """
+    if not eligible:
+        return 0, 0, 0, 0
+    start = objs[eligible[0]][0]
+    buckets = {}
+    for i in eligible:
+        # Transition i runs from objs[i] to objs[i+1]; date it by its start.
+        k = int((objs[i][0] - start) // section_ms)
+        buckets.setdefault(k, []).append(label.get(i))
+    active = streams = bursts = jumps = 0
+    for members in buckets.values():
+        if len(members) < section_min_transitions:
+            continue
+        active += 1
+        for tag, bump in (("s", "stream"), ("b", "burst"), ("j", "jump")):
+            if members.count(tag) / len(members) >= section_dominance:
+                if bump == "stream":
+                    streams += 1
+                elif bump == "burst":
+                    bursts += 1
+                else:
+                    jumps += 1
+                break   # a section is owned by at most one pattern
+    return active, streams, bursts, jumps
+
+
 def looks_like_halved_notation(objs, timing_points, burst_max_gap_ms=105.0,
                                 halved_quarter_share_min=0.15):
     """
@@ -581,7 +647,10 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
                    cut_max_multiple=3.0, cut_max_dist_ratio=4.0,
                    burst_beat_fraction_max=0.4, burst_always_fast_ms=110.0,
-                   burst_max_gap_ms=105.0, halved_quarter_share_min=0.15, mods=None):
+                   burst_max_gap_ms=105.0, halved_quarter_share_min=0.15,
+                   section_ms=2000.0, section_dominance=0.5, section_min_transitions=4,
+                   hybrid_section_min=0.15, hybrid_balance_min=0.5,
+                   mods=None):
     """
     Terminology (matching osu!'s official beatmap tags):
       - burst  : 3-9 note run. Three notes really is enough - short 3-note
@@ -938,7 +1007,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # A run REJECTED for being too jump-spaced isn't discarded either: its
     # transitions land here, and the wide ones are counted as the jumps they
     # are. That is the evidence that used to vanish.
-    jump_count = 0
+    jump_idx = set()
     for i in eligible:
         if i in claimed_burst or i in claimed_stream:
             continue
@@ -950,7 +1019,8 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         # the actual spacing is small - that was causing real streams to get
         # flagged as mostly jumps.
         if dist > diam * spaced_diam_ratio and (norm_dist / (move_time / 100.0)) > jump_velocity_ratio:
-            jump_count += 1
+            jump_idx.add(i)
+    jump_count = len(jump_idx)
 
     # Coverage, all three on the one basis that makes them comparable: share
     # of gameplay transitions. These partition `eligible`, so they sum to at
@@ -959,6 +1029,18 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     diff.burst_transitions = len(claimed_burst & eligible_set)
     diff.stream_transitions = len(claimed_stream & eligible_set)
     diff.jump_transitions = jump_count
+
+    # Where in the map each pattern lives, not just how much of it there is.
+    label = {}
+    for i in claimed_burst & eligible_set:
+        label[i] = "b"
+    for i in claimed_stream & eligible_set:
+        label[i] = "s"
+    for i in jump_idx:
+        label[i] = "j"
+    (diff.active_sections, diff.stream_sections,
+     diff.burst_sections, diff.jump_sections) = section_pattern_counts(
+        objs, eligible, label, section_ms, section_dominance, section_min_transitions)
 
     diff.burst_count = len(bursts)
     diff.stream_count = len(streams)
@@ -992,6 +1074,27 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # and gets called a jump map on the strength of five jumps.
     diff.has_jumps = counted_gaps >= jump_min_transitions and diff.jump_pct >= jump_pct_threshold
     diff.has_cutstreams = cutstreams > 0
+
+    # Streams and jumps in DIFFERENT PARTS of the map, in comparable amounts.
+    # Two conditions:
+    #   - each owns at least hybrid_section_min of the map's sections, so
+    #     neither is a stray passage;
+    #   - and they are BALANCED - the smaller owns at least hybrid_balance_min
+    #     of what the larger does. Without this a flat threshold calls a map
+    #     with 61% jump sections and 19% stream sections a hybrid, when it is
+    #     plainly a jump map that has a stream section in it. "A mix" means
+    #     comparable amounts, not merely some of each.
+    # Computed here rather than in category_of() for the same reason
+    # has_streams/has_jumps are: it is a property of the map measured from its
+    # notes, and category_of()'s job is only to rank what is present.
+    if diff.active_sections and diff.has_streams and diff.has_jumps:
+        s_share = diff.stream_sections / diff.active_sections
+        j_share = diff.jump_sections / diff.active_sections
+        bigger = max(s_share, j_share)
+        balance = (min(s_share, j_share) / bigger) if bigger else 0.0
+        diff.has_hybrid = (s_share >= hybrid_section_min
+                           and j_share >= hybrid_section_min
+                           and balance >= hybrid_balance_min)
 
     return diff
 
@@ -1931,7 +2034,7 @@ def write_collection_db(path, collections, db_version=20211103):
 # Main
 # --------------------------------------------------------------------------
 
-CATEGORIES = ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]
+CATEGORIES = ["Streams", "Hybrid", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]
 
 # The two categories that are both "a jump map", differing only in whether
 # bursts show up alongside the jumps. combine_jumps writes an extra
@@ -1966,7 +2069,8 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
                  burst_note_total=0, total_note_count=0, jump_pct=0.0,
                  stream_note_total=0, stream_run_count=0, max_stream_len=0,
                  burst_promote_stream_len=12, burst_run_count=0, counted_gaps=0,
-                 burst_recurrence_min=1, burst_transitions=None, stream_transitions=None):
+                 burst_recurrence_min=1, burst_transitions=None, stream_transitions=None,
+                 has_hybrid=False):
     """
     The one place the dominant-pattern rules live.
 
@@ -2055,6 +2159,7 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
         counted_gaps = d.counted_gaps
         burst_transitions = d.burst_transitions
         stream_transitions = d.stream_transitions
+        has_hybrid = d.has_hybrid
 
     if burst_run_count and burst_run_count < burst_recurrence_min:
         has_bursts = False
@@ -2121,6 +2226,20 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     # Ties keep the old cascade's outcome: it awarded a stream-vs-jump tie to
     # streams (>=) and a burst-vs-jump tie to bursts (jumps needed a strict >).
     # Hence the priority below, which only ever breaks exact ties.
+    # --- Hybrid: streams AND jumps, in different parts of the map ----------
+    # Coverage can't express this. A map that is jumps for a minute and then
+    # streams for a minute averages out to the same numbers as one that mixes
+    # both evenly throughout, and the contest below would hand it to whichever
+    # edged ahead - losing the thing that actually characterises it.
+    #
+    # Sections can see it: this asks whether streams OWN a real share of the
+    # map's sections and jumps own a real share too. Both patterns still have
+    # to clear their own presence bars first, so this only ever splits maps
+    # that genuinely have both - it never promotes a map on evidence too thin
+    # to count on its own.
+    if has_hybrid and has_streams and has_jumps:
+        return "Hybrid"
+
     contenders = []
     if has_streams:
         contenders.append((stream_coverage, 3, "stream"))
@@ -2350,14 +2469,29 @@ DEFAULT_PARAMS = dict(
     # the two content signals that decide halved notation. There is
     # deliberately no BPM threshold; see looks_like_halved_notation().
     halved_quarter_share_min=0.15,
+    # Sectional structure. 2000ms is roughly two bars at 200 BPM and was
+    # picked by printing real maps' section timelines - osu!'s own 400ms
+    # strain sections are far too short to show pattern structure. A section
+    # is "owned" by a pattern when that pattern holds section_dominance of it,
+    # and sections with fewer than section_min_transitions notes are ignored
+    # so a map's sparse tail can't swamp the proportions.
+    section_ms=2000.0,
+    section_dominance=0.5,
+    section_min_transitions=4,
+    # Hybrid: streams and jumps must each own this share of the map's
+    # sections, AND be balanced - the smaller at least hybrid_balance_min of
+    # the larger, so "a jump map with one stream section" isn't called a mix.
+    hybrid_section_min=0.15,
+    hybrid_balance_min=0.5,
 )
 
 # Named starting points for the GUI's "Detection sensitivity" control, so the
 # common case is one click instead of nineteen numbers.
 #
-# Only four knobs move. They are the ones that actually answer "how much gets
+# Only five knobs move. They are the ones that actually answer "how much gets
 # flagged": how fast a run has to be, how much of a rhythm step-up a burst
-# needs, and how much of a map streams/jumps must cover to own it. Everything
+# needs, how much of a map streams/jumps must cover to own it, and how readily
+# a map counts as a Hybrid rather than one thing or the other. Everything
 # else describes what a pattern IS rather than how eager we are to find one,
 # and moving those would change the definitions rather than the sensitivity.
 #
@@ -2372,12 +2506,14 @@ SENSITIVITY_PRESETS = {
         burst_beat_fraction_max=0.30,   # 1/4 only - drops 1/3 snap
         stream_pct_threshold=25.0,      # streams must cover a quarter of the map
         jump_pct_threshold=20.0,
+        hybrid_section_min=0.25,        # Hybrid only for unambiguous mixes
     ),
     "Looser": dict(
         max_gap_ms=160.0,               # ~94 BPM stream still counts as fast
         burst_beat_fraction_max=0.45,   # allows sloppier-than-1/3 snapping
         stream_pct_threshold=10.0,
         jump_pct_threshold=12.0,
+        hybrid_section_min=0.10,
     ),
 }
 DEFAULT_SENSITIVITY = "Balanced"
@@ -2406,7 +2542,8 @@ def sensitivity_of(params):
 
 
 # Params that must stay integers when parsed from a string (CLI/GUI).
-INT_PARAMS = ("burst_min", "burst_max", "stream_min", "jump_min_transitions")
+INT_PARAMS = ("burst_min", "burst_max", "stream_min", "jump_min_transitions",
+              "section_min_transitions")
 
 
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
@@ -2570,6 +2707,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                 w = csv.writer(f)
                 mods_str = "+".join(mods) if mods else "NM"
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
+                            "has_hybrid", "active_sections", "stream_sections", "jump_sections",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
                             "max_stream_len", "jump_pct", "burst_note_total", "stream_note_total",
                             "total_note_count", "counted_gaps",
@@ -2585,6 +2723,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
                 for d in diffs:
                     w.writerow([d.title, d.diff_name, safe_round(d.bpm), d.has_bursts, d.has_streams, d.has_jumps, d.has_cutstreams,
+                                d.has_hybrid, d.active_sections, d.stream_sections, d.jump_sections,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
                                 d.max_stream_len, safe_round(d.jump_pct, 1), d.burst_note_total,
                                 d.stream_note_total, d.total_note_count, d.counted_gaps,
@@ -2719,6 +2858,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                     stream_runs, max_stream_len,
                     burst_run_count=burst_runs, counted_gaps=counted_gaps,
                     burst_transitions=burst_tr, stream_transitions=stream_tr,
+                    has_hybrid=row.get("has_hybrid") == "True",
                 )
             groups[category].append(entry)
 
@@ -2875,6 +3015,23 @@ def main():
                           "map's backbone rather than accents - one of two content signals used to spot "
                           "halved-BPM authoring (a 130 BPM file that really plays at 260). No BPM "
                           "threshold is involved; the notes decide.")
+    ap.add_argument("--section-ms", type=float, default=DEFAULT_PARAMS["section_ms"],
+                     help="Length of one section, in ms. Sections are how the Hybrid category tells "
+                          "'jumps then streams' apart from 'both mixed evenly throughout' - coverage "
+                          "alone averages those to the same numbers.")
+    ap.add_argument("--section-dominance", type=float, default=DEFAULT_PARAMS["section_dominance"],
+                     help="Share of a section one pattern must hold to own it (0.5 = half its notes)")
+    ap.add_argument("--section-min-transitions", type=int,
+                     default=DEFAULT_PARAMS["section_min_transitions"],
+                     help="Fewest notes for a section to be counted at all, so a map's sparse tail "
+                          "can't register as full sections and skew the proportions")
+    ap.add_argument("--hybrid-section-min", type=float, default=DEFAULT_PARAMS["hybrid_section_min"],
+                     help="Share of a map's sections that streams must own AND jumps must own before "
+                          "it is called Hybrid rather than one or the other")
+    ap.add_argument("--hybrid-balance-min", type=float, default=DEFAULT_PARAMS["hybrid_balance_min"],
+                     help="How balanced that mix must be: the smaller side must own at least this "
+                          "fraction of what the larger does. Stops a jump map with one stream section "
+                          "counting as a mix.")
     ap.add_argument("--combine-jumps", action="store_true",
                      help="Also write a single \"Jumps\" collection containing every jump map, on top of "
                           "the separate \"Jumps with bursts\" and \"Jumps (no bursts)\" ones. Nothing is "

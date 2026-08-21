@@ -204,6 +204,14 @@ The vocabulary, for anyone new to osu! pattern terms or this codebase:
   rejected as "actually a jump, not a burst/stream" if too much of it falls
   in the jump-wide tier — see `run_wide_fraction_max`/`mean_diam_ratio_max`
   in the params table.
+- **Hybrid** — a map with stream passages AND jump passages, in comparable
+  amounts and in *different parts* of the map. Its own category, because
+  coverage cannot express it: "jumps for a minute then streams for a minute"
+  and "both mixed evenly throughout" average to identical numbers. See
+  "Sections" below.
+- **Section** — a fixed 2000ms slice of the map. A pattern *owns* a section
+  when it holds `section_dominance` of that section's transitions. Sections
+  are what make structure visible where coverage only sees totals.
 - **Coverage** — what fraction of the *map* (by note count, for
   bursts/streams; by transition count, for jumps) a pattern actually
   occupies. Classification cares about coverage, not mere presence — a
@@ -483,11 +491,49 @@ arguments or an old CSV. That derivation is arithmetically exact (a run of N
 notes is N-1 transitions) - what it cannot express is two passes claiming the
 same transition, which is the thing the partition fixes.
 
+### Sections, and the Hybrid category
+
+Coverage is a total: it says how much of a map is streams and how much is
+jumps. It cannot say *where*, and that is a real gap - a map that is jumps for
+a minute and then streams for a minute averages to exactly the same numbers as
+one that mixes both evenly all the way through, and those are completely
+different maps to play. The contest below would hand each of them to whichever
+pattern edged ahead, losing the thing that actually characterises the first.
+
+`section_pattern_counts()` slices the map into `section_ms` chunks and counts
+how many sections each pattern *owns* (holds `section_dominance` of).
+
+**On `section_ms = 2000`:** osu!'s own `StrainSkill` uses 400ms, but that is
+for strain peaks, and at 200 BPM it is barely one beat. Printing real maps'
+section timelines at 400ms gives fragmented noise; at 2000ms (about two bars
+at 200 BPM) the structure reads straight off the line. FREEDOM DiVE [ENDLESS
+DiMENSiONS] shows its jump passages and its long stream passage exactly where
+the map has them. This was picked by looking, not by taste.
+
+**Hybrid needs two things**, and the second is not optional:
+
+1. Streams own ≥ `hybrid_section_min` of the sections, and jumps own ≥ that too.
+2. They are BALANCED - the smaller owns ≥ `hybrid_balance_min` (0.5) of what
+   the larger does. Without this, a map with 61% jump sections against 19%
+   stream sections is called a "mix" at any flat threshold, when it is plainly
+   a jump map that has a stream section in it. On a 7,572-diff sample the
+   balance rule alone removes 240 such maps (765 → 525).
+
+Both patterns must also clear their own coverage bars (`has_streams` /
+`has_jumps`), so Hybrid never promotes a map on evidence too thin to count on
+its own. `hybrid_section_min` is one of the five knobs the sensitivity presets
+move: Stricter 0.25, Balanced 0.15, Looser 0.10.
+
+Measured over that sample: **525 diffs (6.9%) become Hybrid** - 346 from
+Streams, 174 from "Jumps with bursts", 5 from "Jumps (no bursts)".
+
 ### `category_of()` decision order
 
-Every pattern that clears its own presence bar enters ONE contest, and the
-highest coverage wins:
+Hybrid is checked first, because it is the one verdict the coverage contest
+structurally cannot reach - it is about *where* patterns sit, not how much
+there is of them. Everything else is one contest:
 
+0. `has_hybrid` (and streams and jumps both present) → **Hybrid**
 1. Rank `has_streams`/`has_bursts`/`has_jumps` by coverage; nothing present →
    **Misc**
 2. Streams win → **Streams**
@@ -551,6 +597,11 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `burst_beat_fraction_max` | 0.4 | slowest snap still counted as burst/stream tapping, as a fraction of a beat per note — admits 1/4 (0.25) and 1/3 (0.33), rejects 1/2 (0.5) |
 | `burst_always_fast_ms` | 110.0 | runs at or under this ms/note skip the beat-fraction check entirely — fast enough to be burst tapping whatever snap the file calls it |
 | `burst_max_gap_ms` | 105.0 | slowest ms/note a run may tap and still be a **burst** (≈143 BPM stream). Streams are deliberately unaffected |
+| `section_ms` | 2000.0 | length of one section, in ms — roughly two bars at 200 BPM |
+| `section_dominance` | 0.5 | share of a section one pattern must hold to own it |
+| `section_min_transitions` | 4 | fewest notes for a section to be counted at all |
+| `hybrid_section_min` | 0.15 | share of sections streams must own AND jumps must own for **Hybrid** |
+| `hybrid_balance_min` | 0.5 | how balanced that mix must be — smaller side / larger side |
 | `halved_quarter_share_min` | 0.15 | share of note gaps on the notated 1/4 before that layer counts as the map's backbone rather than accents — one of two content signals for halved-BPM authoring. No BPM threshold is involved |
 
 Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
