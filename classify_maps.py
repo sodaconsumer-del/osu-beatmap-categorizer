@@ -478,53 +478,84 @@ def is_junk_diff(diff):
 MIN_PLAUSIBLE_BEAT_MS = 100.0
 
 
-def effective_beat_ms(beat_ms, min_notated_bpm=125.0):
+def usable_beat_ms(beat_ms):
     """
-    Beat length in ms with halved-BPM notation folded back out.
+    `beat_ms` if it could be a real notated tempo, else 0.0 for "unknown".
 
-    A mapper is free to notate a song at half its real tempo - write 118 when
-    the song is really 236 - and osu! plays exactly the same either way, so
-    nothing in the file says which was meant. It matters here because
-    burst/stream detection asks "is this run faster than 1/2 snap?", and under
-    halved notation the run that a player feels as plain 1/2 tapping is
-    written as 1/4 and sails through.
-
-    Folding is one-directional: a too-LONG beat gets halved until the notated
-    tempo reaches min_notated_bpm, and a short one is left alone. Doubled
-    notation (a 90 BPM song written as 180) needs no correction, because the
-    absolute max_gap_ms gate judges the same milliseconds either way - it is
-    only the too-slow direction that lets a slow rhythm masquerade as a fast
-    snap. Halving a genuinely fast tempo would be actively harmful: a real
-    250 BPM map taps 1/1 at 240ms and 1/2 at 120ms, and folding it to 125
-    would turn that ordinary 1/2 into a "1/4 burst" - exactly the bug this
-    function exists to prevent.
-
-    The blast radius is small and worth stating: under a 140ms absolute cap,
-    the only maps whose 1/4 can be admitted at all sit at 107-125 notated BPM
-    (1/4 = 120-140ms). Below 107 the 1/4 is already too slow to count; at or
-    above 125 nothing is folded. So this only ever changes the verdict for
-    maps notated in that narrow band - which is precisely where halved
-    notation lives.
+    Callers skip any snap test rather than measure against a number that isn't
+    a tempo. A subnormal or negative beatLength is the parse-level corruption
+    test_tiny_beat_length_does_not_produce_infinite_bpm covers; anything under
+    MIN_PLAUSIBLE_BEAT_MS is a "tempo" no song has, so the safe reading is
+    that the timing data is junk - not that every run in the map is too slow.
     """
-    # 0.0 means "this file has no usable tempo" - callers skip the snap test
-    # rather than measure against a number that isn't one. A subnormal or
-    # negative beatLength is the parse-level corruption
-    # test_tiny_beat_length_does_not_produce_infinite_bpm covers; anything
-    # under MIN_PLAUSIBLE_BEAT_MS is a "tempo" no song has, so the safe
-    # reading is that the timing data is junk, not that every run in the map
-    # is too slow to be a burst.
-    if beat_ms < MIN_PLAUSIBLE_BEAT_MS or not math.isfinite(beat_ms):
+    if not math.isfinite(beat_ms) or beat_ms < MIN_PLAUSIBLE_BEAT_MS:
         return 0.0
-    if min_notated_bpm <= 0:
-        return beat_ms
-    longest = 60000.0 / min_notated_bpm
-    # Bounded rather than `while` - a pathological beat length would
-    # otherwise spin for hundreds of iterations before reaching the band.
-    for _ in range(8):
-        if beat_ms <= longest:
-            break
-        beat_ms /= 2.0
     return beat_ms
+
+
+def looks_like_halved_notation(objs, timing_points, burst_max_gap_ms=105.0,
+                                halved_quarter_share_min=0.15):
+    """
+    True if this map's stored tempo looks like HALVED notation - a song really
+    at 260 BPM written as 130, which osu! plays identically either way.
+
+    It matters because the snap test asks "is this run faster than 1/2?", and
+    under halved notation the plain 1/2 tapping a player feels is written as
+    1/4 and sails through.
+
+    Decided from the NOTES, not from a threshold on the stored BPM. Two
+    conditions, both required:
+
+      1. The notated 1/4 carries a WORKHORSE share of the map
+         (halved_quarter_share_min). In a correctly-notated map 1/4 is accent
+         content - bursts and streams - and stays a minority; under halved
+         notation the map's real 1/2 backbone lands there, so it dominates.
+      2. Most of that 1/4 layer is SLOWER than burst_max_gap_ms, i.e. too slow
+         to be genuine burst or stream content. This is what stops a real
+         stream map from being folded: a 180 BPM stream map is half 1/4 notes
+         too, but at 83ms each they are obviously real streaming, whereas a
+         130 BPM map's 1/4 is 115ms - not tapping anybody streams, so it is
+         far more likely to be a 260 BPM map's 1/2.
+
+    Condition 2 is deliberately derived from `burst_max_gap_ms` rather than
+    being its own invented number: the same "too slow to be burst content"
+    line, measured against 28 hand-labelled difficulties, does both jobs.
+
+    Measured on 35 difficulties with known notation (Chug Jug at 118 and the
+    11-diff MONTAGEM BATCHI set at 130, both halved; 23 correctly-notated maps
+    from 160 to 250): 33/35 correct. Both misses are BATCHI's Easy and Normal,
+    which contain no 1/4 content at all - there is nothing to detect, and
+    nothing for the fold to affect either, so they cost nothing.
+
+    Note this is a property of the MAPSET (its timing points), not the
+    difficulty - but each diff is judged alone, since classify_diff() never
+    sees its siblings. A quiet diff in a halved set may not look halved; that
+    is harmless for exactly the reason above.
+
+    Folds once, not repeatedly. Quartered notation is not a thing anyone does.
+    """
+    if not timing_points or len(objs) < 2:
+        return False
+    total = quarter = slow_quarter = 0
+    for i in range(1, len(objs)):
+        gap = objs[i][0] - objs[i - 1][0]
+        # Same break cap as elsewhere - a gap this long is a section boundary,
+        # not part of the map's rhythm.
+        if not (0 < gap <= 2000):
+            continue
+        total += 1
+        beat = usable_beat_ms(_beat_length_at(objs[i - 1][0], timing_points))
+        if not beat:
+            continue
+        # Per-transition local beat, so a map with BPM changes is measured
+        # against whatever tempo was actually in force at that point.
+        if abs(beat / gap - 4.0) / 4.0 < 0.08:
+            quarter += 1
+            if gap > burst_max_gap_ms:
+                slow_quarter += 1
+    if not total or quarter / total < halved_quarter_share_min:
+        return False
+    return slow_quarter * 2 > quarter
 
 
 def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
@@ -536,7 +567,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
                    cut_max_multiple=3.0, cut_max_dist_ratio=4.0,
                    burst_beat_fraction_max=0.4, burst_always_fast_ms=110.0,
-                   burst_max_gap_ms=105.0, min_notated_bpm=125.0, mods=None):
+                   burst_max_gap_ms=105.0, halved_quarter_share_min=0.15, mods=None):
     """
     Terminology (matching osu!'s official beatmap tags):
       - burst  : 3-9 note run. Three notes really is enough - short 3-note
@@ -661,6 +692,13 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         # file's own timing data (see AGENTS.md).
         overlapping = raw_move < 0
         transitions.append((tap_gap, move_time, dist, overlapping))
+
+    # Notation is a property of the whole map, so decide it once here rather
+    # than re-deriving it for every run. Uses raw (un-rate-adjusted) times
+    # deliberately: whether a mapper halved the tempo is a fact about the
+    # file, and DT doesn't change it.
+    halved_notation = looks_like_halved_notation(
+        objs, diff.timing_points, burst_max_gap_ms, halved_quarter_share_min)
 
     # --- jump density ------------------------------------------------------
     # Velocity is in diameters per 100ms. That unit is BPM-independent, which
@@ -817,9 +855,10 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         #     DOUBLED notation working: a 200 BPM song written as 400 taps its
         #     1/4 at 75ms, which the file calls a 1/2, and it sails through on
         #     speed alone exactly as it did before this gate existed.
-        #   - effective_beat_ms() folds HALVED notation back out before the
-        #     fraction is taken, which is the other direction and the one
-        #     speed can't rescue - see that function.
+        #   - HALVED notation is folded back out before the fraction is taken,
+        #     which is the other direction and the one speed can't rescue.
+        #     Whether a map is halved is decided from its own notes - see
+        #     looks_like_halved_notation(), computed once above.
         #
         # So the gate only decides runs in the 110-140ms band, which is
         # precisely the ambiguous stretch: too slow to be self-evidently a
@@ -831,8 +870,10 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         # to survive. Same exclusion, same reason, as the spacing checks above.
         run_gap = mean_gap(spacing)
         if run_gap > burst_always_fast_ms:
-            beat_ms = effective_beat_ms(
-                _beat_length_at(objs[run[0]][0], diff.timing_points), min_notated_bpm) / rate
+            beat_ms = usable_beat_ms(
+                _beat_length_at(objs[run[0]][0], diff.timing_points)) / rate
+            if halved_notation:
+                beat_ms /= 2.0
             if beat_ms > 0 and run_gap > beat_ms * burst_beat_fraction_max:
                 continue
         if burst_min <= length <= burst_max:
@@ -2222,9 +2263,11 @@ DEFAULT_PARAMS = dict(
     # stream. Measured over 28 hand-labelled difficulties: the ones with
     # bursts run 75-94ms per note, the ones without 115-134ms, no overlap.
     burst_max_gap_ms=105.0,
-    # Notated tempos below this are treated as halved notation and folded
-    # back up before the beat fraction is taken. See effective_beat_ms().
-    min_notated_bpm=125.0,
+    # Share of a map's note gaps that must sit on the notated 1/4 before that
+    # layer counts as the map's backbone rather than accent content - one of
+    # the two content signals that decide halved notation. There is
+    # deliberately no BPM threshold; see looks_like_halved_notation().
+    halved_quarter_share_min=0.15,
 )
 
 # Named starting points for the GUI's "Detection sensitivity" control, so the
@@ -2730,10 +2773,12 @@ def main():
                      help="Slowest ms-per-note a run may tap and still count as a burst. Streams are "
                           "not affected. Stops a slow song's honest 1/4 (120ms at 125 BPM) reading as "
                           "a burst when it is simply not fast enough to be one.")
-    ap.add_argument("--min-notated-bpm", type=float, default=DEFAULT_PARAMS["min_notated_bpm"],
-                     help="Tempos notated below this are treated as halved-BPM authoring and doubled back "
-                          "up before the beat-fraction check, so a 118 BPM file that plays at 236 is not "
-                          "credited with 1/4 bursts it does not have")
+    ap.add_argument("--halved-quarter-share-min", type=float,
+                     default=DEFAULT_PARAMS["halved_quarter_share_min"],
+                     help="Share of note gaps on the notated 1/4 before that layer is treated as the "
+                          "map's backbone rather than accents - one of two content signals used to spot "
+                          "halved-BPM authoring (a 130 BPM file that really plays at 260). No BPM "
+                          "threshold is involved; the notes decide.")
     ap.add_argument("--combine-jumps", action="store_true",
                      help="Also write a single \"Jumps\" collection containing every jump map, on top of "
                           "the separate \"Jumps with bursts\" and \"Jumps (no bursts)\" ones. Nothing is "

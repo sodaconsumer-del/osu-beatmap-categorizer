@@ -526,9 +526,11 @@ class ClassifierGUI(tk.Tk):
                 ("burst_always_fast_ms", "Always a burst at or below this speed",
                  "milliseconds per note. Below this it is burst tapping whatever snap the file calls "
                  "it - this is what keeps maps written at doubled BPM working."),
-                ("min_notated_bpm", "Treat tempos below this as halved notation",
-                 "BPM. A song written as 118 but played at 236 would otherwise be credited with 1/4 "
-                 "bursts it does not have."),
+                ("halved_quarter_share_min", "When 1/4 is this much of a map, read it as halved",
+                 "0.15 = 15% of note gaps. Some songs are written at half their real tempo (130 for a "
+                 "260 BPM song), which makes ordinary 1/2 tapping look like 1/4. The notes give it "
+                 "away: a real map uses 1/4 for bursts only, so a 1/4 layer this large - and too slow "
+                 "to be a burst - is really the 1/2 backbone."),
             ]),
             ("Run length - burst vs stream", [
                 ("burst_min", "Shortest run that counts as a burst",

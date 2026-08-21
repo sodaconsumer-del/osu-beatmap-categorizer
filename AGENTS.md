@@ -241,14 +241,11 @@ Decisions that look odd but aren't:
       400 taps its 1/4 at 75ms, the file calls that a 1/2, and it passes on
       speed alone exactly as it always did. `test_stored_bpm_does_not_affect_
       the_verdict` pins this.
-    - `effective_beat_ms()` folds **halved** notation back out before the
-      fraction is taken — the direction speed *can't* rescue, because halved
-      notation makes an ordinary 1/2 look like a 1/4. It only ever folds
-      downward (long beat → shorter), never the reverse: halving a genuine
-      250 BPM map would turn its real 1/2 (120ms) into a "1/4 burst", the
-      exact bug being fixed. Blast radius is small and bounded by the 140ms
-      cap — only maps notated at 107–125 BPM can have a 1/4 admitted at all,
-      which is precisely where halved notation lives.
+    - `looks_like_halved_notation()` folds **halved** notation back out before
+      the fraction is taken — the direction speed *can't* rescue, because
+      halved notation makes an ordinary 1/2 look like a 1/4. See its own
+      section below; the short version is that it reads the notes, not the
+      stored BPM.
   So the gate only ever decides runs in the 110–140ms band: too slow to be
   self-evidently burst tapping, fast enough to slip under the absolute cap.
 
@@ -514,13 +511,70 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `burst_beat_fraction_max` | 0.4 | slowest snap still counted as burst/stream tapping, as a fraction of a beat per note — admits 1/4 (0.25) and 1/3 (0.33), rejects 1/2 (0.5) |
 | `burst_always_fast_ms` | 110.0 | runs at or under this ms/note skip the beat-fraction check entirely — fast enough to be burst tapping whatever snap the file calls it |
 | `burst_max_gap_ms` | 105.0 | slowest ms/note a run may tap and still be a **burst** (≈143 BPM stream). Streams are deliberately unaffected |
-| `min_notated_bpm` | 125.0 | tempos notated below this are treated as halved-BPM authoring and doubled back up before the beat fraction is taken |
+| `halved_quarter_share_min` | 0.15 | share of note gaps on the notated 1/4 before that layer counts as the map's backbone rather than accents — one of two content signals for halved-BPM authoring. No BPM threshold is involved |
 
 Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
 `category_of()` parameter, not a `classify_diff()` one, since it operates on
 already-computed run lengths). `INT_PARAMS` in `classify_maps.py` lists which
 of the above must parse as `int` rather than `float` when read from CLI/GUI
 text: `burst_min`, `burst_max`, `stream_min`, `jump_min_transitions`.
+
+### Detecting halved-BPM notation
+
+A mapper may notate a song at half its real tempo - 130 for a 260 BPM song -
+and osu! plays it identically either way, so nothing in the file declares
+which was meant. It matters because the snap test asks "is this faster than
+1/2?", and under halved notation ordinary 1/2 tapping is written as 1/4.
+
+`looks_like_halved_notation()` decides this **from the notes**. An earlier
+version used a threshold on the stored BPM (`min_notated_bpm = 125`, fold
+anything slower). That was wrong on both counts:
+
+- **Arbitrary.** MONTAGEM BATCHI is notated 130 and *is* halved (it plays as a
+  ~260 BPM jump map) - five BPM the wrong side of the line, so it was missed.
+  Nudging the threshold up to catch it would have started folding correctly
+  notated maps instead.
+- **It ignored the evidence sitting right there.** The note timings say a
+  great deal about which reading is right.
+
+Two conditions, both required:
+
+1. **The notated 1/4 carries a workhorse share of the map**
+   (`halved_quarter_share_min`, 0.15). In a correctly-notated map 1/4 is
+   accent content - bursts and streams - and stays a minority. Under halved
+   notation the map's real 1/2 backbone lands there and dominates.
+2. **Most of that 1/4 layer is slower than `burst_max_gap_ms`** - too slow to
+   be genuine burst or stream content. This is what protects real stream
+   maps: a 180 BPM stream map is also half 1/4 notes, but at 83ms each that
+   is obviously streaming, whereas a 130 BPM map's 1/4 is 115ms, which nobody
+   streams - so it is far more likely to be a 260 BPM map's 1/2.
+
+Condition 2 is deliberately *derived* from `burst_max_gap_ms` rather than
+being another invented number: the same measured "too slow to be burst
+content" line does both jobs.
+
+Measured on 35 difficulties with known notation - Chug Jug (118) and the
+11-diff MONTAGEM BATCHI set (130), both halved, against 23 correctly-notated
+maps from 160 to 250 BPM - **33/35, with no real misses**. The two are
+BATCHI's Easy and Normal, which contain no 1/4 content at all: there is
+nothing to detect, and equally nothing for the fold to affect, so they cost
+nothing.
+
+Two caveats worth knowing:
+
+- Notation is a property of the **mapset** (its timing points), but each diff
+  is judged alone, because `classify_diff()` never sees its siblings. A quiet
+  diff in a halved set may not read as halved - harmless, per above.
+- The residual risk is a genuinely slow *stream* map: something notated around
+  110-140 BPM whose 1/4 is both a large share and slower than 105ms. Condition
+  2 cannot tell that from halved notation, because at that point the two are
+  the same thing physically. No map in the labelled set is like this.
+
+If you are tempted to replace this with a tempo-detection library: the 2x
+ambiguity is the classic octave-error problem, and halving maps 1/2 onto 1/1,
+both of which are perfectly normal primary layers. The signal that works here
+is not "what is the tempo" but "is the 1/4 layer doing a job only a 1/2 layer
+would do".
 
 ### Sensitivity presets
 

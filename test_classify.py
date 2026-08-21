@@ -175,13 +175,22 @@ def test_the_same_pattern_a_bit_faster_is_a_burst():
 
 def test_the_burst_speed_cap_does_not_touch_streams():
     # burst_max_gap_ms is deliberately scoped to bursts. A sustained run at
-    # the same 120ms that fails as a burst above must still register as a
-    # stream, because lowering max_gap_ms instead would have silently stopped
-    # calling ~130 BPM stream maps streams - a change no label here supports.
-    d = build(circles(20, step=120, dx=8), bl=480.0)
+    # 120ms - too slow to be a burst - must still register as a stream,
+    # because lowering max_gap_ms instead would have silently stopped calling
+    # ~130 BPM stream maps streams, a change no label here supports.
+    #
+    # The 1/2 filler matters: without it the map is 100% notated 1/4 at a
+    # too-slow speed, which is precisely the halved-notation signature, and
+    # the run would (correctly) be re-read as 1/2 tapping. Here the 1/4 layer
+    # is a minority, so the stated 125 BPM is taken at face value.
+    filler = [f"{60 + (i % 8) * 40},80,{1000 + i * 240},1,0" for i in range(140)]
+    stream = [f"{100 + i * 8},250,{40000 + i * 120},1,0" for i in range(20)]
+    d = build(filler + stream, bl=480.0)
     cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert not cm.looks_like_halved_notation(d.objs, d.timing_points, 105.0, 0.15)
     assert d.stream_count == 1
     assert d.max_stream_len == 20
+    assert d.burst_count == 0, "120ms is still too slow to be a burst"
 
 
 def test_halved_bpm_notation_does_not_manufacture_bursts():
@@ -213,8 +222,8 @@ def test_corrupt_timing_does_not_suppress_every_run():
     # effective_beat_ms reports "no usable tempo" (0.0) below
     # MIN_PLAUSIBLE_BEAT_MS instead, and the gate stands down rather than
     # measuring against a number that isn't a tempo.
-    assert cm.effective_beat_ms(1e-320) == 0.0
-    assert cm.effective_beat_ms(float("inf")) == 0.0
+    assert cm.usable_beat_ms(1e-320) == 0.0
+    assert cm.usable_beat_ms(float("inf")) == 0.0
     # 88ms so the burst speed cap isn't what rejects it - this is testing the
     # timing-corruption path, not burst_max_gap_ms.
     filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
@@ -223,13 +232,53 @@ def test_corrupt_timing_does_not_suppress_every_run():
     assert d.has_bursts
 
 
-def test_the_fold_only_ever_shortens_a_beat():
-    # Halving a genuinely fast tempo would turn a real 250 BPM map's ordinary
-    # 1/2 (120ms) into a "1/4 burst" - the exact bug the fold exists to stop.
-    assert cm.effective_beat_ms(240.0) == 240.0     # 250 BPM, left alone
-    assert cm.effective_beat_ms(150.0) == 150.0     # 400 BPM, left alone
-    assert cm.effective_beat_ms(508.47) == 508.47 / 2   # 118 BPM -> 236
-    assert cm.effective_beat_ms(1000.0) == 250.0        # 60 BPM -> 240, folded twice
+def test_halved_notation_is_decided_by_the_notes_not_the_stored_bpm():
+    # Two conditions, both needed. Neither is a threshold on the stored BPM -
+    # an earlier version used one (min_notated_bpm=125) and it was both
+    # arbitrary and wrong: MONTAGEM BATCHI is notated 130 and IS halved, five
+    # BPM from the line, while a correctly-notated 120 BPM map would have been
+    # folded by mistake.
+    def halved(lines, bl):
+        d = build(lines, bl=bl)
+        return cm.looks_like_halved_notation(d.objs, d.timing_points, 105.0, 0.15)
+
+    # 130 BPM (461.5ms beat) tapping its notated 1/4 at 115ms, wall to wall:
+    # too slow to be streaming, and far too much of the map to be accents.
+    # That is a 260 BPM map's 1/2. (This is literally BATCHI's shape.)
+    assert halved(circles(40, step=115, dx=40), 461.5)
+
+    # 190 BPM (315.8ms beat) with the same wall-to-wall 1/4, but at 79ms -
+    # that IS streaming, so the tempo is taken at face value. This is the case
+    # a bare BPM threshold cannot tell apart from the one above without also
+    # ruining every real stream map.
+    assert not halved(circles(40, step=79, dx=8), 315.8)
+
+    # 125 BPM with only a little 1/4 (one 4-note burst among 1/2 tapping):
+    # accent content, not a backbone, so nothing is folded.
+    slow = [f"{100 + i * 30},100,{1000 + i * 240},1,0" for i in range(30)]
+    burst = [f"{100 + i * 8},200,{9000 + i * 120},1,0" for i in range(4)]
+    assert not halved(slow + burst, 480.0)
+
+
+def test_halved_notation_needs_both_signals():
+    # Share alone would fold a real stream map; slowness alone would fold a
+    # quiet slow map whose only 1/4 is a stray burst. Each condition has to be
+    # doing work the other cannot, so flipping either one off must un-fold it.
+    #
+    # 130 BPM, half the map on the notated 1/4 (115ms) and half on 1/2 (230ms).
+    # The two sections are far enough apart that the gap between them is a
+    # break and is excluded, so the share is a clean 50%.
+    quarters = [f"{40 + i * 10},100,{1000 + i * 115},1,0" for i in range(20)]
+    halves = [f"{40 + i * 10},300,{10000 + i * 230},1,0" for i in range(20)]
+    d = build(quarters + halves, bl=461.5)
+
+    assert cm.looks_like_halved_notation(d.objs, d.timing_points, 105.0, 0.15)
+    # Demand the 1/4 layer be 80% of the map, more than this one is -> the
+    # "backbone, not accents" condition now fails, so no fold.
+    assert not cm.looks_like_halved_notation(d.objs, d.timing_points, 105.0, 0.80)
+    # Or say 115ms is fast enough to be a burst -> the "too slow to be real
+    # burst content" condition fails instead, and again no fold.
+    assert not cm.looks_like_halved_notation(d.objs, d.timing_points, 200.0, 0.15)
 
 
 def test_sub_floor_diffs_are_not_classified_at_all():
