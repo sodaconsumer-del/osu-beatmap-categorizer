@@ -117,6 +117,20 @@ class DiffInfo:
     # instead of notes vs transitions - see category_of()'s docstring.
     counted_gaps: int = 0
 
+    # How those counted_gaps transitions divide up. A PARTITION: each gameplay
+    # transition is described by exactly one of these (or by none, if it is
+    # neither run content nor a jump - ordinary spaced tapping), so the three
+    # are directly comparable and sum to at most counted_gaps.
+    #
+    # These replace deriving burst/stream coverage from note counts. A run of
+    # N notes is N-1 transitions, so the old conversion was arithmetically
+    # exact - what it could not express is that two passes might both claim
+    # the same transition. Kept alongside the note totals rather than
+    # replacing them, because report.csv and --from-csv still carry those.
+    burst_transitions: int = 0
+    stream_transitions: int = 0
+    jump_transitions: int = 0
+
     # multi-label - a diff can be any combination of these, not mutually exclusive
     has_bursts: bool = False
     has_streams: bool = False
@@ -700,32 +714,19 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     halved_notation = looks_like_halved_notation(
         objs, diff.timing_points, burst_max_gap_ms, halved_quarter_share_min)
 
-    # --- jump density ------------------------------------------------------
-    # Velocity is in diameters per 100ms. That unit is BPM-independent, which
-    # is the whole point; note it is NOT the old diameters-per-beat, so the
-    # default threshold was re-derived rather than carried over.
-    jump_count = 0
-    counted_gaps = 0
-    for tap_gap, move_time, dist, overlapping in transitions:
-        # Gaps longer than the cap are breaks and section boundaries, not
-        # gameplay. Leaving them in the denominator quietly diluted dense
-        # maps and inflated sparse ones.
-        if tap_gap > jump_gap_cap_ms:
-            continue
-        # A temporally overlapping transition (see above) has no meaningful
-        # velocity to measure - excluded the same way breaks are, rather
-        # than let the floor manufacture a jump out of it.
-        if overlapping:
-            continue
-        counted_gaps += 1
-        norm_dist = dist / diam
-        # Require BOTH genuinely far spacing AND a high distance/time ratio.
-        # Velocity alone isn't enough: a legitimate tight stream has a tiny
-        # time-per-note by definition, which inflates distance/time even when
-        # the actual spacing is small - that was causing real streams to get
-        # flagged as mostly jumps.
-        if dist > diam * spaced_diam_ratio and (norm_dist / (move_time / 100.0)) > jump_velocity_ratio:
-            jump_count += 1
+    # --- which transitions are gameplay at all ------------------------------
+    # Gaps longer than the cap are breaks and section boundaries, not
+    # gameplay; leaving them in the denominator quietly diluted dense maps and
+    # inflated sparse ones. A temporally overlapping transition (see above)
+    # has no meaningful velocity to measure, so it's excluded the same way
+    # rather than letting the 1ms floor manufacture a jump out of it.
+    #
+    # This set is the denominator every coverage figure is measured against,
+    # and - since the run classification below partitions it - the thing that
+    # makes those figures comparable to each other.
+    eligible = [i for i, (tap_gap, _, _, overlapping) in enumerate(transitions)
+                if tap_gap <= jump_gap_cap_ms and not overlapping]
+    counted_gaps = len(eligible)
 
     # --- run building: fast AND rhythmically consistent ---------------------
     raw_runs = []
@@ -805,6 +806,13 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     bursts = []
     streams = []
     cutstreams = 0
+    # Transition indices claimed by a burst or a stream run. Everything the
+    # runs don't claim is offered to the jump test below, so each gameplay
+    # transition ends up described exactly once instead of by two independent
+    # passes that could both count it. See "one transition, one label" in
+    # AGENTS.md.
+    claimed_burst = set()
+    claimed_stream = set()
     for run, cuts in merged_runs:
         length = len(run) + 1  # transitions -> note count
         if length < burst_min:
@@ -903,14 +911,54 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
             if run_gap > burst_max_gap_ms:
                 continue
             bursts.append(length)
+            claimed_burst.update(run)
         elif length >= stream_min:
             streams.append(length)
+            claimed_stream.update(run)
             # A cutstream is now literally a stream that was cut - i.e. one
             # we had to rejoin across a skipped beat. The previous definition
             # keyed on spacing variation instead, which is a different
             # property wearing the same name.
             if cuts:
                 cutstreams += 1
+
+    # --- jump density, over what the runs did NOT claim ---------------------
+    # Velocity is in diameters per 100ms. That unit is BPM-independent, which
+    # is the whole point; note it is NOT the old diameters-per-beat, so the
+    # default threshold was re-derived rather than carried over.
+    #
+    # Runs are evaluated first and win ties by construction: a transition
+    # inside a run that survived every spacing check is stream/burst content,
+    # and shouldn't also be counted as a jump. In practice the two rarely
+    # disagree - a surviving run averages under mean_diam_ratio_max while the
+    # jump test needs more than spaced_diam_ratio - but "rarely" was doing
+    # load-bearing work in a comparison that is supposed to be between
+    # mutually exclusive alternatives, and now it isn't.
+    #
+    # A run REJECTED for being too jump-spaced isn't discarded either: its
+    # transitions land here, and the wide ones are counted as the jumps they
+    # are. That is the evidence that used to vanish.
+    jump_count = 0
+    for i in eligible:
+        if i in claimed_burst or i in claimed_stream:
+            continue
+        _, move_time, dist, _ = transitions[i]
+        norm_dist = dist / diam
+        # Require BOTH genuinely far spacing AND a high distance/time ratio.
+        # Velocity alone isn't enough: a legitimate tight stream has a tiny
+        # time-per-note by definition, which inflates distance/time even when
+        # the actual spacing is small - that was causing real streams to get
+        # flagged as mostly jumps.
+        if dist > diam * spaced_diam_ratio and (norm_dist / (move_time / 100.0)) > jump_velocity_ratio:
+            jump_count += 1
+
+    # Coverage, all three on the one basis that makes them comparable: share
+    # of gameplay transitions. These partition `eligible`, so they sum to at
+    # most 1.0 and can be compared directly rather than pairwise-and-ordered.
+    eligible_set = set(eligible)
+    diff.burst_transitions = len(claimed_burst & eligible_set)
+    diff.stream_transitions = len(claimed_stream & eligible_set)
+    diff.jump_transitions = jump_count
 
     diff.burst_count = len(bursts)
     diff.stream_count = len(streams)
@@ -1918,7 +1966,7 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
                  burst_note_total=0, total_note_count=0, jump_pct=0.0,
                  stream_note_total=0, stream_run_count=0, max_stream_len=0,
                  burst_promote_stream_len=12, burst_run_count=0, counted_gaps=0,
-                 burst_recurrence_min=1):
+                 burst_recurrence_min=1, burst_transitions=None, stream_transitions=None):
     """
     The one place the dominant-pattern rules live.
 
@@ -1993,6 +2041,8 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
     real zero-run map already has has_bursts == False, so this gate would
     never have mattered for it anyway.
     """
+    # burst_transitions/stream_transitions are the exact partition counts when
+    # the caller has them; None means "derive them the old way" - see below.
     if hasattr(has_streams, "has_streams"):
         d = has_streams
         has_streams, has_bursts, has_jumps = d.has_streams, d.has_bursts, d.has_jumps
@@ -2003,14 +2053,22 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
         max_stream_len = d.max_stream_len
         burst_run_count = d.burst_count
         counted_gaps = d.counted_gaps
+        burst_transitions = d.burst_transitions
+        stream_transitions = d.stream_transitions
 
     if burst_run_count and burst_run_count < burst_recurrence_min:
         has_bursts = False
 
     jump_coverage = jump_pct / 100.0
     if counted_gaps:
-        stream_transitions = max(0, stream_note_total - stream_run_count)
-        burst_transitions = max(0, burst_note_total - burst_run_count)
+        if burst_transitions is None:
+            # Raw-args or old-CSV path: recover the transition counts from the
+            # note totals. A run of N notes is N-1 transitions, so this is
+            # arithmetically exact and agrees with the measured partition on
+            # every diff checked - it just can't notice if two passes claimed
+            # the same transition, which is what the partition exists to stop.
+            stream_transitions = max(0, stream_note_total - stream_run_count)
+            burst_transitions = max(0, burst_note_total - burst_run_count)
         stream_coverage = stream_transitions / counted_gaps
         burst_coverage = burst_transitions / counted_gaps
     else:
@@ -2041,22 +2099,46 @@ def category_of(has_streams, has_bursts=None, has_jumps=None,
         real_stream = stream_run_count > 0 and max_stream_len >= burst_promote_stream_len
         return "Streams" if real_stream else "Bursts"
 
-    if has_streams and (not has_jumps or stream_coverage >= jump_coverage):
-        return "Streams"
-    # Streams present but out-covered by jumps: this is a jump map that
-    # happens to contain a stream, so it falls through to be judged on its
-    # jump and burst content like any other jump map.
-    if has_jumps and has_bursts:
-        return "Jumps with bursts" if jump_coverage > burst_coverage else burst_or_stream()
-    if has_bursts:
-        return burst_or_stream()
-    if has_jumps:
-        return "Jumps (no bursts)"
+    # --- one contest, not a chain of pairwise ones -------------------------
+    # This used to be an ordered cascade: streams-vs-jumps first, then
+    # jumps-vs-bursts, then whatever was left. Two problems with that shape.
+    #
+    # Streams and bursts never met. A map where bursts out-covered streams,
+    # and streams out-covered jumps, was called a stream map on the strength
+    # of the first comparison it happened to reach - the burst evidence was
+    # never weighed against it at all.
+    #
+    # And order stood in for strength. Whichever pattern got compared first
+    # had an advantage that had nothing to do with how much of the map it
+    # actually occupied.
+    #
+    # All three coverages are now measured on one basis and partition the same
+    # denominator (see burst_transitions/stream_transitions/jump_transitions),
+    # so they can simply be ranked. Only patterns that cleared their own
+    # presence bar are entered - a pattern that isn't really there doesn't get
+    # to win by being marginally less absent than the others.
+    #
+    # Ties keep the old cascade's outcome: it awarded a stream-vs-jump tie to
+    # streams (>=) and a burst-vs-jump tie to bursts (jumps needed a strict >).
+    # Hence the priority below, which only ever breaks exact ties.
+    contenders = []
     if has_streams:
-        # Has a stream, no jumps to lose to, but didn't take the branch above
-        # (only reachable if total_note_count is zero/unknown).
+        contenders.append((stream_coverage, 3, "stream"))
+    if has_bursts:
+        contenders.append((burst_coverage, 2, "burst"))
+    if has_jumps:
+        contenders.append((jump_coverage, 1, "jump"))
+    if not contenders:
+        return "Misc"
+
+    winner = max(contenders)[2]
+    if winner == "stream":
         return "Streams"
-    return "Misc"
+    if winner == "burst":
+        return burst_or_stream()
+    # Jumps own the map. Bursts alongside them are secondary content, not the
+    # map's character - which is the distinction the two jump categories draw.
+    return "Jumps with bursts" if has_bursts else "Jumps (no bursts)"
 
 
 def derive_collections(diffs):
@@ -2491,6 +2573,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
                             "max_stream_len", "jump_pct", "burst_note_total", "stream_note_total",
                             "total_note_count", "counted_gaps",
+                            "burst_transitions", "stream_transitions", "jump_transitions",
                             "ranked_status", "star_rating", "online_id", "mods", "category", "path"])
                 def safe_round(x, ndigits=None):
                     # round() raises OverflowError on inf and ValueError on
@@ -2505,6 +2588,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                                 d.burst_count, d.stream_count, d.cutstream_count, d.max_burst_len,
                                 d.max_stream_len, safe_round(d.jump_pct, 1), d.burst_note_total,
                                 d.stream_note_total, d.total_note_count, d.counted_gaps,
+                                d.burst_transitions, d.stream_transitions, d.jump_transitions,
                                 d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown",
                                 d.online_id if d.online_id is not None else "unknown", mods_str,
                                 category_of(d), d.path])
@@ -2611,11 +2695,22 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                     # (counted_gaps=0 there means "unknown, use the old way").
                     burst_runs = int(row.get("burst_runs") or 0)
                     counted_gaps = int(row.get("counted_gaps") or 0)
+                    # Exact partition counts, written since the run-partition
+                    # change. Absent in older CSVs, where None makes
+                    # category_of derive them from the note totals instead -
+                    # the two agree except when a run contains a transition
+                    # that was excluded from the denominator (an
+                    # overlapping-slider one), which the derivation can't see.
+                    bt = row.get("burst_transitions")
+                    st = row.get("stream_transitions")
+                    burst_tr = int(bt) if bt not in (None, "") else None
+                    stream_tr = int(st) if st not in (None, "") else None
                 except ValueError:
                     burst_note_total = stream_note_total = total_note_count = 0
                     stream_runs = max_stream_len = 0
                     jump_pct = 0.0
                     burst_runs = counted_gaps = 0
+                    burst_tr = stream_tr = None
                 category = category_of(
                     row.get("has_streams") == "True",
                     row.get("has_bursts") == "True",
@@ -2623,6 +2718,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                     burst_note_total, total_note_count, jump_pct, stream_note_total,
                     stream_runs, max_stream_len,
                     burst_run_count=burst_runs, counted_gaps=counted_gaps,
+                    burst_transitions=burst_tr, stream_transitions=stream_tr,
                 )
             groups[category].append(entry)
 

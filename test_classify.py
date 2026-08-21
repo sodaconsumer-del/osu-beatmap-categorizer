@@ -700,6 +700,72 @@ def test_split_puts_loved_on_the_unranked_side():
     assert [d.ranked_status for d in out["Streams - Unranked"]] == ["loved"]
 
 
+# --- one transition, one label ---------------------------------------------
+
+def test_the_three_coverages_partition_the_same_denominator():
+    # burst/stream/jump coverage are compared against each other, so they have
+    # to be measured on one basis and must not overlap. Previously the run
+    # pass and the jump pass ran independently and could both claim the same
+    # transition; now the runs claim first and the jump test sees the rest.
+    lines = (circles(14, t0=1000, step=75, x0=100, dx=8)          # a stream
+             + circles(4, t0=4000, step=75, x0=60, dx=6)          # a burst
+             + [f"{40 + (i % 2) * 400},90,{6000 + i * 300},1,0"   # wide jumps
+                for i in range(30)])
+    d = classify(lines)
+    total = d.burst_transitions + d.stream_transitions + d.jump_transitions
+    assert total <= d.counted_gaps, (total, d.counted_gaps)
+    assert d.stream_transitions > 0 and d.jump_transitions > 0
+
+
+def test_a_transition_inside_a_run_is_not_also_counted_as_a_jump():
+    # A tight stream's transitions belong to the stream, full stop. If the
+    # jump pass could also count them the two coverages would be comparing
+    # overlapping evidence, and "which pattern owns this map" stops meaning
+    # anything.
+    d = classify(circles(30, step=75, dx=8))
+    assert d.stream_transitions == 29
+    assert d.jump_transitions == 0
+    assert d.jump_pct == 0.0
+
+
+def test_a_run_rejected_as_too_wide_still_counts_as_jump_evidence():
+    # A fast but full-screen-spaced run is not a burst - but it is not nothing
+    # either. Its transitions used to be dropped on the floor; they should
+    # land in the jump bucket, which is what they are.
+    lines = [f"{40 + (i % 2) * 420},{90 + (i % 2) * 200},{1000 + i * 130},1,0"
+             for i in range(60)]
+    d = classify(lines)
+    assert d.burst_count == 0, "full-screen spacing is not a burst"
+    assert d.stream_count == 0
+    assert d.jump_transitions > 40, d.jump_transitions
+    assert d.has_jumps
+
+
+def test_the_category_is_one_contest_not_an_ordered_chain():
+    # Bursts cover 40% of this map, streams 20%, and there are no jumps. The
+    # old cascade compared streams first, found nothing to lose to, and
+    # returned Streams without ever weighing the burst evidence - order stood
+    # in for strength. Ranking all three coverages together gives the honest
+    # answer.
+    cat = cm.category_of(
+        True, True, False,          # has_streams, has_bursts, has_jumps
+        48, 200, 0.0,               # burst_note_total, total_note_count, jump_pct
+        21, 1, 10,                  # stream_note_total, stream_run_count, max_stream_len
+        burst_run_count=8, counted_gaps=100,
+    )
+    assert cat == "Bursts", cat
+
+
+def test_ties_still_resolve_the_way_the_old_cascade_did():
+    # The cascade gave a stream-vs-jump tie to streams (>=) and a
+    # burst-vs-jump tie to bursts (jumps needed a strict >). Ranking must not
+    # quietly flip either of those.
+    assert cm.category_of(True, False, True, 0, 100, 20.0, 21, 1, 30,
+                          counted_gaps=100) == "Streams"
+    assert cm.category_of(False, True, True, 28, 100, 20.0, 0, 0, 0,
+                          burst_run_count=8, counted_gaps=100) == "Bursts"
+
+
 # --- sensitivity presets ---------------------------------------------------
 
 def test_balanced_preset_is_exactly_the_defaults():

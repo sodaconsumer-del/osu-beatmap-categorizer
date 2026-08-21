@@ -454,36 +454,76 @@ live path and the `--from-csv` rebuild go through it — they used to carry
 separate copies that could drift. `--from-csv` reproducing a byte-identical
 `collection.db` is a good regression check.
 
+### One transition, one label
+
+Every gameplay transition (i.e. every one in `counted_gaps`) is described by
+at most ONE of burst, stream or jump. `classify_diff()` classifies runs
+first; whatever the runs don't claim is then offered to the jump test.
+`burst_transitions` / `stream_transitions` / `jump_transitions` are the
+result, and because they partition one denominator they can be compared
+directly.
+
+This was not always true, and the bug was not theoretical. The run pass and
+the jump pass used to run independently over all transitions, so a note
+inside a perfectly good stream could also be counted as a jump - and then
+stream coverage and jump coverage, which exist to be weighed against each
+other, were partly measuring the same notes. Measured over 870 real diffs:
+**41% had at least one double-counted transition**, inflating `jump_pct` by
+up to 9.3 percentage points (Ember Lights: 43.0% → 33.7%). It biased every
+streams-vs-jumps comparison toward jumps, in proportion to how much stream
+content the map had.
+
+A run REJECTED for being too jump-spaced is not discarded either: its
+transitions fall through to the jump test and the wide ones are counted as
+the jumps they are. Evidence changes hands instead of evaporating.
+
+The note-count fields (`burst_note_total` etc.) are still written, and
+`category_of()` still derives transition counts from them when given raw
+arguments or an old CSV. That derivation is arithmetically exact (a run of N
+notes is N-1 transitions) - what it cannot express is two passes claiming the
+same transition, which is the thing the partition fixes.
+
 ### `category_of()` decision order
 
-Evaluated top to bottom, first match wins:
+Every pattern that clears its own presence bar enters ONE contest, and the
+highest coverage wins:
 
-1. `has_streams` AND (no jumps, OR stream coverage ≥ jump coverage) → **Streams**
-2. Jumps and bursts both present → jump coverage > burst coverage ?
-   **Jumps with bursts** : `burst_or_stream()` (see 5)
-3. Bursts present (no jumps) → `burst_or_stream()` (see 5)
-4. Jumps present (no bursts) → **Jumps (no bursts)**
+1. Rank `has_streams`/`has_bursts`/`has_jumps` by coverage; nothing present →
+   **Misc**
+2. Streams win → **Streams**
+3. Bursts win → `burst_or_stream()` (see 5)
+4. Jumps win → **Jumps with bursts** if bursts are also present, else
+   **Jumps (no bursts)**
 5. `burst_or_stream()`: a run ≥ `burst_promote_stream_len` (12) exists →
    **Streams**, else **Bursts**
-6. Nothing matched → **Misc**
 
-`has_streams` itself already requires ≥15% coverage (`stream_pct_threshold`) —
-it is not raw presence. So a map can contain a 10-note stream run and still
-have `has_streams == False` if that run is a small fraction of the map; it
-only shows up via step 5's `burst_promote_stream_len` check, which looks at
-`max_stream_len` directly rather than coverage. This is deliberate — see
-"Except: a burst map that streams once" above.
+Ties go stream > burst > jump, which is exactly what the old ordered cascade
+did (it gave a stream-vs-jump tie to streams with `>=`, and a burst-vs-jump
+tie to bursts by making jumps need a strict `>`), so ranking changes nothing
+about ties.
 
-**Coverage comparisons (steps 1 and 2) use TRANSITIONS as the common basis**,
-not notes, when `counted_gaps` is available (always true for a real scan;
-only unavailable when rebuilding from a CSV written before this field
-existed). `jump_pct` was always transitions-based; stream/burst coverage
-used to be notes-based, which isn't the same thing being measured twice - a
-run of N notes is N-1 transitions, so `stream_note_total`/`burst_note_total`
-are converted (`- stream_run_count`/`- burst_run_count`) before dividing by
-`counted_gaps`, matching exactly how `jump_pct` itself was computed. See
-"Jump vs. stream coverage" under Known limitations for why this mattered in
-practice, not just in principle.
+**This replaced an ordered chain of pairwise comparisons**, which had two
+faults. Streams and bursts were never compared at all - a map where bursts
+out-covered streams, and streams out-covered jumps, was called a stream map
+on the strength of the first comparison it happened to reach. And order stood
+in for strength: whichever pattern got compared first had an advantage
+unrelated to how much of the map it occupied.
+
+`has_streams` requires ≥15% coverage (`stream_pct_threshold`) — it is not raw
+presence. A map can contain a 10-note stream run and still have
+`has_streams == False`; it then only shows up via step 5's
+`burst_promote_stream_len` check, which reads `max_stream_len` directly
+rather than coverage. Deliberate — see "Except: a burst map that streams
+once" above. Note this leaves the three presence bars asymmetric
+(`has_bursts` is pure presence, `has_jumps` needs 15% *and* 40 transitions),
+which is a known wart, not a design.
+
+Measured effect of the partition and the contest together, over a 7,572-diff
+sample: **50 diffs change category (0.66%)** — 42 "Jumps with bursts" →
+"Streams" and 7 → "Bursts" (both from jump coverage no longer being inflated
+by double-counted run transitions), and 1 "Streams" → "Bursts" (the
+three-way contest, on a map where bursts covered 41% against streams' 25%).
+The 24-map reference set and the 28 burst labels are unchanged.
 
 ### `DEFAULT_PARAMS` reference
 
@@ -670,6 +710,12 @@ spacing-based can tell the difference.
 burst_runs, stream_runs, cutstream_runs, max_burst_len, max_stream_len,
 jump_pct, burst_note_total, stream_note_total, total_note_count, counted_gaps,
 ranked_status, star_rating, online_id, mods, category, path`
+
+`burst_transitions` / `stream_transitions` / `jump_transitions` are the
+partition described under "One transition, one label" — written so a
+`--from-csv` rebuild gets the exact counts rather than re-deriving them.
+Absent in older CSVs, where `category_of()` falls back to the note-total
+derivation automatically.
 
 `counted_gaps` (new on this branch) is jump_pct's own denominator, carried
 through so a `--from-csv` rebuild can use the same transitions-basis
