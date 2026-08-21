@@ -48,8 +48,9 @@ is a burst.
 Spacing is measured from the previous object's END, so a long slider whose
 tail sits next to the following note isn't mistaken for a full-screen jump.
 
-Pass --mods DT / --mods HR,DT to classify as if those mods were active. NM
-is the baseline.
+Classification is NM-only. Mod support was removed deliberately - see
+"NM only" in AGENTS.md; mod_adjustments() is kept because osu_visualizer.py
+still needs it, and so restoring this is a small job.
 
 Accuracy is measurable rather than a matter of taste - see eval_classifier.py,
 which scores a report.csv against hand-labelled maps. Run test_classify.py for
@@ -573,6 +574,77 @@ def section_pattern_counts(objs, eligible, label, section_ms=2000.0,
     return active, streams, bursts, jumps
 
 
+def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
+                                 doubled_half_share_min=0.25,
+                                 max_plausible_bpm=300.0):
+    """
+    True if this map's stored tempo looks like DOUBLED notation - a song
+    really at 180 BPM written as 360.
+
+    The mirror of looks_like_halved_notation(), needed for the same reason
+    pointing the other way: the snap test asks "is this faster than 1/2?", and
+    under doubled notation the 1/4 a player actually feels is written as a
+    1/2, so a real burst reads as ordinary tapping and is thrown away.
+
+    Two conditions, both from the notes:
+
+      1. The NOTATED TEMPO exceeds max_plausible_bpm. Decisive, and read off
+         the timing points rather than the notes on purpose: notation is a
+         property of the MAPSET, so every difficulty in it must get the same
+         answer. Content alone does not do that. Across the eight difficulties
+         of "Flowering Night Fever" (a real 290 BPM map) the quiet ones carry
+         no 1/4 at all, so they look exactly like doubled notation while their
+         harder siblings do not - three of the eight flipped, inflating their
+         burst counts. A tempo bound is shared by construction.
+      2. The notated 1/2 is a workhorse layer (doubled_half_share_min) AND is
+         mostly faster than burst_max_gap_ms - tapped at speeds no real 1/2
+         reaches. Same derived threshold the halved detector uses.
+      3. The notated 1/4 is essentially absent - under doubled notation it
+         would be a real 1/8, which practically nothing writes. Supporting
+         evidence only; on its own it is what misfires above.
+
+    Note the asymmetry with the halved detector, which needs no tempo bound:
+    there the content genuinely decides, because a halved map's 1/4 layer is
+    both large AND too slow to be real burst content. Here it cannot, so the
+    tempo has to.
+
+    Measured on the two clean examples:
+        The Big Black [NC]       notated 360 - 1/2 50%, 1/4  0%  -> doubled
+        Flowering Night Fever    real    290 - 1/2 44%, 1/4 30%  -> honest
+
+    This exists so the snap test can apply to EVERY run. It used to be skipped
+    for anything under 110ms, as a blunt way to protect doubled notation, and
+    that left every map above ~273 BPM exempt - their ordinary 1/2 jump pulse
+    counted as bursts, 127 of them on "Flowering Night Fever [Ekoro's Fever]".
+    """
+    if not timing_points or len(objs) < 2:
+        return False
+    beat0 = usable_beat_ms(timing_points[0][1])
+    if not beat0 or 60000.0 / beat0 <= max_plausible_bpm:
+        return False
+    half = half_fast = quarter = total = 0
+    for i in range(1, len(objs)):
+        gap = objs[i][0] - objs[i - 1][0]
+        if not (0 < gap <= 2000):
+            continue
+        total += 1
+        beat = usable_beat_ms(_beat_length_at(objs[i - 1][0], timing_points))
+        if not beat:
+            continue
+        div = beat / gap
+        if abs(div - 2.0) / 2.0 < 0.10:
+            half += 1
+            if gap <= burst_max_gap_ms:
+                half_fast += 1
+        elif abs(div - 4.0) / 4.0 < 0.10:
+            quarter += 1
+    if not total or half / total < doubled_half_share_min:
+        return False
+    if quarter >= half * 0.25:
+        return False              # a real 1/4 layer - the tempo is honest
+    return half_fast * 2 > half   # and that 1/2 is too fast to be a real 1/2
+
+
 def looks_like_halved_notation(objs, timing_points, burst_max_gap_ms=105.0,
                                 halved_quarter_share_min=0.15):
     """
@@ -646,11 +718,11 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    stream_pct_threshold=15.0,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
                    cut_max_multiple=3.0, cut_max_dist_ratio=4.0,
-                   burst_beat_fraction_max=0.4, burst_always_fast_ms=110.0,
+                   burst_beat_fraction_max=0.4, doubled_half_share_min=0.25,
+                   max_plausible_bpm=300.0,
                    burst_max_gap_ms=105.0, halved_quarter_share_min=0.15,
                    section_ms=2000.0, section_dominance=0.5, section_min_transitions=4,
-                   hybrid_section_min=0.15, hybrid_balance_min=0.5,
-                   mods=None):
+                   hybrid_section_min=0.15, hybrid_balance_min=0.5):
     """
     Terminology. Mostly osu!'s official beatmap tags, with two deliberate
     departures called out where they occur - see `burst` and `cutstream`:
@@ -740,8 +812,8 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     interrupted by a skipped beat is still a stream, which is what the
     "cutstreams count as streams" rule is supposed to mean.
 
-    mods, if given, is a list of acronyms like ["DT"] or ["HR", "DT"]. NM is
-    the baseline; see mod_adjustments().
+    NM only. `rate` stays in the arithmetic below at a fixed 1.0 rather than
+    being deleted, so restoring mods later is a matter of feeding it again.
     """
     objs = diff.objs
     # Set regardless of what follows - a diff too sparse to classify still
@@ -760,7 +832,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         # same as the too-few-objects case above.
         return diff
 
-    rate, eff_cs = mod_adjustments(mods, diff.circle_size)
+    rate, eff_cs = 1.0, diff.circle_size
     radius = 54.4 - 4.48 * eff_cs
     diam = max(radius * 2, 1.0)
 
@@ -799,6 +871,9 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # file, and DT doesn't change it.
     halved_notation = looks_like_halved_notation(
         objs, diff.timing_points, burst_max_gap_ms, halved_quarter_share_min)
+    doubled_notation = (not halved_notation) and looks_like_doubled_notation(
+        objs, diff.timing_points, burst_max_gap_ms, doubled_half_share_min,
+        max_plausible_bpm)
 
     # --- which transitions are gameplay at all ------------------------------
     # Gaps longer than the cap are breaks and section boundaries, not
@@ -963,13 +1038,14 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         # push a genuine cutstream over the line that rejoining it was meant
         # to survive. Same exclusion, same reason, as the spacing checks above.
         run_gap = mean_gap(spacing)
-        if run_gap > burst_always_fast_ms:
-            beat_ms = usable_beat_ms(
-                _beat_length_at(objs[run[0]][0], diff.timing_points)) / rate
-            if halved_notation:
-                beat_ms /= 2.0
-            if beat_ms > 0 and run_gap > beat_ms * burst_beat_fraction_max:
-                continue
+        beat_ms = usable_beat_ms(
+            _beat_length_at(objs[run[0]][0], diff.timing_points)) / rate
+        if halved_notation:
+            beat_ms /= 2.0
+        elif doubled_notation:
+            beat_ms *= 2.0
+        if beat_ms > 0 and run_gap > beat_ms * burst_beat_fraction_max:
+            continue
         if burst_min <= length <= burst_max:
             # A burst has to be genuinely FAST, not merely a fast snap. The
             # rhythm gate above asks "is this a step up from the map's pulse",
@@ -2471,11 +2547,16 @@ DEFAULT_PARAMS = dict(
     # Without it, a 240 BPM map's ordinary 1/2 tapping (125ms) cleared the
     # 140ms absolute cap and every jump map at that tempo grew phantom bursts.
     burst_beat_fraction_max=0.4,
-    # ...but only for runs slower than this. At 110ms a note (a ~136 BPM
-    # stream) a run is burst tapping regardless of what snap the file calls
-    # it, which is what keeps doubled-BPM notation working - see the rhythm
-    # gate in classify_diff().
-    burst_always_fast_ms=110.0,
+    # Share of note gaps on the notated 1/2 before that layer counts as the
+    # map's backbone - one of two signals for DOUBLED notation. Replaces a
+    # blanket "runs under 110ms skip the snap test", which protected doubled
+    # notation by exempting every map above ~273 BPM along with it.
+    doubled_half_share_min=0.25,
+    # Above this notated tempo, doubled-BPM authoring is the likelier reading.
+    # Read off the timing points, not the notes, so every difficulty in a
+    # mapset agrees - notation belongs to the set, and content alone gives
+    # different answers for its quiet and busy diffs.
+    max_plausible_bpm=300.0,
     # Slowest a run may tap and still be a BURST (streams are unaffected -
     # see the comment at the burst/stream split). 105ms is about a 143 BPM
     # stream. Measured over 28 hand-labelled difficulties: the ones with
@@ -2567,7 +2648,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                   params=None, progress_cb=None, log_cb=None, cancel_event=None,
                   include_categories=None, ranked_mode="all_together",
                   min_star=None, max_star=None, combine_jumps=False,
-                  pause_event=None, mods=None):
+                  pause_event=None):
     """
     Core pipeline used by both the CLI and the GUI:
       1. scan_folder() over .osu/.osz files
@@ -2606,9 +2687,6 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     import time
 
     log(f"=== Starting run on {songs_folder} ===")
-    if mods:
-        log(f"Classifying as if these mods were active: {', '.join(mods)} "
-            f"(NM is the baseline - this changes what counts as a stream).")
 
     classify_count = [0]
 
@@ -2616,7 +2694,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled()
         wait_if_paused(pause_event, cancel_event)
-        classify_diff(d, mods=mods, **{k: p[k] for k in DEFAULT_PARAMS})
+        classify_diff(d, **{k: p[k] for k in DEFAULT_PARAMS})
         # Free per-note data immediately - only the summary fields (counts,
         # booleans, hash) are needed from here on. Classifying inline like
         # this (instead of parsing the whole library first, THEN classifying
@@ -2722,7 +2800,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
             import csv
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                mods_str = "+".join(mods) if mods else "NM"
+                mods_str = "NM"      # NM-only for now; column kept so the CSV shape is stable
                 w.writerow(["title", "diff_name", "bpm", "has_bursts", "has_streams", "has_jumps", "has_cutstreams",
                             "has_hybrid", "active_sections", "stream_sections", "jump_sections",
                             "burst_runs", "stream_runs", "cutstream_runs", "max_burst_len",
@@ -3018,10 +3096,15 @@ def main():
                      help="Slowest snap that still counts as burst/stream tapping, as a fraction of a beat "
                           "per note. 0.4 admits 1/4 and 1/3 snap and rejects 1/2, which stops a high-BPM "
                           "jump map's ordinary 1/2 tapping from reading as bursts")
-    ap.add_argument("--burst-always-fast-ms", type=float, default=DEFAULT_PARAMS["burst_always_fast_ms"],
-                     help="Runs at or under this ms per note skip the beat-fraction check entirely - they "
-                          "are fast enough to be burst tapping whatever snap the file calls them. This is "
-                          "what keeps doubled-BPM notation working")
+    ap.add_argument("--max-plausible-bpm", type=float, default=DEFAULT_PARAMS["max_plausible_bpm"],
+                     help="Above this notated tempo, doubled-BPM authoring is the likelier reading. "
+                          "Taken from the timing points so every difficulty in a mapset agrees.")
+    ap.add_argument("--doubled-half-share-min", type=float,
+                     default=DEFAULT_PARAMS["doubled_half_share_min"],
+                     help="Share of note gaps on the notated 1/2 before that layer counts as the map's "
+                          "backbone - one of two content signals for DOUBLED-BPM authoring (a 360 BPM "
+                          "file that really plays at 180). The other is that the notated 1/4 is absent, "
+                          "since under doubled notation it would be a real 1/8.")
     ap.add_argument("--burst-max-gap-ms", type=float, default=DEFAULT_PARAMS["burst_max_gap_ms"],
                      help="Slowest ms-per-note a run may tap and still count as a burst. Streams are "
                           "not affected. Stops a slow song's honest 1/4 (120ms at 125 BPM) reading as "
@@ -3053,10 +3136,6 @@ def main():
                      help="Also write a single \"Jumps\" collection containing every jump map, on top of "
                           "the separate \"Jumps with bursts\" and \"Jumps (no bursts)\" ones. Nothing is "
                           "reclassified - a jumps+bursts map simply appears in both.")
-    ap.add_argument("--mods", default=None,
-                     help="Classify as if these mods were active, e.g. --mods DT or --mods HR,DT. "
-                          "NM (no mods) is the baseline and the default. Only DT/NC, HT/DC, HR and EZ "
-                          "change anything here - rate and circle size.")
     ap.add_argument("--csv", default=None, help="Optional path to dump full per-diff results as CSV")
     ap.add_argument("--categories", default=None,
                      help="Comma-separated list of categories to include in the output collection.db "
@@ -3091,7 +3170,6 @@ def main():
         sys.exit(1)
 
     params = {key: getattr(args, key) for key in DEFAULT_PARAMS}
-    mods = [m.strip().upper() for m in args.mods.replace("+", ",").split(",") if m.strip()] if args.mods else None
 
     def cli_progress(done, total):
         if total:
@@ -3110,7 +3188,6 @@ def main():
         min_star=args.min_star,
         max_star=args.max_star,
         combine_jumps=args.combine_jumps,
-        mods=mods,
     )
 
     if not args.no_db:

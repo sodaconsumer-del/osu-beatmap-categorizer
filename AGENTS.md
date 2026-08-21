@@ -234,6 +234,21 @@ Decisions that look odd but aren't:
   maps are authored at deliberately doubled tempo. Stream BPM is `15000 / ms`.
   An earlier ratio-based test was admitting roughly half its transitions at
   1/2 snap.
+- **The snap test now applies to EVERY run, and both notations are folded
+  out from the notes.** It used to be skipped for anything under
+  `burst_always_fast_ms` (110ms), a blunt way to protect doubled notation.
+  That exempted every map above ~273 BPM, whose ordinary 1/2 jump pulse is
+  under 110ms - "Flowering Night Fever [Ekoro's Fever]" (290 BPM) reported
+  **127 bursts**, most of them its 103ms 1/2. `looks_like_doubled_notation()`
+  replaces the blanket skip, so the gate can run on everything.
+  **Its decisive condition is the notated tempo, not the notes, and that is
+  the point.** Notation belongs to the MAPSET, so every difficulty must agree
+  - and content cannot deliver that. Across Flowering Night Fever's eight
+  difficulties the quiet ones carry no 1/4 at all, so they look exactly like
+  doubled notation while their busy siblings do not: three of eight flipped,
+  and their burst counts inflated (Insane 71, pishi's Lunatic 114). With the
+  tempo bound all eight agree. The halved detector needs no such bound
+  because there the content genuinely decides - see its docstring.
 - **...but absolute ms alone can't tell a burst from a fast map's own pulse,
   so there is now a second, narrowly-scoped rhythm gate on top.** At 240 BPM
   an ordinary 1/2 tap is 125ms, which clears the 140ms cap, so *every* jump
@@ -737,7 +752,26 @@ entries earlier in this document, which are recorded as REVERSALS - both
 generalised from a population statistic to a rule the user's own labels
 later contradicted. A large population is not by itself a bug.)
 
-### Mod math
+### NM only
+
+Classification is NM-only. `--mods`, the GUI checkboxes and the `mods`
+parameter are gone from the classification path; `report.csv` keeps its
+`mods` column, always "NM", so the file shape and `--from-csv` are unchanged.
+
+Removed because mods and native tempo gave contradictory answers to the same
+physical question. `test_dt_turns_half_tapping_into_a_stream` asserted that a
+200 BPM map tapping 1/2 at 150ms becomes a stream under DT, because DT
+compresses it to 100ms. But DT-on-200BPM and native-290BPM are the same thing
+at the keyboard - both are ~100ms at 1/2 snap - so any rule that promotes the
+first must promote the second, and promoting the second is exactly the false
+positive this branch was chasing. There is no consistent rule that does both.
+Dropping mods removes the contradiction; the snap test then applies cleanly.
+
+`mod_adjustments()` is deliberately KEPT - `osu_visualizer.py` imports it, its
+verification against ppy/osu is worth preserving, and `rate` still threads
+through `classify_diff()` at a fixed 1.0. Restoring mods is small.
+
+### Mod math (used by the visualizer only)
 
 `mod_adjustments(mods, circle_size)` → `(rate, effective_circle_size)`.
 Verified against `ModDoubleTime.cs` / `OsuModHardRock.cs` in ppy/osu:

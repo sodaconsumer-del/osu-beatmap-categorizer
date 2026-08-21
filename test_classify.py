@@ -39,11 +39,11 @@ def circles(n, t0=1000, step=75, x0=100, dx=8):
     return [f"{x0 + i * dx},100,{int(t0 + i * step)},1,0" for i in range(n)]
 
 
-def classify(lines, mods=None, **overrides):
+def classify(lines, **overrides):
     d = build(lines)
     params = dict(cm.DEFAULT_PARAMS)
     params.update(overrides)
-    cm.classify_diff(d, mods=mods, **params)
+    cm.classify_diff(d, **params)
     return d
 
 
@@ -461,15 +461,6 @@ def test_cutstream_rejoin_is_rejected_when_the_cut_itself_is_a_jump():
 
 # --- mods ------------------------------------------------------------------
 
-def test_dt_turns_half_tapping_into_a_stream():
-    lines = circles(16, step=150)
-    assert not classify(lines).has_streams
-    assert classify(lines, mods=["DT"]).has_streams
-
-
-def test_nm_is_the_baseline():
-    lines = circles(16)
-    assert cm.category_of(classify(lines)) == cm.category_of(classify(lines, mods=["NM"]))
 
 
 def test_mod_adjustments_match_osu():
@@ -481,11 +472,6 @@ def test_mod_adjustments_match_osu():
     assert cm.mod_adjustments(["HR", "DT"], 4.0) == (1.5, 5.2)
     assert cm.mod_adjustments(None, 4.0) == (1.0, 4.0)
 
-
-def test_hr_shrinks_circles_so_spacing_reads_wider():
-    # Same notes, but HR's smaller circles mean the same gap is more diameters.
-    lines = circles(16, dx=60)
-    assert classify(lines).jump_pct <= classify(lines, mods=["HR"]).jump_pct
 
 
 # --- parsing ---------------------------------------------------------------

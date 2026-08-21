@@ -447,26 +447,6 @@ class ClassifierGUI(tk.Tk):
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Mods ---
-        frame_mods = ttk.LabelFrame(body, text="6. Classify as if these mods were active")
-        frame_mods.pack(fill="x", **pad)
-        row_mods = ttk.Frame(frame_mods)
-        row_mods.pack(fill="x", padx=10, pady=8)
-        self.mod_vars = {}
-        for acronym, label in [("DT", "Double Time (1.5x speed)"),
-                                ("HR", "Hard Rock (CS x1.3)"),
-                                ("HT", "Half Time (0.75x speed)"),
-                                ("EZ", "Easy (CS / 2)")]:
-            var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(row_mods, text=label, variable=var).pack(side="left", padx=(0, 16))
-            self.mod_vars[acronym] = var
-        ttk.Label(frame_mods,
-                  text="Leave all unchecked for NM (no mods), which is the baseline. Only speed and "
-                       "circle size change what a pattern is - DT makes slower rhythms fast enough to "
-                       "count as streams, HR shrinks circles so the same spacing reads as wider. "
-                       "(HR's vertical flip doesn't matter here: flipping every object preserves the "
-                       "distance between them.)",
-                  style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
-
         # --- Detection sensitivity + advanced thresholds ---
         # Nineteen bare numbers with names like "mean_diam_ratio_max" told a
         # user nothing about what they would do. The common case is now one
@@ -526,9 +506,15 @@ class ClassifierGUI(tk.Tk):
                  "milliseconds per note. 105 is about a 143 BPM stream. A slow song's honest 1/4 "
                  "(120ms at 125 BPM) is a real 1/4 and still not a burst - it isn't fast enough. "
                  "Streams are not affected by this."),
-                ("burst_always_fast_ms", "Always a burst at or below this speed",
-                 "milliseconds per note. Below this it is burst tapping whatever snap the file calls "
-                 "it - this is what keeps maps written at doubled BPM working."),
+                ("max_plausible_bpm", "Above this BPM, read the tempo as doubled",
+                 "300. Some songs are written at double their real tempo (360 for a 180 BPM song), "
+                 "which makes real 1/4 bursts look like ordinary 1/2 tapping. Taken from the timing "
+                 "points rather than the notes so every difficulty in a mapset agrees."),
+                ("doubled_half_share_min", "When 1/2 is this much of a map, read it as doubled",
+                 "0.25 = 25% of note gaps. The mirror of the halved check: some songs are written at "
+                 "double their real tempo (360 for a 180 BPM song), which makes genuine 1/4 bursts "
+                 "look like ordinary 1/2 tapping. The giveaway is that the notated 1/4 is missing "
+                 "entirely - it would be a real 1/8."),
                 ("halved_quarter_share_min", "When 1/4 is this much of a map, read it as halved",
                  "0.15 = 15% of note gaps. Some songs are written at half their real tempo (130 for a "
                  "260 BPM song), which makes ordinary 1/2 tapping look like 1/4. The notes give it "
@@ -762,7 +748,6 @@ class ClassifierGUI(tk.Tk):
             messagebox.showerror("Invalid threshold", "Threshold fields must be numbers.")
             return
 
-        mods = [acronym for acronym, var in self.mod_vars.items() if var.get()] or None
 
         export_dir = self.export_dir_var.get().strip()
         if not export_dir:
@@ -816,7 +801,7 @@ class ClassifierGUI(tk.Tk):
             target=self._worker,
             args=(folder, output, csv_path, params, self.cancel_event, self.pause_event,
                   include_categories, ranked_mode, min_star, max_star,
-                  self.combine_jumps_var.get(), mods),
+                  self.combine_jumps_var.get()),
             daemon=True,
         )
         self.worker_thread.start()
@@ -866,7 +851,7 @@ class ClassifierGUI(tk.Tk):
             self._log("Resumed.")
 
     def _worker(self, folder, output, csv_path, params, cancel_event, pause_event,
-                include_categories, ranked_mode, min_star, max_star, combine_jumps, mods):
+                include_categories, ranked_mode, min_star, max_star, combine_jumps):
         def progress_cb(done, total):
             self.msg_queue.put(("progress", done, total))
 
@@ -878,7 +863,7 @@ class ClassifierGUI(tk.Tk):
                 folder, output=output, csv_path=csv_path, write_db=output is not None,
                 params=params, progress_cb=progress_cb, log_cb=log_cb, cancel_event=cancel_event,
                 pause_event=pause_event, include_categories=include_categories, ranked_mode=ranked_mode,
-                min_star=min_star, max_star=max_star, combine_jumps=combine_jumps, mods=mods,
+                min_star=min_star, max_star=max_star, combine_jumps=combine_jumps,
             )
             self.msg_queue.put(("done", result))
         except cm.ScanCancelled:
