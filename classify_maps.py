@@ -35,9 +35,10 @@ milliseconds: at most burst_beat_fraction_max (0.4) of a beat per note, which
 admits 1/4 and 1/3 and rejects 1/2. Without that, a 240 BPM jump map's
 ordinary 1/2 tapping (125ms - under the cap) reads as wall-to-wall bursts.
 The stored tempo still isn't trusted blindly, because plenty of maps notate a
-doubled or halved one: runs at or under burst_always_fast_ms (110ms) skip the
-snap test entirely, and halved notation is folded back out first (see
-effective_beat_ms). So the snap test only ever decides the 110-140ms band.
+doubled or halved one. Rather than exempt part of the speed range from the
+test, the notation is folded back out first so the beat being measured against
+is the one a player feels - see looks_like_halved_notation() and
+looks_like_doubled_notation(). The snap test then applies to every run.
 
 Spacing then decides what KIND of run it is. Fast-but-far transitions are
 jumps, not bursts, regardless of how tight the timing is (e.g. 1/4-snap jump
@@ -778,9 +779,11 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     from a fast map's own pulse: at 240 BPM an ordinary 1/2 tap is 125ms and
     clears this cap, so every high-BPM jump map grew bursts out of its plain
     tapping. The gate asks the question this cap can't - is the run a step UP
-    from the beat it sits on - and is deliberately confined to the 110-140ms
-    band where notation could mislead, so the "never trust the stored tempo"
-    principle above still holds everywhere it was actually load-bearing.
+    from the beat it sits on. The "never trust the stored tempo" principle
+    above still holds, because the gate does not take the stored tempo at
+    face value: halved and doubled notation are folded back out first, from
+    the map's own content, so the beat it measures against is the one a
+    player feels rather than the one the file happens to name.
 
     The second gate is CONSISTENCY: every gap in a run must stay within
     gap_consistency_tol of the run's running mean. A real stream does not
@@ -934,7 +937,25 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
             between = nxt[0] - 1
             if between != run[-1] + 1:
                 break
-            note_gap = mean_gap(run)
+            # Measured over the run's OWN notes, excluding any cut junction
+            # already merged in on a previous pass round this loop. A junction
+            # spans a skipped note, so its gap is 2-3x the note gap; averaging
+            # it back in drags `note_gap` upward and makes the next junction
+            # look like a fractional multiple of a rhythm that isn't there.
+            #
+            # Concretely, on a 100ms/note stream with two single skipped
+            # beats: the first merge leaves run holding a 200ms junction, so
+            # note_gap reads (8*100+200)/9 = 111.1 instead of 100, the second
+            # junction reads 200/111.1 = 1.80 instead of 2.00, and
+            # abs(1.80-2) = 0.20 fails gap_consistency_tol by two hundredths.
+            # The stream came apart into a 10-note stream plus a phantom
+            # 5-note burst - the exact outcome rejoining exists to prevent,
+            # and it got worse with every additional cut.
+            #
+            # Same exclusion, same reason, as `spacing` and `run_gap` below;
+            # this line was the one place in the run logic that still counted
+            # junctions as ordinary notes.
+            note_gap = mean_gap([j for j in run if j not in cuts])
             if note_gap <= 0:
                 break
             mult = transitions[between][0] / note_gap
@@ -1015,23 +1036,28 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         # that isn't perfectly snapped.
         #
         # But the stored tempo is NOT authoritative about snap (the reason the
-        # original design refused to consult it at all), so the gate is scoped
-        # to where notation can actually mislead:
+        # original design refused to consult it at all). The answer is not to
+        # exempt part of the range from the gate - it is to fold the notation
+        # back out first, so the beat the gate measures against is the one a
+        # player actually feels. Both directions are decided per map, above:
         #
-        #   - Runs at or under burst_always_fast_ms skip it entirely. At 110ms
-        #     a note that is a ~136 BPM stream - fast enough that it is burst
-        #     tapping whatever the file calls the snap. This is what keeps
-        #     DOUBLED notation working: a 200 BPM song written as 400 taps its
-        #     1/4 at 75ms, which the file calls a 1/2, and it sails through on
-        #     speed alone exactly as it did before this gate existed.
-        #   - HALVED notation is folded back out before the fraction is taken,
-        #     which is the other direction and the one speed can't rescue.
-        #     Whether a map is halved is decided from its own notes - see
-        #     looks_like_halved_notation(), computed once above.
+        #   - HALVED notation (a 260 BPM song written as 130) puts the map's
+        #     real 1/2 backbone on the notated 1/4, where it sails through a
+        #     naive snap test. Halve the beat and it reads as the 1/2 it is.
+        #     See looks_like_halved_notation() - decided from the notes.
+        #   - DOUBLED notation (a 180 BPM song written as 360) does the
+        #     reverse: a genuine 1/4 burst is written as a 1/2 and the gate
+        #     would throw it away. Double the beat and it survives. See
+        #     looks_like_doubled_notation() - decided from the timing points,
+        #     because notation belongs to the mapset and content alone gives
+        #     different answers for a set's quiet and busy difficulties.
         #
-        # So the gate only decides runs in the 110-140ms band, which is
-        # precisely the ambiguous stretch: too slow to be self-evidently a
-        # burst, fast enough to slip under the absolute cap.
+        # This used to be handled by exempting any run at or under 110ms from
+        # the gate entirely (burst_always_fast_ms). That protected doubled
+        # notation, but it exempted every map above ~273 BPM along with it, so
+        # their ordinary 1/2 pulse counted as bursts - 127 of them on
+        # "Flowering Night Fever [Ekoro's Fever]" alone. The parameter is gone
+        # and the gate now applies to EVERY run.
         #
         # Measured over `spacing`, not `run`: a cut junction spans a skipped
         # note, so its gap is 2-3x the run's own, and averaging it in would
@@ -2662,10 +2688,13 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     phase - if set, raises ScanCancelled to stop promptly without writing
     a CSV or collection.db (a partial/interrupted run isn't something you'd
     want to trust as the actual output).
-    include_categories, if given, restricts which categories ("Streams",
-    "Bursts", "Jumps", "Misc") get written to the output collection.db -
-    e.g. pass ["Jumps"] to only output a Jumps collection and skip writing
-    the rest entirely. The CSV report always includes every diff regardless,
+    include_categories, if given, restricts which categories get written to
+    the output collection.db. The valid names are exactly CATEGORIES -
+    "Streams", "Hybrid", "Bursts", "Jumps with bursts", "Jumps (no bursts)",
+    "Misc" - e.g. pass both jump categories to skip writing the rest
+    entirely. COMBINED_JUMPS_LABEL ("Jumps") is deliberately NOT selectable
+    here: it is synthesised by combine_jumps after this filter has run, so
+    passing it matches nothing. The CSV report always includes every diff,
     so you can still audit the full scan.
     ranked_mode controls how ranked status factors into collection names
     (only meaningful when ranked status is actually available - currently
@@ -3138,9 +3167,13 @@ def main():
                           "reclassified - a jumps+bursts map simply appears in both.")
     ap.add_argument("--csv", default=None, help="Optional path to dump full per-diff results as CSV")
     ap.add_argument("--categories", default=None,
-                     help="Comma-separated list of categories to include in the output collection.db "
-                          "(Streams,Bursts,Jumps,Misc). Default: all of them. E.g. --categories Jumps "
-                          "to only get a Jumps collection and skip writing the rest.")
+                     help="Comma-separated list of categories to include in the output collection.db. "
+                          "Valid names are exactly the category names: Streams, Hybrid, Bursts, "
+                          "'Jumps with bursts', 'Jumps (no bursts)', Misc. Default: all of them. "
+                          "E.g. --categories 'Jumps with bursts','Jumps (no bursts)' for jump maps "
+                          "only. Note that plain 'Jumps' is NOT valid here - that collection is "
+                          "produced by --combine-jumps, which runs after this filter, so select the "
+                          "two real jump categories and add --combine-jumps to get it.")
     ap.add_argument("--ranked-mode", choices=["all_together", "ranked_only", "unranked_only", "split"],
                      default="all_together",
                      help="How ranked status factors into collections - only meaningful when ranked "

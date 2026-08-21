@@ -256,28 +256,27 @@ Decisions that look odd but aren't:
   is a step UP from the map's own pulse, so a run must also come in at most
   `burst_beat_fraction_max` (0.4) of a beat per note — which admits 1/4 (0.25)
   and 1/3 (0.33) and rejects 1/2 (0.5) with 20% headroom for loose snapping.
-  The stored tempo is still not trusted on its own; the gate is deliberately
-  confined to the only band where it can matter:
-    - Runs at or under `burst_always_fast_ms` (110ms/note, a ~136 BPM stream)
-      skip it entirely. That is what keeps **doubled** notation working, and
-      it is the same argument as the bullet above: a 200 BPM song written as
-      400 taps its 1/4 at 75ms, the file calls that a 1/2, and it passes on
-      speed alone exactly as it always did. `test_stored_bpm_does_not_affect_
-      the_verdict` pins this.
-    - `looks_like_halved_notation()` folds **halved** notation back out before
-      the fraction is taken — the direction speed *can't* rescue, because
-      halved notation makes an ordinary 1/2 look like a 1/4. See its own
-      section below; the short version is that it reads the notes, not the
-      stored BPM.
-  So the gate only ever decides runs in the 110–140ms band: too slow to be
-  self-evidently burst tapping, fast enough to slip under the absolute cap.
+  The stored tempo is still not trusted on its own. Rather than exempt part
+  of the speed range from the gate, both notations are folded out first, so
+  the beat the gate measures against is the one a player actually feels:
+    - `looks_like_halved_notation()` halves the beat for **halved** notation
+      (a 260 BPM song written as 130), which otherwise makes an ordinary 1/2
+      look like a 1/4 and sail through. It reads the notes, not the stored
+      BPM — see its own section below.
+    - `looks_like_doubled_notation()` doubles it for **doubled** notation (a
+      180 BPM song written as 360), where a genuine 1/4 burst is written as a
+      1/2 and would otherwise be thrown away. Its decisive condition comes
+      from the timing points, so every difficulty in a mapset agrees.
+  The gate then applies to **every** run. An earlier design exempted anything
+  under 110ms (`burst_always_fast_ms`) to protect doubled notation; that
+  parameter is gone — see the bullet above for why.
 
   **Read the next bullet before relying on any of this for bursts.** The gate
   was added to fix 11 maps and did, but a later and simpler rule
   (`burst_max_gap_ms`) turned out to fix those same 11 *and* four the gate got
   wrong — and it makes the gate inert for bursts. What is left of the gate's
-  job is long runs in the 110–140ms band at 1/2 snap, i.e. streams, which no
-  label in this repo currently covers. It is kept because that job is real and
+  job is long runs at 1/2 snap that are fast in milliseconds, i.e. streams,
+  which no label in this repo currently covers. It is kept because that job is real and
   removing it would change stream behaviour on no evidence, not because it is
   still load-bearing for bursts. If you are here to simplify, this is the
   first thing to consider deleting — measure the stream side first.
@@ -610,7 +609,6 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `cut_max_multiple` | 3.0 | largest skipped-note gap multiple still treated as a cut inside one stream |
 | `cut_max_dist_ratio` | 4.0 | largest cut-transition distance (× hit-circle diameter) still treated as a skipped note rather than a real jump between two separate runs |
 | `burst_beat_fraction_max` | 0.4 | slowest snap still counted as burst/stream tapping, as a fraction of a beat per note — admits 1/4 (0.25) and 1/3 (0.33), rejects 1/2 (0.5) |
-| `burst_always_fast_ms` | 110.0 | runs at or under this ms/note skip the beat-fraction check entirely — fast enough to be burst tapping whatever snap the file calls it |
 | `burst_max_gap_ms` | 105.0 | slowest ms/note a run may tap and still be a **burst** (≈143 BPM stream). Streams are deliberately unaffected |
 | `section_ms` | 2000.0 | length of one section, in ms — roughly two bars at 200 BPM |
 | `section_dominance` | 0.5 | share of a section one pattern must hold to own it |

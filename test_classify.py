@@ -196,8 +196,9 @@ def test_the_burst_speed_cap_does_not_touch_streams():
 def test_halved_bpm_notation_does_not_manufacture_bursts():
     # A mapper may notate a 236 BPM song as 118 (508ms beat). What the file
     # calls a 1/4 (127ms) is the 1/2 a player actually feels, so it is not a
-    # burst - but a naive snap test would credit it as one. effective_beat_ms
-    # folds the notation back out first. Real example: "Chug Jug With You
+    # burst - but a naive snap test would credit it as one. The gate folds
+    # the notation back out first (looks_like_halved_notation, then beat_ms
+    # /= 2 in classify_diff). Real example: "Chug Jug With You
     # [Cote's Zero Build Match...]", notated 118 BPM, no bursts in it.
     filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
     d = build(circles(3, step=127, dx=8) + filler, bl=508.47)
@@ -206,20 +207,30 @@ def test_halved_bpm_notation_does_not_manufacture_bursts():
 
 
 def test_doubled_bpm_notation_still_finds_bursts():
-    # The other direction, and the reason the gate is scoped rather than
-    # absolute: a 200 BPM song notated as 400 (150ms beat) writes its 1/4 at
-    # 75ms, which the file calls a 1/2. burst_always_fast_ms lets it through
-    # on speed alone - at 75ms a note nothing else needs asking.
+    # The other direction: a 200 BPM song notated as 400 (150ms beat) writes
+    # its 1/4 at 75ms, which the file calls a 1/2. Left alone the gate would
+    # reject it as ordinary tapping; looks_like_doubled_notation spots the
+    # notation and classify_diff doubles the beat back out, so the burst
+    # survives. 400 BPM is over max_plausible_bpm (300), which is the
+    # decisive condition - and it comes from the timing points, so every
+    # difficulty in a set agrees.
     filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
     d = build(circles(3, step=75, dx=8) + filler, bl=150.0)
+    assert cm.looks_like_doubled_notation(d.objs, d.timing_points, 105.0, 0.25, 300.0),         "the fixture must actually read as doubled - otherwise this tests nothing"
     cm.classify_diff(d, **cm.DEFAULT_PARAMS)
     assert d.has_bursts
+    # Without the fold the 75ms run is 1/2 of a 150ms beat, over
+    # burst_beat_fraction_max, and would be thrown away. Pin that, so if the
+    # doubled detector ever stops firing here the test says why.
+    honest = build(circles(3, step=75, dx=8) + filler, bl=150.0)
+    cm.classify_diff(honest, **dict(cm.DEFAULT_PARAMS, max_plausible_bpm=1e9))
+    assert not honest.has_bursts
 
 
 def test_corrupt_timing_does_not_suppress_every_run():
     # A subnormal beatLength would make `beat * burst_beat_fraction_max`
     # smaller than any real gap, silently rejecting every run in the map.
-    # effective_beat_ms reports "no usable tempo" (0.0) below
+    # usable_beat_ms reports "no usable tempo" (0.0) below
     # MIN_PLAUSIBLE_BEAT_MS instead, and the gate stands down rather than
     # measuring against a number that isn't a tempo.
     assert cm.usable_beat_ms(1e-320) == 0.0
@@ -439,6 +450,51 @@ def test_real_break_does_not_merge():
     d = classify(lines)
     assert not d.has_streams
     assert d.burst_count == 2
+
+
+def test_a_stream_survives_more_than_one_cut():
+    # Regression: the rejoin loop measured the run's note gap over the WHOLE
+    # run, including cut junctions it had already merged in. A junction spans
+    # a skipped note, so its gap is 2-3x the note gap, and averaging it back
+    # in dragged the reference upward - each successive cut then looked like
+    # a fractional multiple of a rhythm that was not there.
+    #
+    # On this fixture (5-note segments at 75ms, single skipped beat between
+    # each) the second junction read 150/83.3 = 1.80 instead of 2.00, and
+    # abs(1.80 - 2) = 0.20 failed gap_consistency_tol (0.18) by two
+    # hundredths. A 15-note cut stream came out as a 10-note stream plus a
+    # phantom 5-note burst, and it got worse with every extra cut.
+    #
+    # A stream does not stop being one stream because it was cut twice.
+    step, seg = 75, 5
+    for n_cuts in (1, 2, 3, 4):
+        lines, t = [], 1000
+        for s_i in range(n_cuts + 1):
+            lines += circles(seg, t0=t)
+            t += seg * step + step        # one skipped note between segments
+        notes = seg * (n_cuts + 1)
+        d = classify(lines)
+        assert d.stream_count == 1, f"{n_cuts} cuts: expected one stream, got {d.stream_count}"
+        assert d.max_stream_len == notes,             f"{n_cuts} cuts: expected a {notes}-note stream, got {d.max_stream_len}"
+        assert d.burst_count == 0,             f"{n_cuts} cuts: rejoining must not leave a phantom burst behind"
+        assert d.has_cutstreams
+
+
+def test_the_cut_reference_gap_ignores_earlier_junctions():
+    # The mechanism behind the test above, pinned directly: after one merge
+    # the run holds a junction whose gap is double the note gap. If the next
+    # merge's reference is taken over the whole run it reads high; taken over
+    # the run's own notes it reads exactly the note gap, which is what every
+    # other check in the run logic (spacing, run_gap) already uses.
+    step, seg = 75, 5
+    lines, t = [], 1000
+    for _ in range(3):
+        lines += circles(seg, t0=t)
+        t += seg * step + step
+    d = classify(lines)
+    # 15 notes, two junctions -> 14 transitions, all claimed by the one run.
+    assert d.stream_note_total == 15
+    assert d.cutstream_count == 1, "one stream, cut twice - not two cut streams"
 
 
 def test_cutstream_rejoin_is_rejected_when_the_cut_itself_is_a_jump():
@@ -903,6 +959,41 @@ def test_every_param_has_a_cli_flag():
     dests = {a.dest for a in parser._actions}
     missing = set(cm.DEFAULT_PARAMS) - dests
     assert not missing, f"params with no CLI flag (the CLI will crash): {sorted(missing)}"
+
+
+def test_integer_threshold_fields_accept_whole_number_decimals():
+    """
+    "40" and "40.0" are the same whole number, and a user typing either into
+    an integer field means the same thing. A bare int("40.0") raises, which
+    used to block the run with "Threshold fields must be numbers" pointing at
+    a field that plainly held one - and silently froze the Custom/preset
+    indicator, whose parse failed the same way.
+
+    A genuine non-integer is still an error: 40.5 notes is not a thing.
+    """
+    import gui
+
+    for key in cm.INT_PARAMS:
+        assert gui.parse_param(key, "40") == 40
+        assert gui.parse_param(key, "40.0") == 40
+        assert isinstance(gui.parse_param(key, "40.0"), int)
+        try:
+            gui.parse_param(key, "40.5")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{key} accepted a fractional note count")
+
+    # Float params keep their decimals untouched.
+    assert gui.parse_param("max_gap_ms", "137.5") == 137.5
+    # And genuine junk is still rejected, for both kinds.
+    for key in ("burst_min", "max_gap_ms"):
+        try:
+            gui.parse_param(key, "")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{key} accepted an empty field")
 
 
 def test_every_param_is_editable_in_the_gui():

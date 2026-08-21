@@ -79,6 +79,29 @@ def save_config(cfg):
         pass  # a preference failing to save is not worth interrupting anyone over
 
 
+def parse_param(key, text):
+    """
+    One threshold field's text as the number that parameter wants.
+
+    Integer params go through float() first, so "40.0" and "40" both give 40.
+    A bare int("40.0") raises, which used to reject a perfectly ordinary way
+    of typing a whole number: the run refused to start with "Threshold fields
+    must be numbers" pointing at a field that plainly held one, and the
+    Custom/preset indicator quietly stopped updating because its parse had
+    failed too.
+
+    Still rejects a genuine non-integer like "40.5" for an integer field -
+    that's a real mistake worth reporting, not a formatting preference.
+    Raises ValueError for anything unusable, as both callers expect.
+    """
+    value = float(text)
+    if key in cm.INT_PARAMS:
+        if value != int(value):
+            raise ValueError(f"{key} must be a whole number, got {text!r}")
+        return int(value)
+    return value
+
+
 class ClassifierGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -693,12 +716,13 @@ class ClassifierGUI(tk.Tk):
         Parsed threshold values, or None if any field isn't a number yet -
         which is normal mid-typing, when a field is briefly empty or "1.".
         Only the Custom indicator uses this; the run path does its own
-        parsing and reports bad input properly rather than ignoring it.
+        parsing (via the same parse_param) and reports bad input properly
+        rather than ignoring it.
         """
         out = {}
         for key, var in self.param_vars.items():
             try:
-                out[key] = int(var.get()) if key in cm.INT_PARAMS else float(var.get())
+                out[key] = parse_param(key, var.get())
             except ValueError:
                 return None
         return out
@@ -741,13 +765,20 @@ class ClassifierGUI(tk.Tk):
             messagebox.showerror("Invalid folder", "Please choose a valid beatmap folder first.")
             return
 
-        try:
-            params = {key: (int(var.get()) if key in cm.INT_PARAMS else float(var.get()))
-                      for key, var in self.param_vars.items()}
-        except ValueError:
-            messagebox.showerror("Invalid threshold", "Threshold fields must be numbers.")
-            return
-
+        # Parsed one at a time rather than in a comprehension so the error can
+        # name the field. "Threshold fields must be numbers" across roughly
+        # twenty-five fields left the user to find the bad one by eye.
+        params = {}
+        for key, var in self.param_vars.items():
+            try:
+                params[key] = parse_param(key, var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid threshold",
+                    f"{key} is not a valid number: {var.get()!r}\n\n"
+                    "Open Advanced to correct it, or pick a sensitivity preset "
+                    "to reset every field.")
+                return
 
         export_dir = self.export_dir_var.get().strip()
         if not export_dir:
