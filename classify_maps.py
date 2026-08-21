@@ -652,16 +652,33 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    hybrid_section_min=0.15, hybrid_balance_min=0.5,
                    mods=None):
     """
-    Terminology (matching osu!'s official beatmap tags):
+    Terminology. Mostly osu!'s official beatmap tags, with two deliberate
+    departures called out where they occur - see `burst` and `cutstream`:
       - burst  : 3-9 note run. Three notes really is enough - short 3-note
         bursts are everywhere in jump, aim-control and flow-aim maps, and
         calling those "not a burst" because they're under five doesn't match
         how the pattern is actually talked about.
+
+        This IS a departure from the official tag, which defines
+        `streams/bursts` as 5-9 notes and splits the shorter ones off into
+        `streams/doubles` (2) and `streams/quads` (4) - leaving triples with
+        no tag at all. The choice of 3 is deliberate; the point is that it is
+        a choice, not a match.
       - stream : 10+ note run
       - spaced stream : a stream where notes don't overlap but spacing/rhythm
         stays consistent - still a stream, not a jump.
-      - cutstream : a stream where a MINORITY of notes have much larger
-        spacing than the rest - still a stream overall, just with cuts
+      - cutstream : a stream that is split by a gap but still tapped as one
+        stream - two 5-note groups inside the same tapping window make a
+        10-note cutstream, not two bursts. It is a TIMING property, not a
+        spacing one.
+
+        Worth being precise about, because three sources disagreed. The
+        official `streams/cutstreams` tag says "streams in which the SPACING
+        of certain notes is much larger than the rest", and this docstring
+        used to repeat that - but the implementation had already moved to the
+        timing definition, and the timing one is what the community means and
+        what the user confirmed. The official wording is just vague. The code
+        is right; this text was the stale part.
       - jump   : wide, irregular spacing between consecutive objects. This is
         an independent, spacing-only property - a map can be jump-heavy at
         any snap speed and can co-occur with bursts/streams (jump bursts,
