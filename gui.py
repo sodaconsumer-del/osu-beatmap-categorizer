@@ -519,6 +519,10 @@ class ClassifierGUI(tk.Tk):
                 ("burst_beat_fraction_max", "Slowest snap that still counts as a burst",
                  "as a fraction of one beat per note. 0.4 accepts 1/4 and 1/3 snap and rejects 1/2, "
                  "which is what stops a fast map's ordinary tapping from reading as bursts."),
+                ("burst_max_gap_ms", "Slowest tapping that can still be a burst",
+                 "milliseconds per note. 105 is about a 143 BPM stream. A slow song's honest 1/4 "
+                 "(120ms at 125 BPM) is a real 1/4 and still not a burst - it isn't fast enough. "
+                 "Streams are not affected by this."),
                 ("burst_always_fast_ms", "Always a burst at or below this speed",
                  "milliseconds per note. Below this it is burst tapping whatever snap the file calls "
                  "it - this is what keeps maps written at doubled BPM working."),

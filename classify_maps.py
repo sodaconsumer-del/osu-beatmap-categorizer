@@ -536,7 +536,7 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    run_wide_fraction_max=0.4, mean_diam_ratio_max=1.5,
                    cut_max_multiple=3.0, cut_max_dist_ratio=4.0,
                    burst_beat_fraction_max=0.4, burst_always_fast_ms=110.0,
-                   min_notated_bpm=125.0, mods=None):
+                   burst_max_gap_ms=105.0, min_notated_bpm=125.0, mods=None):
     """
     Terminology (matching osu!'s official beatmap tags):
       - burst  : 3-9 note run. Three notes really is enough - short 3-note
@@ -836,6 +836,31 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
             if beat_ms > 0 and run_gap > beat_ms * burst_beat_fraction_max:
                 continue
         if burst_min <= length <= burst_max:
+            # A burst has to be genuinely FAST, not merely a fast snap. The
+            # rhythm gate above asks "is this a step up from the map's pulse",
+            # which a slow song's honest 1/4 passes: at 125 BPM a 1/4 is 120ms
+            # and at 130 BPM it is 115ms, both comfortably under max_gap_ms.
+            # Reported on "Jump & Stream Practice [Arastelia's Dizzy]" (125
+            # BPM) and the MONTAGEM BATCHI set (130 BPM) - real 1/4 runs, and
+            # not bursts, because 115-120ms per note is not burst tapping.
+            #
+            # Across all 28 hand-labelled difficulties the separation is
+            # clean and it is on SPEED, not snap and not spacing: the maps
+            # that do have bursts run 75-94ms per note, the ones that don't
+            # run 115-134ms, with nothing in between. Confirmed visually via
+            # osu_visualizer_preview.py - the disputed clusters look
+            # burst-SHAPED (which is why every spacing check passes them),
+            # they are just too slow to be bursts.
+            #
+            # Deliberately scoped to bursts rather than lowering max_gap_ms,
+            # even though on this evidence a ~105ms global cap would also
+            # score 28/28. max_gap_ms builds the runs that streams are found
+            # in too, so lowering it would silently stop calling ~130 BPM
+            # stream maps streams - and every one of these 28 labels is about
+            # bursts. There is no labelled stream data here to justify that,
+            # so it isn't being changed on a guess.
+            if run_gap > burst_max_gap_ms:
+                continue
             bursts.append(length)
         elif length >= stream_min:
             streams.append(length)
@@ -2192,6 +2217,11 @@ DEFAULT_PARAMS = dict(
     # it, which is what keeps doubled-BPM notation working - see the rhythm
     # gate in classify_diff().
     burst_always_fast_ms=110.0,
+    # Slowest a run may tap and still be a BURST (streams are unaffected -
+    # see the comment at the burst/stream split). 105ms is about a 143 BPM
+    # stream. Measured over 28 hand-labelled difficulties: the ones with
+    # bursts run 75-94ms per note, the ones without 115-134ms, no overlap.
+    burst_max_gap_ms=105.0,
     # Notated tempos below this are treated as halved notation and folded
     # back up before the beat fraction is taken. See effective_beat_ms().
     min_notated_bpm=125.0,
@@ -2696,6 +2726,10 @@ def main():
                      help="Runs at or under this ms per note skip the beat-fraction check entirely - they "
                           "are fast enough to be burst tapping whatever snap the file calls them. This is "
                           "what keeps doubled-BPM notation working")
+    ap.add_argument("--burst-max-gap-ms", type=float, default=DEFAULT_PARAMS["burst_max_gap_ms"],
+                     help="Slowest ms-per-note a run may tap and still count as a burst. Streams are "
+                          "not affected. Stops a slow song's honest 1/4 (120ms at 125 BPM) reading as "
+                          "a burst when it is simply not fast enough to be one.")
     ap.add_argument("--min-notated-bpm", type=float, default=DEFAULT_PARAMS["min_notated_bpm"],
                      help="Tempos notated below this are treated as halved-BPM authoring and doubled back "
                           "up before the beat-fraction check, so a 118 BPM file that plays at 236 is not "

@@ -145,23 +145,43 @@ def test_half_snap_tapping_in_a_fast_map_is_not_a_burst():
     assert d.burst_count == 0
 
 
-def test_quarter_snap_at_the_same_speed_is_a_burst():
-    # The control for the test above: near-identical 120ms tapping, but the
-    # map is 125 BPM (480ms beat) so those notes are a 1/4 - a genuine step up
-    # from the map's pulse. Same milliseconds, opposite verdict; the rhythm is
-    # what changed, which is the whole point of the gate.
+def test_a_slow_songs_honest_quarter_is_still_not_a_burst():
+    # 125 BPM (480ms beat), notes 120ms apart: a real 1/4, passing the rhythm
+    # gate at exactly 0.25 of a beat - and still not a burst, because 120ms
+    # per note is not burst tapping. Being a fast SNAP is not the same as
+    # being FAST, which is what burst_max_gap_ms enforces.
     #
-    # 125 BPM is deliberately the slowest tempo this can be demonstrated at:
-    # one notch below it, min_notated_bpm reads the file as halved notation
-    # and folds the beat, at which point the same notes are a 1/2 again. That
-    # ambiguity is real and not resolvable from the file - a 120 BPM map
-    # tapping 1/4 and a 240 BPM map tapping 1/2 are the same timestamps - and
-    # the fold resolves it toward the far more common authoring choice. See
-    # test_halved_bpm_notation_does_not_manufacture_bursts.
+    # Reported on "Jump & Stream Practice [Arastelia's Dizzy]" (125 BPM,
+    # 120ms) and the MONTAGEM BATCHI set (130 BPM, 115ms). Across all 28
+    # hand-labelled difficulties the split is on speed alone: 75-94ms for the
+    # maps that have bursts, 115-134ms for the ones that don't.
     filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
     d = build(circles(3, step=120, dx=8) + filler, bl=480.0)
     cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert not d.has_bursts
+    assert d.burst_count == 0
+
+
+def test_the_same_pattern_a_bit_faster_is_a_burst():
+    # The control: same shape and same 1/4 snap, but at 170 BPM (353ms beat)
+    # the 1/4 is 88ms - inside the 75-94ms band the labelled burst maps
+    # actually occupy. Speed is the only thing that changed.
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    d = build(circles(3, step=88, dx=8) + filler, bl=352.9)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
     assert d.has_bursts
+    assert d.burst_count == 1
+
+
+def test_the_burst_speed_cap_does_not_touch_streams():
+    # burst_max_gap_ms is deliberately scoped to bursts. A sustained run at
+    # the same 120ms that fails as a burst above must still register as a
+    # stream, because lowering max_gap_ms instead would have silently stopped
+    # calling ~130 BPM stream maps streams - a change no label here supports.
+    d = build(circles(20, step=120, dx=8), bl=480.0)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert d.stream_count == 1
+    assert d.max_stream_len == 20
 
 
 def test_halved_bpm_notation_does_not_manufacture_bursts():
@@ -195,8 +215,10 @@ def test_corrupt_timing_does_not_suppress_every_run():
     # measuring against a number that isn't a tempo.
     assert cm.effective_beat_ms(1e-320) == 0.0
     assert cm.effective_beat_ms(float("inf")) == 0.0
+    # 88ms so the burst speed cap isn't what rejects it - this is testing the
+    # timing-corruption path, not burst_max_gap_ms.
     filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
-    d = build(circles(3, step=120, dx=8) + filler, bl=1e-320)
+    d = build(circles(3, step=88, dx=8) + filler, bl=1e-320)
     cm.classify_diff(d, **cm.DEFAULT_PARAMS)
     assert d.has_bursts
 

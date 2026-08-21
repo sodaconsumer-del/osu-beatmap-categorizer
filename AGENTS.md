@@ -180,10 +180,11 @@ The vocabulary, for anyone new to osu! pattern terms or this codebase:
   decided by SPACING. This split matters: a fast, evenly-spaced sequence of
   wide jumps is still a "run" by the timing test, but its spacing marks it as
   a jump run, not a burst or stream.
-- **Burst** — a run of 3–9 notes, at a snap that is a step up from the map's
-  own pulse (1/4 or 1/3, not 1/2 — see `burst_beat_fraction_max`). Speed alone
-  isn't enough: at 240 BPM an ordinary 1/2 tap is 125ms, which is fast in
-  milliseconds but is just what that map taps all the way through.
+- **Burst** — a run of 3–9 notes that is genuinely FAST: at most
+  `burst_max_gap_ms` (105ms) per note. Being a fast *snap* is not the same
+  thing and is not sufficient — a 125 BPM map's honest 1/4 is 120ms, a real
+  1/4 and not a burst. Nor is spacing the discriminator: the disputed
+  clusters look burst-shaped and pass every spacing check.
 - **Stream** — a run of 10+ notes. "Spaced stream" is the same thing with
   non-overlapping but still deliberate, readable spacing (spacing tier
   "spaced" below) — still a stream, not a jump.
@@ -250,14 +251,46 @@ Decisions that look odd but aren't:
       which is precisely where halved notation lives.
   So the gate only ever decides runs in the 110–140ms band: too slow to be
   self-evidently burst tapping, fast enough to slip under the absolute cap.
-  Measured on the user's hand-sorted mislabel set: all 11 "Jumps with bursts"
-  verdicts on maps with no bursts were 1/2-snap runs at 120–135ms in 223–250
-  BPM maps, and all 11 are fixed. The twelfth (Chug Jug With You, notated 118
-  BPM but played at 236) is the halved-notation case and is fixed by the fold.
-  Real library check, the user's full osu!stable library (58,811
-  difficulties, old vs new end to end): 866 diffs move "Jumps with bursts" →
-  "Jumps (no bursts)". On a 7,572-diff lazer sample the gate rejected 14,339
-  runs that previously counted — 12,429 moving and 1,910 zero-distance.
+
+  **Read the next bullet before relying on any of this for bursts.** The gate
+  was added to fix 11 maps and did, but a later and simpler rule
+  (`burst_max_gap_ms`) turned out to fix those same 11 *and* four the gate got
+  wrong — and it makes the gate inert for bursts. What is left of the gate's
+  job is long runs in the 110–140ms band at 1/2 snap, i.e. streams, which no
+  label in this repo currently covers. It is kept because that job is real and
+  removing it would change stream behaviour on no evidence, not because it is
+  still load-bearing for bursts. If you are here to simplify, this is the
+  first thing to consider deleting — measure the stream side first.
+- **A burst must be genuinely FAST, not merely a fast snap.**
+  `burst_max_gap_ms` (105ms/note, ≈143 BPM stream) is the rule that actually
+  separates the labelled data. A slow song's honest 1/4 is a real 1/4 and
+  still not a burst: 125 BPM gives 120ms, 130 BPM gives 115ms, both well
+  inside the old 140ms cap and both passing the rhythm gate at exactly 0.250
+  of a beat. Reported on "Jump & Stream Practice [Arastelia's Dizzy]" and the
+  whole MONTAGEM BATCHI set.
+  Across all 28 hand-labelled difficulties the separation is clean, and it is
+  on **speed** — not snap, not spacing:
+
+  | | fastest tight run per map |
+  |---|---|
+  | has bursts (13) | 75, 76, 78, 79, 83, 83, 84, 84, 90, 90, 93, 94 ms |
+  | no bursts (15) | 115, 116, 116, 120, 120, 120, 120, 122, 125, 125, 125, 127, 128, 129, 134 ms |
+
+  Any cap in 95–110 scores 28/28; 105 sits in the middle of the gap.
+  Confirmed visually with `osu_visualizer_preview.py`: the disputed clusters
+  are burst-*shaped* (which is exactly why every spacing check passes them)
+  and simply too slow, so spacing was never going to separate them.
+  **Deliberately scoped to bursts rather than lowering `max_gap_ms`**, even
+  though a ~105ms global cap also scores 28/28 on this data. `max_gap_ms`
+  builds the runs streams are found in too, so lowering it would silently
+  stop calling ~130 BPM stream maps streams — and all 28 labels are about
+  bursts. Not changing stream behaviour on a guess.
+  Earlier measurements, from when the rhythm gate was carrying this fix:
+  866 diffs moved "Jumps with bursts" → "Jumps (no bursts)" across the user's
+  full 58,811-difficulty stable library; a 7,572-diff lazer sample had the
+  gate rejecting 14,339 runs (12,429 moving, 1,910 zero-distance). Those
+  numbers predate `burst_max_gap_ms`, so treat them as the order of magnitude,
+  not the current figure.
 - **Runs must be rhythmically consistent.** A real stream doesn't change
   tapping speed partway through.
 - **Spacing is measured from the previous object's END.** Sliders are around
@@ -480,6 +513,7 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `cut_max_dist_ratio` | 4.0 | largest cut-transition distance (× hit-circle diameter) still treated as a skipped note rather than a real jump between two separate runs |
 | `burst_beat_fraction_max` | 0.4 | slowest snap still counted as burst/stream tapping, as a fraction of a beat per note — admits 1/4 (0.25) and 1/3 (0.33), rejects 1/2 (0.5) |
 | `burst_always_fast_ms` | 110.0 | runs at or under this ms/note skip the beat-fraction check entirely — fast enough to be burst tapping whatever snap the file calls it |
+| `burst_max_gap_ms` | 105.0 | slowest ms/note a run may tap and still be a **burst** (≈143 BPM stream). Streams are deliberately unaffected |
 | `min_notated_bpm` | 125.0 | tempos notated below this are treated as halved-BPM authoring and doubled back up before the beat fraction is taken |
 
 Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
