@@ -14,6 +14,7 @@ Run with:  python test_classify.py
        or: pytest test_classify.py
 """
 
+import math
 import os
 
 import classify_maps as cm
@@ -575,6 +576,121 @@ def test_tiny_beat_length_does_not_produce_infinite_bpm():
 def test_non_standard_modes_are_skipped():
     text = HEADER.format(cs=4, bl=300, extra="").replace("Mode: 0", "Mode: 3")
     assert cm.parse_osu_bytes((text + "100,100,1000,1,0").encode(), "t") is None
+
+
+# --- slider path geometry ---------------------------------------------------
+#
+# These pin the curve maths against facts that are true independently of the
+# implementation - the geometry of a semicircle, the endpoint-interpolation
+# property of a bezier - rather than against numbers this code produced.
+
+def _end_of(curve, length, x0=0.0, y0=0.0):
+    return cm._point_at_path_length(cm._slider_path_points(curve, x0, y0), length)
+
+
+def _polyline_end(curve, length, x0=0.0, y0=0.0):
+    """The old control-polygon walk, kept here as the thing being improved on."""
+    pts = [(x0, y0)]
+    for token in curve.split("|")[1:]:
+        bits = token.split(":")
+        if len(bits) == 2:
+            pts.append((float(bits[0]), float(bits[1])))
+    remaining = length
+    for i in range(1, len(pts)):
+        ax, ay = pts[i - 1]
+        bx, by = pts[i]
+        seg = math.hypot(bx - ax, by - ay)
+        if seg <= 0:
+            continue
+        if remaining <= seg:
+            f = remaining / seg
+            return ax + (bx - ax) * f, ay + (by - ay) * f
+        remaining -= seg
+    return pts[-1]
+
+
+def test_a_perfect_circle_slider_follows_its_arc():
+    # (0,0) (50,50) (100,0) is the semicircle of radius 50 centred on (50,0).
+    # Half its arc is pi*50/2 = 78.54px, which lands exactly on the top of
+    # the circle at (50,50). The control polygon instead runs 78.54px into
+    # its second leg and lands nearly 8px away, which is the whole point.
+    half_arc = math.pi * 50 / 2
+    ex, ey = _end_of("P|50:50|100:0", half_arc)
+    assert abs(ex - 50) < 0.5 and abs(ey - 50) < 0.5, f"arc ended at {ex:.2f},{ey:.2f}"
+    px, py = _polyline_end("P|50:50|100:0", half_arc)
+    assert math.hypot(px - ex, py - ey) > 5, \
+        "this fixture is supposed to separate the arc from its chord"
+
+
+def test_a_bezier_ends_where_the_curve_ends_not_where_the_polygon_does():
+    # Two facts true of every bezier, neither of them implementation detail:
+    #   - the curve is no longer than its control polygon
+    #   - the curve passes through its last control point
+    # The old walk satisfies neither, because it measures along the polygon.
+    curve = "B|100:0|100:100"
+    path = cm._slider_path_points(curve, 0.0, 0.0)
+    curve_len = sum(math.hypot(path[i][0] - path[i - 1][0],
+                               path[i][1] - path[i - 1][1])
+                    for i in range(1, len(path)))
+    polygon_len = 200.0
+    assert curve_len < polygon_len, "a bezier cannot be longer than its polygon"
+
+    ex, ey = _end_of(curve, curve_len)
+    assert abs(ex - 100) < 0.5 and abs(ey - 100) < 0.5, \
+        f"a full-length bezier must end on its last control point, got {ex:.2f},{ey:.2f}"
+    px, py = _polyline_end(curve, curve_len)
+    assert math.hypot(px - 100, py - 100) > 30, \
+        "the polygon walk should stop well short - that is the error being fixed"
+
+
+def test_a_repeated_control_point_turns_a_corner():
+    # osu! splits a slider at repeated ("red anchor") control points. Here the
+    # repeat makes two straight segments meeting at a right angle, total
+    # length exactly 100. Treated as one cubic bezier instead, the corner
+    # would round off and the path would be shorter than 100.
+    curve = "B|50:0|50:0|50:50"
+    path = cm._slider_path_points(curve, 0.0, 0.0)
+    total = sum(math.hypot(path[i][0] - path[i - 1][0],
+                           path[i][1] - path[i - 1][1])
+                for i in range(1, len(path)))
+    assert abs(total - 100.0) < 0.5, f"expected a 100px corner, got {total:.2f}"
+    ex, ey = _end_of(curve, 100.0)
+    assert abs(ex - 50) < 0.5 and abs(ey - 50) < 0.5
+
+
+def test_a_linear_slider_is_unchanged_by_all_of_this():
+    # The control: linear sliders were already exact, and must stay exact -
+    # they are 35% of every slider in the library.
+    for length in (10.0, 50.0, 99.0, 100.0):
+        a = _end_of("L|100:0", length)
+        b = _polyline_end("L|100:0", length)
+        assert math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-9, \
+            f"linear moved at length {length}"
+
+
+def test_a_declared_length_past_the_path_extends_it():
+    # osu! lengthens the final segment rather than clamping.
+    ex, ey = _end_of("L|100:0", 200.0)
+    assert abs(ex - 200) < 1e-6 and abs(ey) < 1e-6, f"got {ex},{ey}"
+
+
+def test_extension_stops_when_the_last_two_points_coincide():
+    # osu-stable performs no extension at all in this case and lazer keeps
+    # the quirk. Without it a degenerate slider whose declared length dwarfs
+    # its path extrapolates off the playfield - measured at 93 diameters.
+    ex, ey = _end_of("L|100:0|100:0", 5000.0)
+    assert abs(ex - 100) < 1e-6 and abs(ey) < 1e-6, \
+        f"should have stopped at the repeated point, got {ex},{ey}"
+
+
+def test_slider_duration_is_untouched_by_the_geometry_change():
+    # Only the end POSITION moved. Duration comes from length/velocity and
+    # must still be exactly osu!'s formula.
+    parts = "0,0,1000,2,0,L|100:0,1,100".split(",")
+    end_t, _, _ = cm._slider_end(parts, 1000, 0.0, 0.0, [(0.0, 500.0)], [],
+                                 1.0)
+    # 100px at 100*1.0 px/beat = 1 beat = 500ms.
+    assert abs(end_t - 1500.0) < 1e-6, f"expected 1500, got {end_t}"
 
 
 # --- jump metric -----------------------------------------------------------

@@ -153,6 +153,79 @@ the OS and ignores colours entirely.
 hint label into a narrow column where it clipped its own text. Give rows their
 own frames.
 
+### Slider geometry comes from osu!, not from an approximation
+
+`_slider_path_points()` builds a slider's real path — bezier, perfect-circle
+arc, catmull, linear — and `_point_at_path_length()` walks it. Ported from
+`osu.Game/Rulesets/Objects/SliderPath.cs` and osu-framework's
+`PathApproximator`.
+
+This used to walk the straight polyline through the control points instead.
+That is exact for linear sliders and wrong for everything else, because a
+control polygon is longer than the curve it defines, so the walk stops short
+of the true tail. Measured over **798,166 single-span sliders** in the user's
+library, in hit-circle diameters (`spaced_diam_ratio`, the whole jump-spacing
+threshold, is 2.0):
+
+| curve type | n | mean | p90 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| linear | 279,977 | 0.001 | 0.002 | 0.012 | 0.036 |
+| catmull | 454 | 0.005 | 0.008 | 0.093 | 0.128 |
+| perfect arc | 366,877 | 0.044 | 0.113 | 0.325 | 2.921 |
+| **bezier** | **142,661** | **0.251** | **0.940** | **2.262** | **98.895** |
+
+Linear agreeing to 0.001 is the control that says the port is right — it is
+the one type where both methods must give the same answer. Bezier is the
+problem: at p99 the old tail sat a full jump-threshold away from the real one.
+
+Consequences, measured over 7,497 difficulties: **0.455%** of transitions
+cross the `spaced_diam_ratio` line, jump transitions fall **0.391%**, and
+**0.43%** of verdicts change. The category totals barely move (net ±5 across
+six categories) and the flips are near-symmetric — Hybrid→Streams 7 against
+Streams→Hybrid 7. That is the signature of removing measurement noise rather
+than correcting a bias, which is what this is.
+
+Two details that are easy to get wrong and are both pinned by tests:
+
+- **Repeated control points split the curve.** The "red anchors" in the
+  editor. Treating the whole list as one curve rounds a corner off instead of
+  turning it.
+- **A declared length past the end of the path extends it**, along the final
+  segment's own direction — *unless* the last two path points coincide, where
+  osu-stable performs no extension and lazer preserves the quirk. Without
+  that second rule a degenerate slider extrapolates off the playfield; it
+  measured as a 93-diameter outlier the first time this was run.
+
+Bezier sampling is one point per 8px of control polygon, checked against a
+faithful port of osu-framework's adaptive subdivision: they agree to 0.0035
+diameters, seventy times finer than the error being removed. Parse cost is
+roughly 2x, which is about 6% of scan wall time — the scan is I/O-bound.
+
+### Things checked against the osu! sources and deliberately NOT done
+
+Each of these was implemented far enough to measure, then dropped. Don't
+re-derive them from scratch.
+
+- **Stacking.** osu! offsets stacked objects by `StackHeight * Scale * -6.4`
+  in both axes and lazer's own difficulty calculator measures every distance
+  between `StackedPosition`s, so this looked obviously right. Ported
+  `OsuBeatmapProcessor.applyStacking` in full and measured it: **2 extra
+  verdict changes in 3,675 difficulties** (0.05%) on top of the slider fix.
+  The offset is ~5px per stack level against a ~73px diameter, far too small
+  to move a 2.0-diameter threshold. Not worth the code.
+- **Declared break periods.** Every `.osu` names its breaks outright in
+  `[Events]` as `2,start,end`, and osu! honours them past
+  `BreakPeriod.MIN_BREAK_DURATION` (650ms), where we infer breaks from
+  `jump_gap_cap_ms` (1000ms). Since `eligible` is the denominator under every
+  coverage figure, a systematic error here would move everything at once.
+  Measured over 2,624,987 transitions: **44 of them** sit inside a declared
+  break that we count as gameplay — 0.002%. Exactly one difficulty in 3,688
+  saw its denominator move by more than 1%. The cap already does this job.
+
+For the record, one thing that *was* confirmed rather than changed:
+`DiffUtils.MillisecondsToBPM` is `60000 / (ms * 4)`, i.e. `15000 / ms`, which
+is the stream-BPM formula quoted throughout this file and in the CLI help.
+
 ## Classification
 
 "Classification" here means one specific thing: scanning a beatmap

@@ -337,18 +337,27 @@ def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
     so parts[5] is the curve, parts[6] the number of slides (1 = no repeat)
     and parts[7] the path length in osu!pixels.
 
-    Duration is exact, straight from osu!'s own formula. The end POSITION is
-    an approximation: the true path is a bezier/perfect-circle/catmull curve,
-    and computing it properly means reimplementing osu!'s path generator. We
-    instead walk `length` pixels along the polyline through the control
-    points, which is exact for linear sliders and close for the gentle curves
-    that make up most real maps. It over-runs slightly on tightly-curved
-    sliders (a chord is shorter than its arc), in which case it clamps to the
-    last control point.
+    Both duration and end position come straight from osu!'s own formulas -
+    see _slider_path_points(), which builds the real bezier / perfect-circle /
+    catmull path rather than the straight polyline through the control points.
 
-    This only feeds spacing, and even a rough tail position is far better
-    than the alternative of using the head - a long slider whose tail sits
-    next to the following note otherwise reads as a huge jump.
+    That approximation used to live here, and it was not harmless. Measured
+    over 798,166 single-span sliders in the user's library, walking the
+    control polygon instead of the curve put the tail this far from where
+    osu! actually ends it (in hit-circle diameters, so 2.0 is the whole
+    jump-spacing threshold):
+
+        curve type      n        mean     p90     p99      max
+        linear     279,977      0.001   0.002   0.012    0.036
+        catmull        454      0.005   0.008   0.093    0.128
+        perfect arc 366,877     0.044   0.113   0.325    2.921
+        bezier     142,661      0.251   0.940   2.262   98.895
+
+    Linear is exact either way, which is the control that says the port is
+    right. Bezier is the problem: its control polygon is materially longer
+    than the curve it defines, so the walk stops short, and at p99 it stops a
+    whole jump-threshold short. 0.455% of all transitions cross the
+    spaced_diam_ratio line because of this, and it moves 0.38% of verdicts.
     """
     try:
         slides = int(parts[6])
@@ -373,14 +382,25 @@ def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
         return end_t, x, y
 
     curve = parts[5] if len(parts) > 5 else ""
-    ex, ey = _point_along_polyline(curve, x, y, length)
+    ex, ey = _point_at_path_length(_slider_path_points(curve, x, y), length)
     return end_t, ex, ey
 
 
-def _point_along_polyline(curve, x0, y0, length):
-    """Walk `length` pixels from (x0, y0) along the slider's control points."""
+# Slider path geometry, ported from osu!. The reference implementations are
+# osu.Game/Rulesets/Objects/SliderPath.cs (segmentation, length fitting) and
+# osu-framework's PathApproximator (the three curve types). Kept stdlib-only
+# like the rest of this file, because it ships in the PyInstaller build.
+
+# Curve-flattening tolerance, matching osu-framework's own constant.
+_CIRCULAR_ARC_TOLERANCE = 0.1
+
+
+def _parse_control_points(curve, x0, y0):
+    """(kind, points) from a slider's curve field, head position included."""
+    tokens = curve.split("|")
+    kind = (tokens[0].strip().upper() + "L")[0] if tokens else "L"
     pts = [(x0, y0)]
-    for token in curve.split("|")[1:]:  # first token is the curve type letter
+    for token in tokens[1:]:
         bits = token.split(":")
         if len(bits) != 2:
             continue
@@ -388,21 +408,204 @@ def _point_along_polyline(curve, x0, y0, length):
             pts.append((float(bits[0]), float(bits[1])))
         except ValueError:
             continue
-    if len(pts) < 2:
-        return x0, y0
+    return kind, pts
 
+
+def _split_at_red_anchors(pts):
+    """
+    osu! splits a slider's control points into independent curve segments
+    wherever a point is repeated - the "red anchors" in the editor. Treating
+    the whole list as one curve rounds the corner off instead of turning it.
+    """
+    segs = []
+    start = 0
+    for i in range(len(pts) - 1):
+        if pts[i] == pts[i + 1]:
+            segs.append(pts[start:i + 1])
+            start = i + 1
+    segs.append(pts[start:])
+    return [seg for seg in segs if seg]
+
+
+def _bezier_points(control, samples):
+    """de Casteljau evaluation of one bezier segment at `samples`+1 points."""
+    n = len(control)
+    out = []
+    for k in range(samples + 1):
+        t = k / samples
+        tmp = list(control)
+        for r in range(1, n):
+            for i in range(n - r):
+                tmp[i] = (tmp[i][0] + (tmp[i + 1][0] - tmp[i][0]) * t,
+                          tmp[i][1] + (tmp[i + 1][1] - tmp[i][1]) * t)
+        out.append(tmp[0])
+    return out
+
+
+def _bezier_sample_count(control):
+    """
+    How finely to sample a bezier.
+
+    Proportional to the control polygon's length rather than fixed, so a long
+    sweeping slider is not under-sampled and a short one is not over-sampled.
+
+    One sample per 8px of control polygon was chosen by measuring against a
+    faithful port of osu-framework's own adaptive subdivision, which flattens
+    to a 0.25px tolerance. Agreement is 0.0035 diameters at worst - roughly
+    seventy times finer than the 0.25-diameter mean error this replaces, and
+    six hundred times finer than its p99. Sampling four times denser buys
+    another factor of ten of agreement that nothing downstream can see, for
+    a quarter more parse time; this is where the curve stops mattering.
+    """
+    span = 0.0
+    for i in range(1, len(control)):
+        span += math.hypot(control[i][0] - control[i - 1][0],
+                           control[i][1] - control[i - 1][1])
+    return max(8, min(128, int(span / 8) + 8))
+
+
+def _circular_arc_points(pts):
+    """
+    The perfect-circle (P) curve: the unique arc through three points.
+
+    Returns None when they are collinear or the arc is degenerate, which is
+    exactly when osu! gives up and falls back to a bezier through the same
+    points - see SliderPath.calculateSubPath.
+    """
+    (x1, y1), (x2, y2), (x3, y3) = pts
+    a = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    if abs(a) < 1e-9:
+        return None
+    s1 = x1 * x1 + y1 * y1
+    s2 = x2 * x2 + y2 * y2
+    s3 = x3 * x3 + y3 * y3
+    cx = (s1 * (y2 - y3) + s2 * (y3 - y1) + s3 * (y1 - y2)) / a
+    cy = (s1 * (x3 - x2) + s2 * (x1 - x3) + s3 * (x2 - x1)) / a
+    r = math.hypot(x1 - cx, y1 - cy)
+    if not math.isfinite(r) or r <= 0:
+        return None
+
+    t1 = math.atan2(y1 - cy, x1 - cx)
+    t2 = math.atan2(y2 - cy, x2 - cx)
+    t3 = math.atan2(y3 - cy, x3 - cx)
+    while t2 < t1:
+        t2 += 2.0 * math.pi
+    while t3 < t1:
+        t3 += 2.0 * math.pi
+    if t3 < t2:
+        t3 -= 2.0 * math.pi
+    direction = -1.0 if t3 < t1 else 1.0
+    theta_range = abs(t3 - t1)
+
+    if 2.0 * r <= _CIRCULAR_ARC_TOLERANCE:
+        amount = 2
+    else:
+        inner = max(-1.0, min(1.0, 1.0 - _CIRCULAR_ARC_TOLERANCE / r))
+        denom = 2.0 * math.acos(inner)
+        amount = 2 if denom <= 0 else max(2, int(math.ceil(theta_range / denom)))
+    if amount >= 1000:
+        # osu! bails out to a bezier rather than emitting a huge point list.
+        return None
+
+    return [(cx + math.cos(t1 + direction * (i / (amount - 1)) * theta_range) * r,
+             cy + math.sin(t1 + direction * (i / (amount - 1)) * theta_range) * r)
+            for i in range(amount)]
+
+
+def _catmull_point(v1, v2, v3, v4, t):
+    t2 = t * t
+    t3 = t * t2
+    return (0.5 * (2 * v2[0] + (-v1[0] + v3[0]) * t
+                   + (2 * v1[0] - 5 * v2[0] + 4 * v3[0] - v4[0]) * t2
+                   + (-v1[0] + 3 * v2[0] - 3 * v3[0] + v4[0]) * t3),
+            0.5 * (2 * v2[1] + (-v1[1] + v3[1]) * t
+                   + (2 * v1[1] - 5 * v2[1] + 4 * v3[1] - v4[1]) * t2
+                   + (-v1[1] + 3 * v2[1] - 3 * v3[1] + v4[1]) * t3))
+
+
+def _catmull_points(pts, detail=25):
+    """Legacy catmull sliders. Vanishingly rare - 454 in 798k - but cheap."""
+    out = []
+    for i in range(len(pts) - 1):
+        v1 = pts[i - 1] if i > 0 else pts[i]
+        v2 = pts[i]
+        v3 = pts[i + 1]
+        v4 = pts[i + 2] if i < len(pts) - 2 else (v3[0] * 2 - v2[0],
+                                                  v3[1] * 2 - v2[1])
+        for c in range(detail + 1):
+            out.append(_catmull_point(v1, v2, v3, v4, c / detail))
+    return out
+
+
+def _slider_path_points(curve, x0, y0):
+    """
+    The slider's real path as a dense polyline, starting at (x0, y0).
+
+    Linear sliders return their control points unchanged, which is both exact
+    and free - and is why the linear row of the table in _slider_end() reads
+    0.001 diameters. The other three types are genuinely curved, and the
+    control polygon is not a stand-in for them.
+    """
+    kind, pts = _parse_control_points(curve, x0, y0)
+    if len(pts) < 2:
+        return [(x0, y0)]
+    if kind == "L":
+        return pts
+
+    path = []
+    for seg in _split_at_red_anchors(pts):
+        if len(seg) < 2:
+            sub = seg
+        elif kind == "P" and len(seg) == 3:
+            sub = _circular_arc_points(seg) or _bezier_points(
+                seg, _bezier_sample_count(seg))
+        elif kind == "C":
+            sub = _catmull_points(seg)
+        else:
+            sub = _bezier_points(seg, _bezier_sample_count(seg))
+        for pt in sub:
+            if not path or pt != path[-1]:
+                path.append(pt)
+    return path or [(x0, y0)]
+
+
+def _point_at_path_length(path, length):
+    """
+    The point `length` pixels along `path`.
+
+    When the declared length runs past the end of the path, osu! lengthens
+    the final segment along its own direction rather than clamping - unless
+    the last two path points coincide, where osu-stable performs no extension
+    at all and lazer preserves that quirk (SliderPath.calculateLength). Both
+    behaviours are reproduced here: without the second one, a degenerate
+    slider whose declared length dwarfs its path extrapolates off into
+    nowhere, which measured as a 93-diameter outlier.
+    """
+    if not path:
+        return 0.0, 0.0
+    if len(path) < 2 or length <= 0:
+        return path[0]
     remaining = length
-    for i in range(1, len(pts)):
-        ax, ay = pts[i - 1]
-        bx, by = pts[i]
-        seg = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+    for i in range(1, len(path)):
+        ax, ay = path[i - 1]
+        bx, by = path[i]
+        seg = math.hypot(bx - ax, by - ay)
         if seg <= 0:
             continue
         if remaining <= seg:
             f = remaining / seg
             return ax + (bx - ax) * f, ay + (by - ay) * f
         remaining -= seg
-    return pts[-1]
+    if path[-1] == path[-2]:
+        return path[-1]
+    for i in range(len(path) - 1, 0, -1):
+        ax, ay = path[i - 1]
+        bx, by = path[i]
+        seg = math.hypot(bx - ax, by - ay)
+        if seg > 0:
+            return (bx + (bx - ax) / seg * remaining,
+                    by + (by - ay) / seg * remaining)
+    return path[-1]
 
 
 # --------------------------------------------------------------------------
