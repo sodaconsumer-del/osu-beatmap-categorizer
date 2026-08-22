@@ -98,6 +98,13 @@ class DiffInfo:
     overall_difficulty: float = 5.0
     approach_rate: float = 5.0
 
+    # The mapper's own [Metadata] Tags line, lowercased, or "" if absent.
+    # Not consulted by classify_diff and deliberately so - see "Mapper tags
+    # are a check, never an input" in AGENTS.md. Carried through to
+    # report.csv so eval_classifier.py --tags can hold the classifier's
+    # verdict up against what the mapper called the map.
+    tags: str = ""
+
     burst_count: int = 0
     stream_count: int = 0
     cutstream_count: int = 0
@@ -183,6 +190,7 @@ def parse_osu_bytes(raw, display_name, path=None):
 
     title_m = re.search(r"^Title:(.*)$", text, re.M)
     diff_m = re.search(r"^Version:(.*)$", text, re.M)
+    tags_m = re.search(r"^Tags:(.*)$", text, re.M)
     cs_m = re.search(r"^CircleSize:(.*)$", text, re.M)
     mode_m = re.search(r"^Mode:(.*)$", text, re.M)
     sm_m = re.search(r"^SliderMultiplier:(.*)$", text, re.M)
@@ -299,6 +307,7 @@ def parse_osu_bytes(raw, display_name, path=None):
         slider_multiplier=slider_multiplier,
         overall_difficulty=od,
         approach_rate=ar,
+        tags=(tags_m.group(1).strip().lower() if tags_m else ""),
     )
 
 
@@ -1897,7 +1906,8 @@ def read_osu_db(path, log_cb=None, want_mode=0):
         r.skip(4)                # stack leniency
         mode = r.u8()
         r.string()               # source
-        r.string()               # tags
+        r.string()               # tags - the .osu is parsed anyway on this
+                                 # path and its own Tags line is authoritative
         r.skip(2)                # online offset
         r.string()               # title font
         r.skip(1)                # unplayed
@@ -3039,7 +3049,8 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                             "max_stream_len", "jump_pct", "burst_note_total", "stream_note_total",
                             "total_note_count", "counted_gaps",
                             "burst_transitions", "stream_transitions", "jump_transitions",
-                            "ranked_status", "star_rating", "online_id", "mods", "category", "path"])
+                            "ranked_status", "star_rating", "online_id", "mods", "category",
+                            "tags", "path"])
                 def safe_round(x, ndigits=None):
                     # round() raises OverflowError on inf and ValueError on
                     # nan - one bad map (a corrupt beatLength, say) shouldn't
@@ -3057,7 +3068,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                                 d.burst_transitions, d.stream_transitions, d.jump_transitions,
                                 d.ranked_status or "unknown", d.star_rating if d.star_rating is not None else "unknown",
                                 d.online_id if d.online_id is not None else "unknown", mods_str,
-                                category_of(d), d.path])
+                                category_of(d), d.tags, d.path])
             log(f"Full per-diff results written to {csv_path}")
         except Exception:
             import traceback

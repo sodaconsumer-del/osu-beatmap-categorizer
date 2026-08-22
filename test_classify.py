@@ -1333,6 +1333,117 @@ def test_counted_gaps_is_populated_and_matches_jump_pcts_own_denominator():
         assert implied_jump_count == 0
 
 
+# --- mapper tags -----------------------------------------------------------
+
+def build_tagged(lines, tags):
+    """`build`, but with a Tags: line in [Metadata]."""
+    text = (HEADER.format(cs=4, bl=300.0, extra="")
+            .replace("[Metadata]\nTitle:Test\n",
+                     f"[Metadata]\nTitle:Test\nTags:{tags}\n")
+            + "\n".join(lines))
+    return cm.parse_osu_bytes(text.encode(), "test")
+
+
+def test_tags_are_parsed_and_lowercased():
+    d = build_tagged(circles(4), "Stream JUMP Speed")
+    assert d.tags == "stream jump speed"
+
+
+def test_a_map_with_no_tags_line_gets_an_empty_string():
+    # Not None - every consumer treats this as text, and a missing Tags line
+    # is common enough that the None check would be everywhere.
+    assert build(circles(4)).tags == ""
+
+
+def test_tags_never_reach_the_classifier():
+    """
+    The whole value of mapper tags is that they are an independent opinion,
+    and an opinion that fed back into the thing it checks would be worthless.
+    Two maps identical but for their tags must classify identically.
+    """
+    lines = circles(14)
+    plain = build(lines)
+    tagged = build_tagged(lines, "stream jump farm stamina")
+    cm.classify_diff(plain, **cm.DEFAULT_PARAMS)
+    cm.classify_diff(tagged, **cm.DEFAULT_PARAMS)
+    assert cm.category_of(plain) == cm.category_of(tagged)
+    for field in ("burst_count", "stream_count", "jump_pct", "has_hybrid",
+                  "stream_transitions", "burst_transitions",
+                  "jump_transitions", "max_stream_len"):
+        assert getattr(plain, field) == getattr(tagged, field), field
+
+
+def test_the_tag_families_only_claim_what_they_can_defend():
+    import eval_classifier as ev
+
+    for family, cats in ev.FAMILY_CATEGORIES.items():
+        assert cats <= set(cm.CATEGORIES), family
+    for word, family in ev.TAG_FAMILIES.items():
+        assert family in ev.FAMILY_CATEGORIES, word
+    # Words this tool has no category for must not be scored - guessing a
+    # mapping for "tech" or "alt" would be inventing the answer.
+    for word in ev.UNSCORED_WORDS:
+        assert word not in ev.TAG_FAMILIES, word
+
+
+def test_tag_words_reads_both_the_tags_and_the_difficulty_name():
+    import eval_classifier as ev
+
+    assert "stream" in ev.tag_words({"tags": "anime stream vocaloid",
+                                     "diff_name": "Insane"})
+    assert "jump" in ev.tag_words({"tags": "", "diff_name": "Jump Training"})
+    # Substrings must not match - "streamer" in a tag list is somebody's name.
+    assert ev.tag_words({"tags": "streamer", "diff_name": "Extra"}) == set()
+
+
+def test_a_near_miss_is_told_apart_from_a_missed_detection():
+    """
+    The distinction the diagnostic rests on: a threshold sitting in the wrong
+    place needs a different fix from a detector that saw nothing at all, and
+    reporting them together would bury both.
+    """
+    import eval_classifier as ev
+
+    floor = cm.DEFAULT_PARAMS["stream_pct_threshold"]
+    near = {"total_note_count": "1000",
+            "stream_note_total": str(int(10 * (floor - 1))),   # just under
+            "jump_pct": "0", "counted_gaps": "900", "max_stream_len": "14"}
+    assert ev.is_near_miss(near, {"stream"})
+
+    nothing = {"total_note_count": "1000", "stream_note_total": "0",
+               "jump_pct": "0", "counted_gaps": "900", "max_stream_len": "0"}
+    assert not ev.is_near_miss(nothing, {"stream"})
+
+    # All jumps, and lost only for being too short to judge: that is the
+    # jump_min_transitions line, not a detection failure.
+    short = {"total_note_count": "60", "stream_note_total": "0",
+             "jump_pct": "100",
+             "counted_gaps": str(cm.DEFAULT_PARAMS["jump_min_transitions"] - 5),
+             "max_stream_len": "0"}
+    assert ev.is_near_miss(short, {"jump"})
+
+
+def test_the_report_csv_carries_tags_so_the_check_can_be_rerun():
+    import csv as _csv
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "r.csv")
+        # Go through run_pipeline rather than reimplementing the CSV writer,
+        # so this notices if the column is added to the header but not the row.
+        with open(os.path.join(tmp, "one.osu"), "w", encoding="utf-8") as f:
+            f.write(HEADER.format(cs=4, bl=300.0, extra="")
+                    .replace("[Metadata]\nTitle:Test\n",
+                             "[Metadata]\nTitle:Test\nTags:stream marathon\n")
+                    + "\n".join(circles(14)))
+        cm.run_pipeline(tmp, csv_path=out, write_db=False, log_cb=lambda m: None)
+        with open(out, newline="", encoding="utf-8") as f:
+            rows = list(_csv.DictReader(f))
+    assert rows, "the pipeline wrote no rows"
+    assert "tags" in rows[0], "report.csv must carry a tags column"
+    assert rows[0]["tags"] == "stream marathon"
+
+
 # --- osu!stable database ---------------------------------------------------
 
 def _uleb(n):

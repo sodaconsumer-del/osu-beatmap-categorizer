@@ -863,9 +863,11 @@ spacing-based can tell the difference.
 ### `report.csv` columns
 
 `title, diff_name, bpm, has_bursts, has_streams, has_jumps, has_cutstreams,
-burst_runs, stream_runs, cutstream_runs, max_burst_len, max_stream_len,
-jump_pct, burst_note_total, stream_note_total, total_note_count, counted_gaps,
-ranked_status, star_rating, online_id, mods, category, path`
+has_hybrid, active_sections, stream_sections, jump_sections, burst_runs,
+stream_runs, cutstream_runs, max_burst_len, max_stream_len, jump_pct,
+burst_note_total, stream_note_total, total_note_count, counted_gaps,
+burst_transitions, stream_transitions, jump_transitions, ranked_status,
+star_rating, online_id, mods, category, tags, path`
 
 `burst_transitions` / `stream_transitions` / `jump_transitions` are the
 partition described under "One transition, one label" — written so a
@@ -887,6 +889,63 @@ both prefer this column and only fall back to recomputing from the raw flags
 for CSVs from before it existed. `online_id`/`star_rating`/`ranked_status`
 read `"unknown"` when the scan path couldn't supply them (a bare folder walk
 never can — see "Three scan paths").
+
+### Mapper tags are a check, never an input
+
+Every `.osu` carries a `Tags:` line the mapper wrote. `DiffInfo.tags` holds
+it, `report.csv` has a `tags` column, and `eval_classifier.py --tags` holds
+the classifier's verdicts up against it.
+
+**Do not feed tags into `classify_diff()`, and do not tune thresholds to the
+agreement rate.** `test_tags_never_reach_the_classifier` enforces the first
+half. The reason for the second is that mappers tag for searchability, not
+for accuracy: a set carries the whole spread of words its guest mappers used,
+tags get copied across diffs of a set that do not play alike (the Easy of a
+stream mapset is tagged `stream` too), and plenty are tagged for a tournament
+or an artist. Fitting to this fits tag-writing convention. What it is for is
+the disagreements.
+
+Why it is worth having anyway: it needs no network and no hand-labelling, 11%
+of a real library names a skillset, and it is **the only outside evidence
+that exists for Streams and Hybrid** — the hand-labelled set in
+`D:\!Claude reference folder\Mislabel` is entirely about jumps and bursts.
+
+Note the name collision with the thing `eval_classifier.py`'s header says was
+tried and dropped. Those are osu!'s **server-side community usertags**
+(`skillset/streams`, and so on), which needed the API and covered almost
+nothing outside the top few hundred maps. This is the mapper's own metadata
+field, shipped inside every copy of the map. Different source, different
+coverage.
+
+Measured over 459 tagged difficulties in one shard:
+
+| word | n | Streams | Hybrid | Bursts | Jumps+b | Jumps | Misc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `stream` | 131 | 69% | 15% | 2% | 8% | 3% | 3% |
+| `deathstream` | 57 | 65% | 30% | 0% | 5% | 0% | 0% |
+| `stamina` | 39 | 79% | 10% | 3% | 3% | 5% | 0% |
+| `jump` | 89 | 6% | 0% | 1% | 47% | 40% | 6% |
+| `jumps` | 58 | 0% | 2% | 0% | 41% | 53% | 3% |
+| `farm` | 19 | 21% | 0% | 0% | 21% | 53% | 5% |
+
+Only words with a defensible mapping onto `CATEGORIES` are scored
+(`TAG_FAMILIES`). `tech`, `alt`, `aim`, `speed`, `flow` and `burst` are shown
+in the breakdown and left out of the agreement figure, because this tool has
+no category for them and inventing a mapping would be inventing the answer.
+
+**Reading the output.** Disagreements are split into *near the threshold* and
+*not close*, because they need opposite fixes. A map tagged `stream` that
+came out Bursts on 14.2% coverage against a 15% floor is a threshold
+question; the same map with no stream run at all is a detection question.
+`--write-disagreements out.csv` dumps them with paths so they can be opened
+in the visualizer.
+
+**The Hybrid check.** Maps tagged BOTH `stream` and `jump` are what Hybrid
+claims to be for, so Hybrid should be over-represented among them. This is
+the only independent test of that category anywhere in the repo. On the first
+run it was *under*-represented — 1 of 19 against a 10% base rate — on a
+sample far too small to conclude from, but small enough that widening it is
+the obvious next step before trusting Hybrid.
 
 ## Testing
 
