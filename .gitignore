@@ -29,3 +29,5 @@ osu-categorizer-export/
 .idea/
 Thumbs.db
 desktop.ini
+realm-reader/publish/
+realm-reader/FodyWeavers.xsd

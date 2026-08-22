@@ -1545,6 +1545,138 @@ def test_osu_db_filters_non_standard_modes():
     assert len(list(cm.read_osu_db(path, want_mode=None))) == 2
 
 
+def _stable_library(tmp, indexed, unindexed, extra_in_indexed=()):
+    """
+    Lays out a Songs/ tree plus a matching osu!.db.
+
+    `indexed`   - (folder, filename) pairs the db will name
+    `unindexed` - (folder, filename) pairs written to disk only
+    `extra_in_indexed` - files inside an indexed folder that the db omits
+    """
+    songs = os.path.join(tmp, "Songs")
+    entries = []
+    for i, (folder, filename) in enumerate(indexed):
+        os.makedirs(os.path.join(songs, folder), exist_ok=True)
+        with open(os.path.join(songs, folder, filename), "w",
+                  encoding="utf-8") as f:
+            f.write(HEADER.format(cs=4, bl=300.0, extra="")
+                    + "\n".join(circles(14)))
+        e = dict(_DB_ENTRY)
+        e.update(folder=folder, filename=filename, md5=f"{i:032x}",
+                 state=4, map_id=1000 + i)
+        entries.append(e)
+    for folder, filename in list(unindexed) + list(extra_in_indexed):
+        os.makedirs(os.path.join(songs, folder), exist_ok=True)
+        with open(os.path.join(songs, folder, filename), "w",
+                  encoding="utf-8") as f:
+            f.write(HEADER.format(cs=4, bl=300.0, extra="")
+                    + "\n".join(circles(14)))
+    db = os.path.join(tmp, "osu!.db")
+    with open(db, "wb") as f:
+        f.write(_build_osu_db(entries))
+    return db, songs
+
+
+def test_maps_osu_db_has_never_seen_are_still_scanned():
+    """
+    The fast path takes its file list from osu!.db, so anything the db has
+    not indexed is not merely missing its ranked status - it is absent from
+    the scan entirely. On the user's real library that was 2,466 folders and
+    4,856 difficulties, 9.7% of Songs/, almost all of them bare-set-id
+    folders left by an external downloader.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db, songs = _stable_library(
+            tmp,
+            indexed=[("123 Artist - Song", "song [Insane].osu")],
+            unindexed=[("2589428", "downloaded [Extra].osu"),
+                       ("2589429", "another [Hard].osu")])
+        results, errors = cm.scan_stable_db(db, songs, log_cb=lambda m: None)
+    assert len(results) == 3, f"expected 1 indexed + 2 recovered, got {len(results)}"
+    assert not errors
+
+
+def test_recovered_maps_admit_they_have_no_ranked_status():
+    # Ranked status, star rating and online id all come from the db, and the
+    # db is exactly what has not seen these files. Reporting them as unranked
+    # is the honest reading of "not known" - inventing one would be worse.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db, songs = _stable_library(
+            tmp,
+            indexed=[("123 Artist - Song", "song [Insane].osu")],
+            unindexed=[("2589428", "downloaded [Extra].osu")])
+        results, _ = cm.scan_stable_db(db, songs, log_cb=lambda m: None)
+
+    indexed = [d for d in results if d.ranked_status is not None]
+    recovered = [d for d in results if d.ranked_status is None]
+    assert len(indexed) == 1 and indexed[0].ranked_status == "ranked"
+    assert len(recovered) == 1
+    assert recovered[0].star_rating is None
+    assert recovered[0].online_id is None
+    # It must still carry a usable hash, or it cannot go in a collection.db.
+    assert len(recovered[0].version_hash) == 32
+    assert not cm.is_ranked(recovered[0].ranked_status)
+
+
+def test_an_indexed_folder_is_not_reopened():
+    """
+    The cost guarantee. Only folders the db does not name are opened, which
+    on the real library was 0.4s against the 168s a full pass over all 22,868
+    indexed folders took - 420x the time to find 20% more maps. If this ever
+    starts walking indexed folders, the fast path has lost its point.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db, songs = _stable_library(
+            tmp,
+            indexed=[("123 Artist - Song", "song [Insane].osu")],
+            unindexed=[],
+            # A second difficulty inside an INDEXED folder that the db omits.
+            extra_in_indexed=[("123 Artist - Song", "song [Extra].osu")])
+        results, _ = cm.scan_stable_db(db, songs, log_cb=lambda m: None)
+    assert len(results) == 1, \
+        "indexed folders must not be reopened - that is the 168s this avoids"
+
+
+def test_a_folder_of_only_other_modes_is_not_treated_as_unindexed():
+    """
+    read_osu_db is read with want_mode=None so folder names of taiko/ctb/
+    mania entries are collected too. Filtering to standard first would leave
+    a mania-only folder looking unindexed, and every file in it would be
+    opened just to discover it is not standard.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        songs = os.path.join(tmp, "Songs")
+        os.makedirs(os.path.join(songs, "999 Mania Only"))
+        # A standard-mode file on disk, but the db lists this folder as mania.
+        with open(os.path.join(songs, "999 Mania Only", "m [Hard].osu"), "w",
+                  encoding="utf-8") as f:
+            f.write(HEADER.format(cs=4, bl=300.0, extra="")
+                    + "\n".join(circles(14)))
+        mania = dict(_DB_ENTRY)
+        mania.update(folder="999 Mania Only", filename="m [Hard].osu",
+                     mode=3, md5="b" * 32)
+        std = dict(_DB_ENTRY)
+        os.makedirs(os.path.join(songs, std["folder"]))
+        with open(os.path.join(songs, std["folder"], std["filename"]), "w",
+                  encoding="utf-8") as f:
+            f.write(HEADER.format(cs=4, bl=300.0, extra="")
+                    + "\n".join(circles(14)))
+        db = os.path.join(tmp, "osu!.db")
+        with open(db, "wb") as f:
+            f.write(_build_osu_db([std, mania]))
+        results, _ = cm.scan_stable_db(db, songs, log_cb=lambda m: None)
+    assert len(results) == 1, \
+        "the mania folder is known to osu! and must not be re-opened"
+
+
 def test_osu_db_maps_stable_status_bytes():
     # stable's status encoding differs from lazer's and the API's.
     wanted = {1: "unsubmitted", 2: "pending", 4: "ranked",

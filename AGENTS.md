@@ -75,6 +75,53 @@ recover.
 Every fallback is silent-by-design but **logged**. If you add a new failure
 mode, log it — see "silent phases" below for why.
 
+### osu!.db is not the whole library
+
+The stable fast path takes its file list from `osu!.db`, which means anything
+the db has not indexed is not merely missing its ranked status — it is
+**absent from the scan entirely**. osu! writes a map into its db when it
+imports it, at startup; a library that has had maps added since osu! last ran
+is simply short by that many maps.
+
+On the user's library that is **2,466 folders and 4,856 difficulties, 9.7% of
+Songs/**, and **91% of those folders are named with a bare set id**
+(`1000624`, `2589428`) — the shape osu!collector and other external
+downloaders leave, as against osu!'s own `<id> Artist - Title`. So this is
+not an edge case for anyone who downloads maps outside the client.
+
+`_scan_unindexed_folders()` picks them up after the db pass. It opens **only
+the folders the db does not name**, which is what keeps it affordable:
+
+| | cost | difficulties found |
+|---|---:|---:|
+| one `listdir` of `Songs/` + the 2,466 unknown folders | **0.4s** | **4,856** |
+| also checking all 22,868 indexed folders for new files | 168.6s | +995 |
+
+420x the time for 20% more maps, so the indexed folders are deliberately not
+reopened, and `test_an_indexed_folder_is_not_reopened` holds that line. The
+995 stragglers are difficulties added to a mapset the db already knows; the
+plain `scan_folder()` path finds them if anyone needs them.
+
+Two details that are easy to get wrong:
+
+- **Read the db with `want_mode=None`, then filter to standard.** The folder
+  names of taiko/ctb/mania entries are still needed, or a mania-only folder
+  looks unindexed and every file in it gets opened just to discover it is not
+  standard. `read_osu_db()` yields `mode` for exactly this.
+- **Recovered difficulties have no ranked status, star rating or online id.**
+  Those live in the db, and the db is what has not seen them. They report as
+  unranked, which is the honest reading of "not known". They do carry a
+  correct `version_hash`, because `parse_osu_file()` computes the same
+  content MD5 the db would have supplied — so they can still go into a
+  collection.db.
+
+Worth recording alongside this, because it was the original hypothesis and it
+turned out to be wrong: **stable's cached ranked status is not stale.** Of
+22,843 difficulties it calls `pending`, a cross-check against the lazer realm
+(joined on MD5, 57,749 maps in both) confirms 22,821 as graveyard/wip/none —
+**22 disagree, 0.1%**. The 45% of the library that reads as unranked really is
+unranked. The gap was never wrong statuses; it was missing maps.
+
 ### Scan throughput: it's I/O latency, and the pool size is not about CPUs
 
 Every scan path is dominated by per-file `open()`/`read()` latency, not by

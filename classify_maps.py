@@ -1933,6 +1933,9 @@ def read_osu_db(path, log_cb=None, want_mode=0):
             "map_id": map_id if map_id > 0 else None,
             "star_rating": star_rating,
             "ranked_status": _STABLE_STATUS.get(state, "unknown"),
+            # Carried so a caller reading every mode (to collect folder names
+            # it must not mistake for unindexed) can still filter to standard.
+            "mode": mode,
         }
 
 
@@ -1963,6 +1966,26 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     Fast path for osu!stable: take the file list from osu!.db instead of
     walking Songs/.
 
+    Then pick up whatever osu!.db has never heard of. Taking the file list
+    from the db means anything missing from the db is invisible to this scan
+    entirely - not merely missing its ranked status and star rating, but
+    absent from the output. On the user's library that is 2,466 folders and
+    4,856 difficulties, 9.7% of Songs/, and 91% of those folders are named
+    with a bare set id - the shape an external downloader such as
+    osu!collector leaves, as opposed to osu!'s own "<id> Artist - Title".
+    osu! only writes them into its db once it has imported them, which it
+    does at startup, so a library that has had maps added since osu! last ran
+    is simply short by that many maps.
+
+    Only the folders the db does not name are opened, so this costs one
+    listdir of Songs/ plus one per unknown folder - not the full recursive
+    walk the fast path exists to avoid.
+
+    Difficulties recovered this way carry no ranked status, star rating or
+    online id: those live in the db, and the db is what has not seen them.
+    They are reported as unranked, which is the honest reading of "not
+    known", and is in any case better than the map not appearing at all.
+
     Returns (results, errors), or None if the db can't be used - callers fall
     back to scan_folder() in that case.
     """
@@ -1977,10 +2000,18 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     log(f"Found osu!.db - reading the beatmap list from it instead of walking {songs_dir} "
         f"(much faster, and skips non-osu!standard difficulties without opening them).")
     try:
-        entries = list(read_osu_db(db_path, log_cb=log_cb, want_mode=0))
+        # Read every mode, then filter. The folder names of the non-standard
+        # entries are still wanted: a folder holding only mania difficulties
+        # is perfectly well known to osu!, and treating it as unindexed below
+        # would mean opening every file in it to discover that.
+        all_entries = list(read_osu_db(db_path, log_cb=log_cb, want_mode=None))
     except (OSError, ValueError, EOFError, struct.error) as e:
         log(f"Couldn't read osu!.db ({e}) - falling back to scanning {songs_dir}.")
         return None
+
+    indexed_folders = {e["folder"] for e in all_entries if e["folder"]}
+    entries = [e for e in all_entries if e["mode"] == 0]
+    del all_entries
 
     if not entries:
         log("osu!.db listed no osu!standard difficulties - falling back to a filesystem scan.")
@@ -2059,10 +2090,24 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
                 if log_cb and i % 5000 == 0:
                     log(f"  ... {i}/{len(entries)} parsed")
     finally:
-        # wait=False so a cancel unwinds now rather than after every in-flight
-        # read completes. Workers only read and parse; results/errors are
-        # appended on this thread alone, so abandoning them races nothing.
-        pool.shutdown(wait=False)
+        pass
+
+    # --- difficulties osu!.db has never seen --------------------------------
+    try:
+        extra = _scan_unindexed_folders(
+            songs_dir, indexed_folders, results, errors, log,
+            check_cancel, on_parsed, pool)
+    except ScanCancelled:
+        raise
+    except OSError as e:
+        extra = 0
+        log(f"Couldn't check {songs_dir} for maps osu!.db hasn't indexed ({e}) - "
+            f"skipping that step.")
+    if extra:
+        log(f"Recovered {extra} difficulties from {songs_dir} that osu!.db has "
+            f"never indexed - most likely added since osu! last ran (an "
+            f"external downloader, say). They have no ranked status or star "
+            f"rating, because that is what the db would have carried.")
 
     if progress_cb:
         progress_cb(len(entries), len(entries))
@@ -2072,7 +2117,76 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
             f"or the db is stale because osu! hasn't been closed since).")
     if errors:
         log(f"{len(errors)} files failed to parse.")
+    # wait=False so a cancel unwinds now rather than after every in-flight
+    # read completes. Workers only read and parse; results/errors are
+    # appended on this thread alone, so abandoning them races nothing.
+    pool.shutdown(wait=False)
     return results, errors
+
+
+def _scan_unindexed_folders(songs_dir, indexed_folders, results, errors, log,
+                             check_cancel, on_parsed, pool):
+    """
+    Parse the .osu files in Songs/ subfolders osu!.db does not name.
+
+    Returns how many difficulties were added. `results` and `errors` are
+    appended to in place, on the calling thread only - the pool is used purely
+    to overlap the reads, exactly as the db pass above does.
+    """
+    check_cancel()
+    try:
+        names = os.listdir(songs_dir)
+    except OSError:
+        raise
+    unindexed = [n for n in names if n not in indexed_folders
+                 and os.path.isdir(os.path.join(songs_dir, n))]
+    if not unindexed:
+        return 0
+    log(f"{len(unindexed)} folders in {songs_dir} are not in osu!.db - checking "
+        f"them for difficulties the db pass could not have seen.")
+
+    paths = []
+    for name in unindexed:
+        check_cancel()
+        folder = os.path.join(songs_dir, name)
+        try:
+            for fn in os.listdir(folder):
+                if fn.lower().endswith(".osu"):
+                    paths.append(os.path.join(folder, fn))
+        except OSError:
+            continue          # vanished or unreadable between listing and now
+    if not paths:
+        return 0
+
+    def _read_one(full):
+        try:
+            return parse_osu_file(full), None
+        except OSError:
+            return None, None          # deleted underneath us; not an error
+        except Exception as exc:
+            return None, str(exc)
+
+    added = 0
+    window = SCAN_READ_WORKERS * 4
+    for start in range(0, len(paths), window):
+        check_cancel()
+        batch = paths[start:start + window]
+        for full, (diff, err) in zip(batch, pool.map(_read_one, batch)):
+            check_cancel()
+            if err is not None:
+                errors.append((full, err))
+                continue
+            if is_junk_diff(diff):
+                continue
+            # No ranked_status, star_rating or online_id: those come from the
+            # db, and the db has not seen this file. version_hash is already
+            # the content MD5 from parse_osu_file, which is the same value the
+            # db would have supplied.
+            results.append(diff)
+            added += 1
+            if on_parsed:
+                on_parsed(diff)
+    return added
 
 
 def default_realm_reader_path():
