@@ -2,7 +2,13 @@
 
 This project is not affiliated with, endorsed by, or sponsored by ppy Pty Ltd or osu!. "osu!" and related trademarks belong to their respective owners.
 
-This tool was built largely with AI assistance (code generation, debugging, etc.), with data collection, testing, and direction provided by me. Use at your own discretion.
+This tool was built largely with AI assistance, Though I have endured rigorous testing and debugging to ensure that the classification is near-perfect. 
+
+It is really good at detecting maps with streams, but there may be some false-positives with detecting high bpm jump maps and certain maps with halved or doubled bpms.
+
+Currently the tool only uses NM difficulty attributes to categorize the maps. Though I plan on making it work for DT and HR in the future.
+
+Note that if you play private servers, maps that are ranked on there but not on bancho will be marked as ranked, I believe that this can be fixed by deleting your osu!.db and processing your beatmaps, but i haven't tested that yet.
 
 ##
 
@@ -13,55 +19,12 @@ If you wish to contact me, you can find me on osu! ( [-soda-](https://osu.ppy.sh
 ##
 
 ## What it does
-
-Scans your osu! beatmap library and sorts every difficulty into **Streams**, **Bursts**, **Jumps with bursts**, **Jumps (no bursts)**, or **Misc**, based on the actual note patterns — not tags, not star rating. Works with both osu!stable and osu!lazer, no export step needed. Writes an osu!stable-compatible `collection.db` plus a `report.csv` you should check before trusting the result.
-
-See [AGENTS.md](AGENTS.md) for how the classification actually works and why.
+Allows you to find maps matching your skillset using a vast amount of classification methods, you can configure the tool to your needs as well. each method works in harmony to ensure the best outcome, I recommend using [Piotrekol's CollectionManager](https://github.com/Piotrekol/CollectionManager) instead of overwriting your existing collection.db, It works for both lazer and stable.
 
 ##
 
-## Download
-
-Grab the latest zip from [Releases](../../releases) and extract it. **Windows only** for now. No Python needed.
-
-Run `osu-beatmap-categorizer.exe`. Keep the `realm-reader` folder next to it — it's the helper that reads osu!lazer's database directly; without it, lazer scans fall back to a slower method.
-
-> **Windows will probably warn you the first time** (SmartScreen — the app isn't code-signed). *More info → Run anyway.* If you'd rather not take that on faith, the source is right here — run it with `python gui.py` instead.
-
-##
-
-## Quick start
-
-1. Point it at your beatmap folder — for stable, your osu! **install folder** (not `Songs` directly.), for lazer, its data folder. Redirects are followed automatically.
-2. Choose an export folder and which categories you want.
-3. Hit **Run classification**.
-4. Check `report.csv`, then **back up your existing `collection.db`** before replacing it — or import via [CollectionManager](https://github.com/Piotrekol/CollectionManager) instead of copying the file directly.
-
-##
-
-## Building from source
-
-Needs Python 3.8+ and nothing else — pure standard library.
-
-```
-python gui.py
-```
-
-or from the command line:
-
-```
-python classify_maps.py "C:/Users/you/AppData/Roaming/osu" --csv report.csv --output collection.db
-```
-
-`python classify_maps.py --help` lists every option.
-
-The `realm-reader` helper is optional (speeds up lazer scans) and needs the .NET 8 SDK to build:
-
-```
-dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader-dist
-```
-
-`realm-reader-dist/` is gitignored and picked up automatically — don't publish into `realm-reader/` itself, or ~190 runtime DLLs land on top of the source.
+## Contributing 
+If you wish to contribute to the project, feel free to make a PR and list what you changed, or improved. 
 
 ##
 
