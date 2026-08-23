@@ -1,9 +1,12 @@
 ## ❗❗❗DISCLAIMER❗❗❗
 This project is not affiliated with, endorsed by, or sponsored by ppy Pty Ltd or osu!. "osu!" and related trademarks belong to their respective owners.
 ##
-This tool was built largely with AI assistance, Though I have endured rigorous testing and debugging to ensure that the classification is near-perfect. 
+This tool was built largely with AI assistance, Though I have endured rigorous testing and debugging to ensure that the classification is near-perfect.
+
 It is really good at detecting maps with streams, but there may be some false-positives with detecting high bpm jump maps and certain maps with halved or doubled bpms.
+
 Currently the tool only uses NM difficulty attributes to categorize the maps. Though I plan on making it work for DT and HR in the future.
+
 Note that if you play private servers, maps that are ranked on there but not on bancho will be marked as ranked, I believe that this can be fixed by deleting your osu!.db and processing your beatmaps, but i haven't tested that yet.
 ##
 ## Contact
