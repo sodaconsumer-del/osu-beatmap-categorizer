@@ -14,11 +14,11 @@ If you wish to contact me, you can find me on osu! ( [-soda-](https://osu.ppy.sh
 
 ## What it does
 
-Scans your osu! beatmap library and sorts every difficulty into **Streams**, **Bursts**, **Jumps with bursts**, **Jumps (no bursts)**, or **Misc**, based on the actual note patterns — not tags, not star rating. Works with both osu!stable and osu!lazer, no export step needed. Writes an osu!stable-compatible `collection.db` plus a `report.csv` you should check before trusting the result.
+Scans your osu! beatmap library and sorts every difficulty into **Streams**, **Hybrid**, **Bursts**, **Jumps with bursts**, **Jumps (no bursts)**, or **Misc**, based on the actual note patterns — not tags, not star rating. Works with both osu!stable and osu!lazer, no export step needed. Writes an osu!stable-compatible `collection.db` plus a `report.csv` you should check before trusting the result.
 
 
 
-Detection sensitivity is a single **Stricter / Balanced / Looser** choice. Balanced is the default and is what the thresholds were actually measured against; all nineteen individual thresholds are still there under "Advanced" if you want them, each labelled in plain English.
+Detection sensitivity is a single **Stricter / Balanced / Looser** choice. Balanced is the default and is what the thresholds were actually measured against; every individual threshold is still there under "Advanced" if you want them, each labelled in plain English.
 
 See [AGENTS.md](AGENTS.md) for how the classification actually works and why.
 

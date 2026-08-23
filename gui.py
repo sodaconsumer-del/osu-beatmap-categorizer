@@ -471,8 +471,8 @@ class ClassifierGUI(tk.Tk):
 
         # --- Mods ---
         # --- Detection sensitivity + advanced thresholds ---
-        # Nineteen bare numbers with names like "mean_diam_ratio_max" told a
-        # user nothing about what they would do. The common case is now one
+        # Two dozen bare numbers with names like "mean_diam_ratio_max" told
+        # a user nothing about what they would do. The common case is now one
         # click; every individual knob is still here, just folded away behind
         # a disclosure and given a plain-language name with a one-line "what
         # does this number actually mean" underneath.
@@ -497,7 +497,7 @@ class ClassifierGUI(tk.Tk):
         ttk.Label(frame_adv,
                   text="Balanced is the measured default. Stricter and Looser are deliberate trades "
                        "for wanting fewer or more maps flagged - they are not better guesses, and "
-                       "they only move four of the settings below.",
+                       "they only move five of the settings below.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(
             anchor="w", padx=10, pady=(2, 6))
 
@@ -670,8 +670,8 @@ class ClassifierGUI(tk.Tk):
     def _toggle_advanced(self):
         """
         Show/hide the per-threshold panel. Collapsed by default - it is the
-        part most users never need, and having all nineteen numbers on screen
-        at once was what made the settings look impenetrable.
+        part most users never need, and having every number on screen at
+        once was what made the settings look impenetrable.
         """
         self.adv_open = not self.adv_open
         if self.adv_open:

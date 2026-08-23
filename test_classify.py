@@ -228,6 +228,46 @@ def test_doubled_bpm_notation_still_finds_bursts():
     assert not honest.has_bursts
 
 
+def test_doubled_notation_survives_a_slow_intro_timing_point():
+    # Same 400 BPM doubled map, but it opens on a half-tempo intro section,
+    # so timing_points[0] names a 300ms beat (200 BPM) and the real 150ms
+    # tempo only starts at 500ms. Reading the tempo off the first point put
+    # the map under max_plausible_bpm, the doubled fold never happened, and
+    # the burst was thrown away. dominant_beat_ms() weighs the points by the
+    # time they cover, so the tempo the song is actually at wins.
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(7)]
+    lines = circles(3, step=75, dx=8) + filler
+    d = build(lines, bl=300.0, extra="500,150.0,4,2,0,60,1,0")
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 150.0
+    assert cm.looks_like_doubled_notation(d.objs, d.timing_points, 105.0, 0.25, 300.0)
+    cm.classify_diff(d, **cm.DEFAULT_PARAMS)
+    assert d.has_bursts
+
+
+def test_dominant_beat_is_the_one_the_map_spends_longest_at():
+    # A single timing point speaks for the whole map.
+    d = build(circles(4, step=300), bl=300.0)
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 300.0
+    # A brief tempo change partway through does not take the map over.
+    d = build(circles(20, step=300, t0=0), bl=300.0,
+              extra="5000,250.0,4,2,0,60,1,0\n5300,300.0,4,2,0,60,1,0")
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 300.0
+    # Corrupt beat lengths are ignored rather than winning by covering time.
+    d = build(circles(4, step=300), bl=1e-9, extra="10,300.0,4,2,0,60,1,0")
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 300.0
+
+
+def test_bezier_sampling_stays_dense_on_a_long_slider():
+    # The sample count is one per 8px of control polygon; the ceiling is a
+    # guard against a pathological polygon, not part of the rule. A 128 cap
+    # broke the rule from 960px up - i.e. on exactly the long sweeping
+    # sliders proportional sampling exists for.
+    long_poly = [(0.0, 0.0), (2000.0, 0.0)]
+    assert cm._bezier_sample_count(long_poly) == 2000 // 8 + 8
+    short_poly = [(0.0, 0.0), (100.0, 0.0)]
+    assert cm._bezier_sample_count(short_poly) == 100 // 8 + 8
+
+
 def test_corrupt_timing_does_not_suppress_every_run():
     # A subnormal beatLength would make `beat * burst_beat_fraction_max`
     # smaller than any real gap, silently rejecting every run in the map.

@@ -266,6 +266,12 @@ def load_tagged(path):
                 continue
             families = {TAG_FAMILIES[w] for w in words if w in TAG_FAMILIES}
             rows.append({
+                # A stable identity for the row. Membership tests downstream
+                # key on this rather than on the dict itself: `r in agree`
+                # compares dicts field by field, including the whole embedded
+                # CSV row, which on a library-sized report.csv turns a
+                # set-difference into minutes of string comparison.
+                "i": len(rows),
                 "category": category,
                 "words": words,
                 "families": families,
@@ -387,9 +393,11 @@ def tag_report(rows, title):
 
 
 def tag_disagreements(scored, agree):
-    disagreed = [r for r in scored if r not in agree]
+    agreed_ids = {r["i"] for r in agree}
+    disagreed = [r for r in scored if r["i"] not in agreed_ids]
     near = [r for r in disagreed if is_near_miss(r["row"], r["families"])]
-    hard = [r for r in disagreed if r not in near]
+    near_ids = {r["i"] for r in near}
+    hard = [r for r in disagreed if r["i"] not in near_ids]
     print(f"\n{len(disagreed)} disagreements: {len(near)} near the threshold, "
           f"{len(hard)} not close")
     for label, group in (("NEAR the threshold - a line in the wrong place",

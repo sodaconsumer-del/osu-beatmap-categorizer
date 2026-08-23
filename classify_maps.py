@@ -465,12 +465,19 @@ def _bezier_sample_count(control):
     six hundred times finer than its p99. Sampling four times denser buys
     another factor of ten of agreement that nothing downstream can see, for
     a quarter more parse time; this is where the curve stops mattering.
+
+    The ceiling is a guard against a pathological control polygon, not part
+    of the rule: at 1024 samples the 8px spacing still holds out to an 8100px
+    polygon, which is sixteen times the width of the playfield and far past
+    any slider a map actually contains. The previous 128 quietly broke the
+    rule from 960px upward - exactly the long sweeping sliders the
+    proportional sampling exists for - and with it the accuracy figure above.
     """
     span = 0.0
     for i in range(1, len(control)):
         span += math.hypot(control[i][0] - control[i - 1][0],
                            control[i][1] - control[i - 1][1])
-    return max(8, min(128, int(span / 8) + 8))
+    return max(8, min(1024, int(span / 8) + 8))
 
 
 def _circular_arc_points(pts):
@@ -787,6 +794,41 @@ def section_pattern_counts(objs, eligible, label, section_ms=2000.0,
     return active, streams, bursts, jumps
 
 
+def dominant_beat_ms(objs, timing_points):
+    """
+    The beat length the map spends the most TIME under, or 0.0 if unknown.
+
+    Which uninherited timing point speaks for a map's tempo is not a question
+    the first one can answer. A map that opens on a half-tempo intro section
+    names that intro's beat in timing_points[0], and reading the tempo off
+    that point alone hands back a number the song is only briefly at - which
+    for looks_like_doubled_notation() is the difference between spotting
+    doubled notation and missing it entirely.
+
+    Weighted by DURATION rather than by note count on purpose. The tempo bound
+    it feeds is there because notation belongs to the mapset, so every
+    difficulty of a set has to reach the same answer, and note counts differ
+    between a set's quiet and busy diffs while its timing spans do not. The
+    one diff-dependent input is where the last span ends, which is taken from
+    the final object - close enough between siblings covering the same song.
+    """
+    if not timing_points:
+        return 0.0
+    end = max(objs[-1][0] if objs else 0.0, timing_points[-1][0])
+    spans = {}
+    for idx, (t, bl) in enumerate(timing_points):
+        beat = usable_beat_ms(bl)
+        if not beat:
+            continue
+        nxt = timing_points[idx + 1][0] if idx + 1 < len(timing_points) else end
+        span = nxt - t
+        if span > 0:
+            spans[beat] = spans.get(beat, 0.0) + span
+    if not spans:
+        return 0.0
+    return max(spans.items(), key=lambda kv: kv[1])[0]
+
+
 def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
                                  doubled_half_share_min=0.25,
                                  max_plausible_bpm=300.0):
@@ -799,7 +841,7 @@ def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
     under doubled notation the 1/4 a player actually feels is written as a
     1/2, so a real burst reads as ordinary tapping and is thrown away.
 
-    Two conditions, both from the notes:
+    Three conditions - one from the timing points, two from the notes:
 
       1. The NOTATED TEMPO exceeds max_plausible_bpm. Decisive, and read off
          the timing points rather than the notes on purpose: notation is a
@@ -809,6 +851,11 @@ def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
          no 1/4 at all, so they look exactly like doubled notation while their
          harder siblings do not - three of the eight flipped, inflating their
          burst counts. A tempo bound is shared by construction.
+
+         Which timing point that tempo comes from matters: it is the one the
+         map spends the most time under, not the first one in the file. See
+         dominant_beat_ms() - a map opening on a half-tempo intro names the
+         intro's beat first, and reading that would miss the doubling.
       2. The notated 1/2 is a workhorse layer (doubled_half_share_min) AND is
          mostly faster than burst_max_gap_ms - tapped at speeds no real 1/2
          reaches. Same derived threshold the halved detector uses.
@@ -832,7 +879,7 @@ def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
     """
     if not timing_points or len(objs) < 2:
         return False
-    beat0 = usable_beat_ms(timing_points[0][1])
+    beat0 = dominant_beat_ms(objs, timing_points)
     if not beat0 or 60000.0 / beat0 <= max_plausible_bpm:
         return False
     half = half_fast = quarter = total = 0
@@ -2053,6 +2100,11 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
     workers = SCAN_READ_WORKERS
     window = workers * 4
     pool = ThreadPoolExecutor(max_workers=workers)
+    # Everything that uses the pool - including the unindexed-folder pass
+    # below - runs inside this try, so the shutdown in its finally happens on
+    # a cancel too. It used to sit after the block with a bare `finally: pass`
+    # above it, which meant a ScanCancelled skipped the shutdown entirely and
+    # left the window's already-queued reads draining behind the raise.
     try:
         i = 0
         for start in range(0, len(entries), window):
@@ -2089,38 +2141,37 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
                     progress_cb(i, len(entries))
                 if log_cb and i % 5000 == 0:
                     log(f"  ... {i}/{len(entries)} parsed")
+
+        # --- difficulties osu!.db has never seen ---------------------------
+        try:
+            extra = _scan_unindexed_folders(
+                songs_dir, indexed_folders, results, errors, log,
+                check_cancel, on_parsed, pool)
+        except ScanCancelled:
+            raise
+        except OSError as e:
+            extra = 0
+            log(f"Couldn't check {songs_dir} for maps osu!.db hasn't indexed ({e}) - "
+                f"skipping that step.")
+        if extra:
+            log(f"Recovered {extra} difficulties from {songs_dir} that osu!.db has "
+                f"never indexed - most likely added since osu! last ran (an "
+                f"external downloader, say). They have no ranked status or star "
+                f"rating, because that is what the db would have carried.")
+
+        if progress_cb:
+            progress_cb(len(entries), len(entries))
+        log(f"Stable scan complete in {time.time() - t0:.1f}s. {len(results)} difficulties classified.")
+        if missing:
+            log(f"{missing} files listed in osu!.db are no longer on disk (deleted outside osu!, "
+                f"or the db is stale because osu! hasn't been closed since).")
+        if errors:
+            log(f"{len(errors)} files failed to parse.")
     finally:
-        pass
-
-    # --- difficulties osu!.db has never seen --------------------------------
-    try:
-        extra = _scan_unindexed_folders(
-            songs_dir, indexed_folders, results, errors, log,
-            check_cancel, on_parsed, pool)
-    except ScanCancelled:
-        raise
-    except OSError as e:
-        extra = 0
-        log(f"Couldn't check {songs_dir} for maps osu!.db hasn't indexed ({e}) - "
-            f"skipping that step.")
-    if extra:
-        log(f"Recovered {extra} difficulties from {songs_dir} that osu!.db has "
-            f"never indexed - most likely added since osu! last ran (an "
-            f"external downloader, say). They have no ranked status or star "
-            f"rating, because that is what the db would have carried.")
-
-    if progress_cb:
-        progress_cb(len(entries), len(entries))
-    log(f"Stable scan complete in {time.time() - t0:.1f}s. {len(results)} difficulties classified.")
-    if missing:
-        log(f"{missing} files listed in osu!.db are no longer on disk (deleted outside osu!, "
-            f"or the db is stale because osu! hasn't been closed since).")
-    if errors:
-        log(f"{len(errors)} files failed to parse.")
-    # wait=False so a cancel unwinds now rather than after every in-flight
-    # read completes. Workers only read and parse; results/errors are
-    # appended on this thread alone, so abandoning them races nothing.
-    pool.shutdown(wait=False)
+        # wait=False so a cancel unwinds now rather than after every in-flight
+        # read completes. Workers only read and parse; results/errors are
+        # appended on this thread alone, so abandoning them races nothing.
+        pool.shutdown(wait=False)
     return results, errors
 
 
@@ -2129,15 +2180,20 @@ def _scan_unindexed_folders(songs_dir, indexed_folders, results, errors, log,
     """
     Parse the .osu files in Songs/ subfolders osu!.db does not name.
 
+    Deliberately FOLDER-level, not file-level: a new difficulty dropped into a
+    folder osu!.db already names is still missed here. Catching that would
+    mean listing every folder in Songs/ and comparing filenames, which is the
+    full walk the fast path exists to avoid - and the case does not really
+    arise, because the folder is what an external downloader creates. A map
+    imported by osu! itself is in the db either way.
+
     Returns how many difficulties were added. `results` and `errors` are
     appended to in place, on the calling thread only - the pool is used purely
-    to overlap the reads, exactly as the db pass above does.
+    to overlap the reads, exactly as the db pass above does. An OSError from
+    listing songs_dir propagates: the caller logs it and skips this step.
     """
     check_cancel()
-    try:
-        names = os.listdir(songs_dir)
-    except OSError:
-        raise
+    names = os.listdir(songs_dir)
     unindexed = [n for n in names if n not in indexed_folders
                  and os.path.isdir(os.path.join(songs_dir, n))]
     if not unindexed:
@@ -2937,7 +2993,7 @@ DEFAULT_PARAMS = dict(
 )
 
 # Named starting points for the GUI's "Detection sensitivity" control, so the
-# common case is one click instead of nineteen numbers.
+# common case is one click instead of two dozen numbers.
 #
 # Only five knobs move. They are the ones that actually answer "how much gets
 # flagged": how fast a run has to be, how much of a rhythm step-up a burst
