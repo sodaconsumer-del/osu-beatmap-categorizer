@@ -79,6 +79,29 @@ def save_config(cfg):
         pass  # a preference failing to save is not worth interrupting anyone over
 
 
+def parse_param(key, text):
+    """
+    One threshold field's text as the number that parameter wants.
+
+    Integer params go through float() first, so "40.0" and "40" both give 40.
+    A bare int("40.0") raises, which used to reject a perfectly ordinary way
+    of typing a whole number: the run refused to start with "Threshold fields
+    must be numbers" pointing at a field that plainly held one, and the
+    Custom/preset indicator quietly stopped updating because its parse had
+    failed too.
+
+    Still rejects a genuine non-integer like "40.5" for an integer field -
+    that's a real mistake worth reporting, not a formatting preference.
+    Raises ValueError for anything unusable, as both callers expect.
+    """
+    value = float(text)
+    if key in cm.INT_PARAMS:
+        if value != int(value):
+            raise ValueError(f"{key} must be a whole number, got {text!r}")
+        return int(value)
+    return value
+
+
 class ClassifierGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -384,13 +407,28 @@ class ClassifierGUI(tk.Tk):
         row_cat = ttk.Frame(frame_cat)
         row_cat.pack(fill="x", padx=10, pady=8)
         self.category_vars = {}
-        for cat in ["Streams", "Bursts", "Jumps with bursts", "Jumps (no bursts)", "Misc"]:
+        # Driven off cm.CATEGORIES rather than a second copy of the list -
+        # adding a category (Hybrid was the last one) should not need a second
+        # edit here that is easy to forget.
+        for cat in cm.CATEGORIES:
             var = tk.BooleanVar(value=True)
             ttk.Checkbutton(row_cat, text=cat, variable=var).pack(side="left", padx=(0, 16))
             self.category_vars[cat] = var
         ttk.Label(frame_cat,
                   text="Uncheck what you don't want - e.g. an aim-only player could keep just Jumps checked.",
-                  style="Muted.TLabel").pack(anchor="w", padx=10, pady=(0, 8))
+                  style="Muted.TLabel").pack(anchor="w", padx=10, pady=(0, 2))
+
+        row_cj = ttk.Frame(frame_cat)
+        row_cj.pack(fill="x", padx=10, pady=(4, 2))
+        self.combine_jumps_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row_cj, text='Also add one combined "Jumps" collection',
+                         variable=self.combine_jumps_var).pack(side="left")
+        ttk.Label(frame_cat,
+                  text='Writes an extra "Jumps" collection holding every jump map, on top of the two '
+                       "above rather than instead of them - so a map with jumps and bursts shows up in "
+                       '"Jumps with bursts" AND in "Jumps". Nothing is reclassified and report.csv still '
+                       "records the specific category; this only changes how the collections are grouped.",
+                  style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Ranked status handling ---
         frame_ranked = ttk.LabelFrame(body, text="4. Ranked status")
@@ -431,63 +469,150 @@ class ClassifierGUI(tk.Tk):
                        "scanning a bare folder of files.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
-        # --- Mods ---
-        frame_mods = ttk.LabelFrame(body, text="6. Classify as if these mods were active")
-        frame_mods.pack(fill="x", **pad)
-        row_mods = ttk.Frame(frame_mods)
-        row_mods.pack(fill="x", padx=10, pady=8)
-        self.mod_vars = {}
-        for acronym, label in [("DT", "Double Time (1.5x speed)"),
-                                ("HR", "Hard Rock (CS x1.3)"),
-                                ("HT", "Half Time (0.75x speed)"),
-                                ("EZ", "Easy (CS / 2)")]:
-            var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(row_mods, text=label, variable=var).pack(side="left", padx=(0, 16))
-            self.mod_vars[acronym] = var
-        ttk.Label(frame_mods,
-                  text="Leave all unchecked for NM (no mods), which is the baseline. Only speed and "
-                       "circle size change what a pattern is - DT makes slower rhythms fast enough to "
-                       "count as streams, HR shrinks circles so the same spacing reads as wider. "
-                       "(HR's vertical flip doesn't matter here: flipping every object preserves the "
-                       "distance between them.)",
-                  style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
-
-        # --- Advanced thresholds (collapsible-ish via a simple frame) ---
-        frame_adv = ttk.LabelFrame(body, text="7. Thresholds (defaults match osu!'s official tag definitions)")
+        # --- Detection sensitivity + advanced thresholds ---
+        # Two dozen bare numbers with names like "mean_diam_ratio_max" told
+        # a user nothing about what they would do. The common case is now one
+        # click; every individual knob is still here, just folded away behind
+        # a disclosure and given a plain-language name with a one-line "what
+        # does this number actually mean" underneath.
+        frame_adv = ttk.LabelFrame(body, text="7. Detection sensitivity")
         frame_adv.pack(fill="x", **pad)
 
+        self.sensitivity_var = tk.StringVar(value=cm.DEFAULT_SENSITIVITY)
+        row_sens = ttk.Frame(frame_adv)
+        row_sens.pack(fill="x", padx=10, pady=(8, 0))
+        for name, blurb in [
+            ("Stricter", "only clear-cut bursts and streams"),
+            ("Balanced", "recommended - matches osu!'s own tags"),
+            ("Looser", "also catches short or borderline patterns"),
+        ]:
+            ttk.Radiobutton(row_sens, text="%s  (%s)" % (name, blurb),
+                            variable=self.sensitivity_var, value=name,
+                            command=self._apply_sensitivity).pack(anchor="w")
+        self.custom_sens_label = ttk.Label(
+            frame_adv, text="", style="Muted.TLabel", wraplength=680, justify="left")
+        self.custom_sens_label.pack(anchor="w", padx=10, pady=(2, 0))
+
+        ttk.Label(frame_adv,
+                  text="Balanced is the measured default. Stricter and Looser are deliberate trades "
+                       "for wanting fewer or more maps flagged - they are not better guesses, and "
+                       "they only move five of the settings below.",
+                  style="Muted.TLabel", wraplength=680, justify="left").pack(
+            anchor="w", padx=10, pady=(2, 6))
+
+        self.adv_open = False
+        self.adv_toggle = ttk.Button(
+            frame_adv, text="\u25b6  Advanced: fine-tune individual thresholds",
+            command=self._toggle_advanced)
+        self.adv_toggle.pack(anchor="w", padx=10, pady=(0, 6))
+
+        # Packed and unpacked by _toggle_advanced - built now either way so
+        # the param vars exist before a run can read them.
+        self.adv_body = ttk.Frame(frame_adv)
+
         self.param_vars = {}
-        params_grid = ttk.Frame(frame_adv)
-        params_grid.pack(fill="x", padx=10, pady=8)
-
-        fields = [
-            ("max_gap_ms", "Max ms between notes", cm.DEFAULT_PARAMS["max_gap_ms"]),
-            ("gap_consistency_tol", "Gap consistency tol.", cm.DEFAULT_PARAMS["gap_consistency_tol"]),
-            ("burst_min", "Burst min notes", cm.DEFAULT_PARAMS["burst_min"]),
-            ("burst_max", "Burst max notes", cm.DEFAULT_PARAMS["burst_max"]),
-            ("stream_min", "Stream min notes", cm.DEFAULT_PARAMS["stream_min"]),
-            ("cut_max_multiple", "Max cut gap multiple", cm.DEFAULT_PARAMS["cut_max_multiple"]),
-            ("cut_max_dist_ratio", "Max cut jump distance ratio", cm.DEFAULT_PARAMS["cut_max_dist_ratio"]),
-            ("tight_diam_ratio", "Tight spacing ratio", cm.DEFAULT_PARAMS["tight_diam_ratio"]),
-            ("spaced_diam_ratio", "Spaced stream ratio", cm.DEFAULT_PARAMS["spaced_diam_ratio"]),
-            ("jump_velocity_ratio", "Jump vel. (diam/100ms)", cm.DEFAULT_PARAMS["jump_velocity_ratio"]),
-            ("jump_pct_threshold", "Jump %% threshold", cm.DEFAULT_PARAMS["jump_pct_threshold"]),
-            ("stream_pct_threshold", "Stream %% threshold", cm.DEFAULT_PARAMS["stream_pct_threshold"]),
-            ("jump_min_transitions", "Min notes for jump calc", cm.DEFAULT_PARAMS["jump_min_transitions"]),
-            ("jump_gap_cap_ms", "Break cutoff (ms)", cm.DEFAULT_PARAMS["jump_gap_cap_ms"]),
-            ("run_wide_fraction_max", "Max wide fraction in run", cm.DEFAULT_PARAMS["run_wide_fraction_max"]),
-            ("mean_diam_ratio_max", "Max avg spacing ratio", cm.DEFAULT_PARAMS["mean_diam_ratio_max"]),
+        # (key, label, what-the-number-means). Grouped so related settings read
+        # together instead of arriving in whatever order they were added.
+        sections = [
+            ('Speed and rhythm - what counts as "fast"', [
+                ("max_gap_ms", "Fastest gap that still counts as one run",
+                 "milliseconds between notes. 140 is roughly a 107 BPM stream; lower means only "
+                 "faster tapping counts."),
+                ("gap_consistency_tol", "How much a run may change speed before it splits",
+                 "0.18 = each gap may drift 18% from the run's own average. A real stream does not "
+                 "change tapping speed halfway through."),
+                ("burst_beat_fraction_max", "Slowest snap that still counts as a burst",
+                 "as a fraction of one beat per note. 0.4 accepts 1/4 and 1/3 snap and rejects 1/2, "
+                 "which is what stops a fast map's ordinary tapping from reading as bursts."),
+                ("burst_max_gap_ms", "Slowest tapping that can still be a burst",
+                 "milliseconds per note. 105 is about a 143 BPM stream. A slow song's honest 1/4 "
+                 "(120ms at 125 BPM) is a real 1/4 and still not a burst - it isn't fast enough. "
+                 "Streams are not affected by this."),
+                ("max_plausible_bpm", "Above this BPM, read the tempo as doubled",
+                 "300. Some songs are written at double their real tempo (360 for a 180 BPM song), "
+                 "which makes real 1/4 bursts look like ordinary 1/2 tapping. Taken from the timing "
+                 "points rather than the notes so every difficulty in a mapset agrees."),
+                ("doubled_half_share_min", "When 1/2 is this much of a map, read it as doubled",
+                 "0.25 = 25% of note gaps. The mirror of the halved check: some songs are written at "
+                 "double their real tempo (360 for a 180 BPM song), which makes genuine 1/4 bursts "
+                 "look like ordinary 1/2 tapping. The giveaway is that the notated 1/4 is missing "
+                 "entirely - it would be a real 1/8."),
+                ("halved_quarter_share_min", "When 1/4 is this much of a map, read it as halved",
+                 "0.15 = 15% of note gaps. Some songs are written at half their real tempo (130 for a "
+                 "260 BPM song), which makes ordinary 1/2 tapping look like 1/4. The notes give it "
+                 "away: a real map uses 1/4 for bursts only, so a 1/4 layer this large - and too slow "
+                 "to be a burst - is really the 1/2 backbone."),
+            ]),
+            ("Run length - burst vs stream", [
+                ("burst_min", "Shortest run that counts as a burst",
+                 "notes. 3 means a triple counts."),
+                ("burst_max", "Longest run still called a burst",
+                 "notes. Anything above this is a stream."),
+                ("stream_min", "Shortest run that counts as a stream", "notes."),
+            ]),
+            ("Spacing - burst/stream vs jump", [
+                ("tight_diam_ratio", 'How close is "stacked"',
+                 "hit-circle diameters. Notes this close are overlapping or nearly so."),
+                ("spaced_diam_ratio", 'How far apart is still "a stream"',
+                 "hit-circle diameters. Wider than this and a transition is jump-spaced."),
+                ("run_wide_fraction_max", "How much of a run may be jump-spaced",
+                 "0.4 = up to 40% of its notes, before the whole run is called a jump pattern."),
+                ("mean_diam_ratio_max", "Average spacing limit across a whole run",
+                 "hit-circle diameters. Catches jump patterns that dodge the check above by chance."),
+                ("jump_velocity_ratio", "How fast the cursor must travel to count as a jump",
+                 "hit-circle diameters per 100ms, required on top of the spacing test above."),
+            ]),
+            ("How much of a map a pattern must cover to own it", [
+                ("jump_pct_threshold", "Share of a map that must be jumps",
+                 "% of note-to-note transitions."),
+                ("stream_pct_threshold", "Share of a map that must be streams",
+                 "% of notes. Stops one short run in a long jump map from claiming the whole map."),
+                ("jump_min_transitions", "Fewest notes before the jump share means anything",
+                 'a 30-note map being "20% jumps" is noise, not a finding.'),
+                ("jump_gap_cap_ms", "Gap that counts as a break rather than gameplay",
+                 "milliseconds. Breaks are left out of the percentages entirely."),
+            ]),
+            ("Sections - where in the map a pattern lives", [
+                ("section_ms", "Length of one section",
+                 "milliseconds. About two bars at 200 BPM. Sections are how the Hybrid category "
+                 "tells 'jumps then streams' apart from 'both mixed evenly throughout' - coverage "
+                 "alone averages those to the same numbers."),
+                ("section_dominance", "How much of a section a pattern must hold to own it",
+                 "0.5 = half its notes. A section is owned by at most one pattern."),
+                ("hybrid_section_min", "Sections each side needs for \"Hybrid\"",
+                 "0.15 = streams must own 15% of the map's sections and jumps another 15%, before "
+                 "the map is called a mix of the two rather than one or the other."),
+                ("hybrid_balance_min", "How balanced that mix must be",
+                 "0.5 = the smaller side must own at least half as many sections as the larger. "
+                 "Without it, a map with 61% jump sections and 19% stream sections counts as a "
+                 "\"mix\" when it is plainly a jump map with a stream section in it."),
+                ("section_min_transitions", "Fewest notes for a section to count at all",
+                 "stops a map's sparse tail, or a couple of notes either side of a break, "
+                 "registering as full sections and skewing the proportions."),
+            ]),
+            ("Cut streams - a stream with a skipped beat", [
+                ("cut_max_multiple", "Biggest skipped-beat gap still inside one stream",
+                 "as a multiple of the run's own note gap. 3 allows up to two missing notes."),
+                ("cut_max_dist_ratio", "How far a skipped beat may travel",
+                 "hit-circle diameters. Beyond this it is a real jump between two runs, not a skip."),
+            ]),
         ]
-        for i, (key, label, default) in enumerate(fields):
-            r, c = divmod(i, 2)
-            cell = ttk.Frame(params_grid)
-            cell.grid(row=r, column=c, sticky="w", padx=6, pady=3)
-            ttk.Label(cell, text=label + ":", width=22).pack(side="left")
-            var = tk.StringVar(value=str(default))
-            ttk.Entry(cell, textvariable=var, width=8).pack(side="left")
-            self.param_vars[key] = var
 
-        ttk.Button(frame_adv, text="Reset to defaults", command=self._reset_defaults).pack(anchor="e", padx=10, pady=(0, 8))
+        for title, fields in sections:
+            ttk.Label(self.adv_body, text=title).pack(anchor="w", padx=10, pady=(8, 2))
+            for key, label, meaning in fields:
+                cell = ttk.Frame(self.adv_body)
+                cell.pack(fill="x", padx=22, pady=(2, 0))
+                ttk.Label(cell, text=label + ":").pack(side="left")
+                var = tk.StringVar(value=str(cm.DEFAULT_PARAMS[key]))
+                var.trace_add("write", self._on_param_edited)
+                ttk.Entry(cell, textvariable=var, width=8).pack(side="left", padx=(6, 0))
+                self.param_vars[key] = var
+                ttk.Label(self.adv_body, text=meaning, style="Muted.TLabel",
+                          wraplength=620, justify="left").pack(anchor="w", padx=34, pady=(0, 2))
+
+        ttk.Button(self.adv_body, text="Reset to defaults",
+                   command=self._reset_defaults).pack(anchor="e", padx=10, pady=(8, 8))
 
         # --- Run controls ---
         # Pinned below the scroll area: Run, pause/cancel, progress and the
@@ -541,9 +666,85 @@ class ClassifierGUI(tk.Tk):
         if path:
             self.export_dir_var.set(path)
 
-    def _reset_defaults(self):
+    def _toggle_advanced(self):
+        """
+        Show/hide the per-threshold panel. Collapsed by default - it is the
+        part most users never need, and having every number on screen at
+        once was what made the settings look impenetrable.
+        """
+        self.adv_open = not self.adv_open
+        if self.adv_open:
+            self.adv_body.pack(fill="x")
+            self.adv_toggle.config(text="▼  Advanced: fine-tune individual thresholds")
+        else:
+            self.adv_body.pack_forget()
+            self.adv_toggle.config(text="▶  Advanced: fine-tune individual thresholds")
+
+    def _apply_sensitivity(self):
+        """
+        Push the chosen preset into the individual threshold fields, so the
+        Advanced panel always shows what is actually going to run rather than
+        stale numbers the preset has since overridden. The run path reads
+        those fields, so this is the only place the preset takes effect -
+        there is no second source of truth to drift.
+        """
+        params = cm.params_for_sensitivity(self.sensitivity_var.get())
+        # Setting the vars fires their write traces; without this guard each
+        # one would re-run the Custom check mid-update and briefly see a
+        # half-applied preset.
+        self._suspend_param_watch = True
+        try:
+            for key, var in self.param_vars.items():
+                var.set(str(params[key]))
+        finally:
+            self._suspend_param_watch = False
+        self._refresh_sensitivity_note()
+
+    def _on_param_edited(self, *_):
+        """
+        A hand-edited threshold means no preset describes the settings any
+        more. Say so, rather than leaving a radio button selected that is now
+        a lie about what will run.
+        """
+        if getattr(self, "_suspend_param_watch", False):
+            return
+        self._refresh_sensitivity_note()
+
+    def _current_params_or_none(self):
+        """
+        Parsed threshold values, or None if any field isn't a number yet -
+        which is normal mid-typing, when a field is briefly empty or "1.".
+        Only the Custom indicator uses this; the run path does its own
+        parsing (via the same parse_param) and reports bad input properly
+        rather than ignoring it.
+        """
+        out = {}
         for key, var in self.param_vars.items():
-            var.set(str(cm.DEFAULT_PARAMS[key]))
+            try:
+                out[key] = parse_param(key, var.get())
+            except ValueError:
+                return None
+        return out
+
+    def _refresh_sensitivity_note(self):
+        params = self._current_params_or_none()
+        if params is None:
+            return
+        match = cm.sensitivity_of(params)
+        if match is None:
+            self.custom_sens_label.config(
+                text="Custom - the thresholds below no longer match any preset. Pick a preset "
+                     "above to overwrite them, or use Reset to defaults.")
+        else:
+            self.custom_sens_label.config(text="")
+            # Editing a value back to a preset's numbers should re-select that
+            # preset, not leave "Custom" showing something untrue.
+            if self.sensitivity_var.get() != match:
+                self.sensitivity_var.set(match)
+
+    def _reset_defaults(self):
+        self.sensitivity_var.set(cm.DEFAULT_SENSITIVITY)
+        self._apply_sensitivity()
 
     def _log(self, msg):
         self.log_text.config(state="normal")
@@ -563,14 +764,20 @@ class ClassifierGUI(tk.Tk):
             messagebox.showerror("Invalid folder", "Please choose a valid beatmap folder first.")
             return
 
-        try:
-            params = {key: (int(var.get()) if key in cm.INT_PARAMS else float(var.get()))
-                      for key, var in self.param_vars.items()}
-        except ValueError:
-            messagebox.showerror("Invalid threshold", "Threshold fields must be numbers.")
-            return
-
-        mods = [acronym for acronym, var in self.mod_vars.items() if var.get()] or None
+        # Parsed one at a time rather than in a comprehension so the error can
+        # name the field. "Threshold fields must be numbers" across roughly
+        # twenty-five fields left the user to find the bad one by eye.
+        params = {}
+        for key, var in self.param_vars.items():
+            try:
+                params[key] = parse_param(key, var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid threshold",
+                    f"{key} is not a valid number: {var.get()!r}\n\n"
+                    "Open Advanced to correct it, or pick a sensitivity preset "
+                    "to reset every field.")
+                return
 
         export_dir = self.export_dir_var.get().strip()
         if not export_dir:
@@ -623,7 +830,8 @@ class ClassifierGUI(tk.Tk):
         self.worker_thread = threading.Thread(
             target=self._worker,
             args=(folder, output, csv_path, params, self.cancel_event, self.pause_event,
-                  include_categories, ranked_mode, min_star, max_star, mods),
+                  include_categories, ranked_mode, min_star, max_star,
+                  self.combine_jumps_var.get()),
             daemon=True,
         )
         self.worker_thread.start()
@@ -673,7 +881,7 @@ class ClassifierGUI(tk.Tk):
             self._log("Resumed.")
 
     def _worker(self, folder, output, csv_path, params, cancel_event, pause_event,
-                include_categories, ranked_mode, min_star, max_star, mods):
+                include_categories, ranked_mode, min_star, max_star, combine_jumps):
         def progress_cb(done, total):
             self.msg_queue.put(("progress", done, total))
 
@@ -685,7 +893,7 @@ class ClassifierGUI(tk.Tk):
                 folder, output=output, csv_path=csv_path, write_db=output is not None,
                 params=params, progress_cb=progress_cb, log_cb=log_cb, cancel_event=cancel_event,
                 pause_event=pause_event, include_categories=include_categories, ranked_mode=ranked_mode,
-                min_star=min_star, max_star=max_star, mods=mods,
+                min_star=min_star, max_star=max_star, combine_jumps=combine_jumps,
             )
             self.msg_queue.put(("done", result))
         except cm.ScanCancelled:
