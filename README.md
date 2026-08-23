@@ -2,6 +2,8 @@
 
 This project is not affiliated with, endorsed by, or sponsored by ppy Pty Ltd or osu!. "osu!" and related trademarks belong to their respective owners.
 
+##
+
 This tool was built largely with AI assistance, Though I have endured rigorous testing and debugging to ensure that the classification is near-perfect. 
 
 It is really good at detecting maps with streams, but there may be some false-positives with detecting high bpm jump maps and certain maps with halved or doubled bpms.
