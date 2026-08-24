@@ -312,6 +312,12 @@ def parse_osu_bytes(raw, display_name, path=None):
     )
 
 
+# Hoisted: bisect needs an upper sentinel for the second tuple element, and
+# building one per call showed up as most of _beat_length_at's own time at
+# ~540k calls per 400 difficulties.
+_INF = float("inf")
+
+
 def _beat_length_at(t, timing_points):
     """
     Beat length in ms at time t. Binary search rather than a linear rescan:
@@ -325,7 +331,7 @@ def _beat_length_at(t, timing_points):
     """
     if not timing_points:
         return 500.0
-    i = bisect.bisect_right(timing_points, (t + 2, float("inf"))) - 1
+    i = bisect.bisect_right(timing_points, (t + 2, _INF)) - 1
     return timing_points[i][1] if i >= 0 else timing_points[0][1]
 
 
@@ -334,7 +340,7 @@ def _sv_at(t, sv_points):
     inherited point, matching osu!'s behaviour."""
     if not sv_points:
         return 1.0
-    i = bisect.bisect_right(sv_points, (t + 2, float("inf"))) - 1
+    i = bisect.bisect_right(sv_points, (t + 2, _INF)) - 1
     return sv_points[i][1] if i >= 0 else 1.0
 
 
@@ -392,7 +398,7 @@ def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
         return end_t, x, y
 
     curve = parts[5] if len(parts) > 5 else ""
-    ex, ey = _point_at_path_length(_slider_path_points(curve, x, y), length)
+    ex, ey = _point_at_curve_length(curve, x, y, length)
     return end_t, ex, ey
 
 
@@ -403,6 +409,10 @@ def _slider_end(parts, t, x, y, timing_points, sv_points, slider_multiplier):
 
 # Curve-flattening tolerance, matching osu-framework's own constant.
 _CIRCULAR_ARC_TOLERANCE = 0.1
+
+# Work ceiling for one bezier segment, in de Casteljau lerps - see
+# _bezier_sample_count(). Only high-degree segments ever reach it.
+_BEZIER_LERP_BUDGET = 2_000_000
 
 
 def _parse_control_points(curve, x0, y0):
@@ -438,17 +448,70 @@ def _split_at_red_anchors(pts):
 
 
 def _bezier_points(control, samples):
-    """de Casteljau evaluation of one bezier segment at `samples`+1 points."""
+    """
+    de Casteljau evaluation of one bezier segment at `samples`+1 points.
+
+    The two low degrees are special-cased because they are almost all of the
+    real traffic and the generic loop is needlessly expensive for them.
+    Measured over 400 real difficulties, of 55,516 bezier segments 61% have
+    two control points, 25% have three and 10% have four; the generic path
+    handles the remaining 4%.
+
+    Neither shortcut is an approximation. A two-point bezier IS the straight
+    line between its endpoints, so two points describe it exactly and no
+    sampling is required at all - and every sample the old code produced for
+    one was a point on that line, i.e. pure work for no information. Three
+    points is the quadratic and four the cubic, whose closed forms are the
+    same arithmetic de Casteljau performs, just without rebuilding a list per
+    sample.
+    """
     n = len(control)
+    if n < 2:
+        return list(control)
+    if n == 2:
+        return [control[0], control[1]]
+    if n == 3:
+        (x0, y0), (x1, y1), (x2, y2) = control
+        out = []
+        for k in range(samples + 1):
+            t = k / samples
+            u = 1.0 - t
+            a = u * u
+            b = 2.0 * u * t
+            c = t * t
+            out.append((a * x0 + b * x1 + c * x2,
+                        a * y0 + b * y1 + c * y2))
+        return out
+    if n == 4:
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = control
+        out = []
+        for k in range(samples + 1):
+            t = k / samples
+            u = 1.0 - t
+            uu = u * u
+            tt = t * t
+            a = uu * u
+            b = 3.0 * uu * t
+            c = 3.0 * u * tt
+            d = tt * t
+            out.append((a * x0 + b * x1 + c * x2 + d * x3,
+                        a * y0 + b * y1 + c * y2 + d * y3))
+        return out
+    # Flat coordinate lists rather than a list of tuples: the inner loop runs
+    # n(n-1)/2 times per sample, and tuple pack/unpack there costs more than
+    # the arithmetic does.
+    cx = [pt[0] for pt in control]
+    cy = [pt[1] for pt in control]
     out = []
     for k in range(samples + 1):
         t = k / samples
-        tmp = list(control)
+        tx = cx[:]
+        ty = cy[:]
         for r in range(1, n):
             for i in range(n - r):
-                tmp[i] = (tmp[i][0] + (tmp[i + 1][0] - tmp[i][0]) * t,
-                          tmp[i][1] + (tmp[i + 1][1] - tmp[i][1]) * t)
-        out.append(tmp[0])
+                tx[i] += (tx[i + 1] - tx[i]) * t
+                ty[i] += (ty[i + 1] - ty[i]) * t
+        out.append((tx[0], ty[0]))
     return out
 
 
@@ -473,17 +536,28 @@ def _bezier_sample_count(control):
     any slider a map actually contains. The previous 128 quietly broke the
     rule from 960px upward - exactly the long sweeping sliders the
     proportional sampling exists for - and with it the accuracy figure above.
+
+    _BEZIER_LERP_BUDGET is a second ceiling, on WORK rather than on samples.
+    de Casteljau costs one lerp per control-point pair per sample, so a
+    segment with many anchors is quadratic in its degree: over 400 real
+    difficulties, 120 bezier segments of 10+ control points (0.2% of them,
+    one at 146 points) accounted for 65% of all time spent evaluating
+    beziers - 2.0s of 3.1s. The budget caps those and leaves everything else
+    alone. Measured over 115,968 real sliders it moves 2 of them at all, by
+    at most 0.059 diameters, against the 0.25-diameter MEAN error of the
+    control-polygon walk this whole port replaced.
     """
     span = 0.0
     for i in range(1, len(control)):
         span += math.hypot(control[i][0] - control[i - 1][0],
                            control[i][1] - control[i - 1][1])
-    return max(8, min(1024, int(span / 8) + 8))
+    budget = max(8, _BEZIER_LERP_BUDGET // (len(control) * len(control)))
+    return max(8, min(1024, int(span / 8) + 8, budget))
 
 
-def _circular_arc_points(pts):
+def _circular_arc_geometry(pts):
     """
-    The perfect-circle (P) curve: the unique arc through three points.
+    The circle through three points, as (cx, cy, r, t1, direction, sweep).
 
     Returns None when they are collinear or the arc is degenerate, which is
     exactly when osu! gives up and falls back to a bezier through the same
@@ -513,7 +587,18 @@ def _circular_arc_points(pts):
         t3 -= 2.0 * math.pi
     direction = -1.0 if t3 < t1 else 1.0
     theta_range = abs(t3 - t1)
+    return cx, cy, r, t1, direction, theta_range
 
+
+def _circular_arc_sample_count(r, theta_range):
+    """
+    How many points osu! flattens this arc into, or None if it gives up.
+
+    Split out so _arc_point_at_length() can ask the same question without
+    building the points: the bail-out matters, because past it osu! draws a
+    bezier through the three points instead and the answer is a different
+    curve, not a coarser version of the same one.
+    """
     if 2.0 * r <= _CIRCULAR_ARC_TOLERANCE:
         amount = 2
     else:
@@ -523,10 +608,57 @@ def _circular_arc_points(pts):
     if amount >= 1000:
         # osu! bails out to a bezier rather than emitting a huge point list.
         return None
+    return amount
 
+
+def _circular_arc_points(pts):
+    """The perfect-circle (P) curve as a polyline, or None if degenerate."""
+    geo = _circular_arc_geometry(pts)
+    if geo is None:
+        return None
+    cx, cy, r, t1, direction, theta_range = geo
+    amount = _circular_arc_sample_count(r, theta_range)
+    if amount is None:
+        return None
     return [(cx + math.cos(t1 + direction * (i / (amount - 1)) * theta_range) * r,
              cy + math.sin(t1 + direction * (i / (amount - 1)) * theta_range) * r)
             for i in range(amount)]
+
+
+def _arc_point_at_length(pts, length):
+    """
+    The point `length` px along a perfect-circle arc, or None if this arc
+    isn't one the closed form can answer for.
+
+    An arc is the one curve here whose length has an exact closed form -
+    r * theta - so there is no reason to flatten it into a polyline and then
+    walk that polyline measuring chords. Half the sliders in a real library
+    are perfect circles (366,877 of 798,166 single-span sliders in the
+    user's), and flattening them at the 0.1px tolerance osu! uses is by far
+    the largest single cost in parsing a map.
+
+    This is also strictly MORE accurate than the walk it replaces: the walk
+    lands on a chord between two flattened samples, which cuts the corner by
+    up to the flattening tolerance, while this lands on the arc itself.
+
+    Returns None - deferring to the polyline - in the two cases where the
+    closed form would not be answering the same question:
+      - a degenerate arc, or one osu! refuses to flatten, where osu! draws a
+        bezier through the three points instead;
+      - `length` past the end of the arc, where osu! extends the last
+        flattened segment in a straight line rather than continuing to curve
+        (see _point_at_path_length).
+    """
+    geo = _circular_arc_geometry(pts)
+    if geo is None:
+        return None
+    cx, cy, r, t1, direction, theta_range = geo
+    if _circular_arc_sample_count(r, theta_range) is None:
+        return None
+    if length > r * theta_range:
+        return None
+    theta = t1 + direction * (length / r)
+    return cx + math.cos(theta) * r, cy + math.sin(theta) * r
 
 
 def _catmull_point(v1, v2, v3, v4, t):
@@ -564,6 +696,11 @@ def _slider_path_points(curve, x0, y0):
     control polygon is not a stand-in for them.
     """
     kind, pts = _parse_control_points(curve, x0, y0)
+    return _path_from_control_points(kind, pts, x0, y0)
+
+
+def _path_from_control_points(kind, pts, x0, y0):
+    """_slider_path_points() with the control points already parsed."""
     if len(pts) < 2:
         return [(x0, y0)]
     if kind == "L":
@@ -572,6 +709,11 @@ def _slider_path_points(curve, x0, y0):
     path = []
     for seg in _split_at_red_anchors(pts):
         if len(seg) < 2:
+            sub = seg
+        elif len(seg) == 2 and kind != "C":
+            # A straight run between two anchors. Exact with two points, and
+            # skipping _bezier_sample_count() here skips measuring a span
+            # whose sample count would have been thrown away anyway.
             sub = seg
         elif kind == "P" and len(seg) == 3:
             sub = _circular_arc_points(seg) or _bezier_points(
@@ -584,6 +726,31 @@ def _slider_path_points(curve, x0, y0):
             if not path or pt != path[-1]:
                 path.append(pt)
     return path or [(x0, y0)]
+
+
+def _point_at_curve_length(curve, x0, y0, length):
+    """
+    Where a slider's tail lands: `length` px along its curve from (x0, y0).
+
+    The entry point for everything that wants a slider end - flattening the
+    curve into a polyline first is an implementation detail, and for a
+    perfect circle it is one worth skipping entirely. See
+    _arc_point_at_length(), which answers the same question in closed form
+    and returns None when it cannot, in which case this falls through to the
+    polyline exactly as before.
+    """
+    kind, pts = _parse_control_points(curve, x0, y0)
+    if len(pts) < 2:
+        return x0, y0
+    if (kind == "P" and len(pts) == 3 and length > 0
+            and pts[0] != pts[1] and pts[1] != pts[2]):
+        # Three distinct points and no red anchor, so _split_at_red_anchors()
+        # would hand the whole thing to the arc code as one segment.
+        point = _arc_point_at_length(pts, length)
+        if point is not None:
+            return point
+    return _point_at_path_length(_path_from_control_points(kind, pts, x0, y0),
+                                 length)
 
 
 def _point_at_path_length(path, length):
@@ -780,18 +947,27 @@ def section_pattern_counts(objs, eligible, label, section_ms=2000.0,
         buckets.setdefault(k, []).append(label.get(i))
     active = streams = bursts = jumps = 0
     for members in buckets.values():
-        if len(members) < section_min_transitions:
+        total = len(members)
+        if total < section_min_transitions:
             continue
         active += 1
-        for tag, bump in (("s", "stream"), ("b", "burst"), ("j", "jump")):
-            if members.count(tag) / len(members) >= section_dominance:
-                if bump == "stream":
-                    streams += 1
-                elif bump == "burst":
-                    bursts += 1
-                else:
-                    jumps += 1
-                break   # a section is owned by at most one pattern
+        # One pass rather than three .count() scans - a section is owned by at
+        # most one pattern, so the first to clear section_dominance takes it.
+        s_n = b_n = j_n = 0
+        for tag in members:
+            if tag == "s":
+                s_n += 1
+            elif tag == "b":
+                b_n += 1
+            elif tag == "j":
+                j_n += 1
+        need = section_dominance * total
+        if s_n >= need:
+            streams += 1
+        elif b_n >= need:
+            bursts += 1
+        elif j_n >= need:
+            jumps += 1
     return active, streams, bursts, jumps
 
 

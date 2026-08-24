@@ -624,6 +624,13 @@ def test_non_standard_modes_are_skipped():
 # property of a bezier - rather than against numbers this code produced.
 
 def _end_of(curve, length, x0=0.0, y0=0.0):
+    # The production entry point, so these cover the closed-form shortcuts
+    # (see _point_at_curve_length) and not just the polyline behind them.
+    return cm._point_at_curve_length(curve, x0, y0, length)
+
+
+def _flattened_end(curve, length, x0=0.0, y0=0.0):
+    """The same answer the long way round, via the flattened polyline."""
     return cm._point_at_path_length(cm._slider_path_points(curve, x0, y0), length)
 
 
@@ -659,6 +666,101 @@ def test_a_perfect_circle_slider_follows_its_arc():
     px, py = _polyline_end("P|50:50|100:0", half_arc)
     assert math.hypot(px - ex, py - ey) > 5, \
         "this fixture is supposed to separate the arc from its chord"
+
+
+def test_a_perfect_circle_end_lands_on_the_circle_itself():
+    # The arc shortcut answers from the circle (r * theta) instead of walking
+    # a flattened polyline, so its answer sits ON the arc rather than on a
+    # chord across it. Both facts are checked: the right distance along, and
+    # exactly r from the centre.
+    #
+    # P|50:50|100:0 through (0,0) is the semicircle centred at (50,0), r=50.
+    curve = "P|50:50|100:0"
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        ex, ey = _end_of(curve, math.pi * 50 * frac)
+        assert abs(math.hypot(ex - 50, ey - 0) - 50) < 1e-9,             f"at {frac} of the way round, the point is not on the circle"
+        theta = math.pi * frac
+        assert abs(ex - (50 - 50 * math.cos(theta))) < 1e-9
+        assert abs(ey - 50 * math.sin(theta)) < 1e-9
+
+
+def test_the_arc_shortcut_agrees_with_flattening_it():
+    # Same question, two routes. They are not identical and should not be:
+    # the polyline lands on a chord across the arc, cutting the corner by up
+    # to _CIRCULAR_ARC_TOLERANCE, while the shortcut lands on the arc. The
+    # gap is bounded by that tolerance, and a hit circle is ~90px across, so
+    # even the loose bound here is a four-hundredth of one.
+    curve = "P|50:50|100:0"
+    for length in (20.0, 60.0, 100.0, math.pi * 50):
+        a = _end_of(curve, length)
+        b = _flattened_end(curve, length)
+        assert math.hypot(a[0] - b[0], a[1] - b[1]) < 0.25,             f"arc and polyline disagree at length {length}"
+
+
+def test_a_length_past_the_end_of_an_arc_still_extends_straight():
+    # osu! extends the last segment in a straight line rather than carrying
+    # on around the circle, so the shortcut must decline this case and hand
+    # it back to the polyline. If it ever answers it itself, the point would
+    # come back somewhere on the circle instead of off the end of it.
+    curve = "P|50:50|100:0"
+    over = math.pi * 50 + 40
+    a = _end_of(curve, over)
+    b = _flattened_end(curve, over)
+    assert math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-9
+    assert math.hypot(a[0] - 50, a[1] - 0) > 50 + 1.0,         "past the end it should leave the circle, not stay on it"
+
+
+def test_low_degree_bezier_shortcuts_match_de_casteljau():
+    # _bezier_points special-cases 2, 3 and 4 control points because they are
+    # most of the real traffic. They are closed forms of the same curve, not
+    # approximations of it, so they must agree with the generic evaluation to
+    # floating-point noise.
+    def de_casteljau(control, samples):
+        out = []
+        for k in range(samples + 1):
+            t = k / samples
+            tmp = list(control)
+            for r in range(1, len(control)):
+                for i in range(len(control) - r):
+                    tmp[i] = (tmp[i][0] + (tmp[i + 1][0] - tmp[i][0]) * t,
+                              tmp[i][1] + (tmp[i + 1][1] - tmp[i][1]) * t)
+            out.append(tmp[0])
+        return out
+
+    for control in ([(0.0, 0.0), (50.0, 120.0), (140.0, 30.0)],
+                    [(0.0, 0.0), (20.0, 90.0), (130.0, 100.0), (160.0, 10.0)]):
+        got = cm._bezier_points(control, 16)
+        want = de_casteljau(control, 16)
+        assert len(got) == len(want)
+        for (gx, gy), (wx, wy) in zip(got, want):
+            assert math.hypot(gx - wx, gy - wy) < 1e-9,                 f"{len(control)}-point shortcut disagrees with de Casteljau"
+
+    # Two points is the one case that returns a DIFFERENT number of points on
+    # purpose: sampling a straight line 17 times describes the same segment
+    # as its two endpoints do, so the shortcut emits the endpoints and the
+    # intermediate samples are the work being skipped. Every sample de
+    # Casteljau would have produced lies on that segment.
+    line = [(0.0, 0.0), (90.0, 40.0)]
+    assert cm._bezier_points(line, 16) == line
+    for px, py in de_casteljau(line, 16):
+        cross = px * 40.0 - py * 90.0
+        assert abs(cross) < 1e-9, "the skipped samples were not on the line"
+
+
+def test_a_high_degree_bezier_stays_within_its_work_budget():
+    # de Casteljau costs a lerp per control-point pair per sample, so a
+    # segment with many anchors is quadratic in its degree - one 146-point
+    # art slider cost 240ms on its own. _BEZIER_LERP_BUDGET caps that; the
+    # ordinary sliders either side of it must not be touched by the cap.
+    big = [(float(i * 7 % 400), float(i * 13 % 300)) for i in range(146)]
+    k = cm._bezier_sample_count(big)
+    assert k * len(big) * len(big) <= cm._BEZIER_LERP_BUDGET
+
+    ordinary = [(0.0, 0.0), (60.0, 90.0), (180.0, 40.0)]
+    assert cm._bezier_sample_count(ordinary) == int(
+        sum(math.hypot(ordinary[i][0] - ordinary[i - 1][0],
+                       ordinary[i][1] - ordinary[i - 1][1])
+            for i in range(1, 3)) / 8) + 8
 
 
 def test_a_bezier_ends_where_the_curve_ends_not_where_the_polygon_does():

@@ -222,8 +222,46 @@ Two details that are easy to get wrong and are both pinned by tests:
 
 Bezier sampling is one point per 8px of control polygon, checked against a
 faithful port of osu-framework's adaptive subdivision: they agree to 0.0035
-diameters, seventy times finer than the error being removed. Parse cost is
-roughly 2x, which is about 6% of scan wall time — the scan is I/O-bound.
+diameters, seventy times finer than the error being removed.
+
+#### What this costs, and the three things that pay most of it back
+
+The first version of this cost **3.3x** on parse+classify — 138 → 42
+difficulties/sec over 400 real files with the I/O taken out. That was
+originally waved through as "about 6% of scan wall time, the scan is
+I/O-bound", which was measured but is the wrong reading: the I/O ceiling on
+that HDD was ~67 diffs/sec, so a CPU rate of 42 does not hide under it, it
+*becomes* the ceiling. On a machine with a faster disk or a warm cache there
+is nothing to hide under at all, and the whole 3.3x lands on the user.
+
+Three changes take it to **65 diffs/sec**, a median of 1.53x per difficulty,
+with the answers unchanged or better:
+
+- **A perfect circle is not flattened at all.** Arc length is exactly
+  `r * theta`, so `_arc_point_at_length()` answers in closed form. This is
+  the single biggest win — 44,889 of 115,968 real sliders take it — and it
+  is strictly *more* accurate than the polyline it replaces, which lands on
+  a chord across the arc rather than on the arc. It declines the two cases
+  where the closed form would answer a different question (a degenerate arc,
+  and a length past the arc's end, where osu! extends in a straight line).
+- **Low-degree beziers use closed forms.** Of 55,516 bezier segments, 61%
+  have two control points, 25% three and 10% four. A two-point bezier IS the
+  straight line between its endpoints, so sampling it 17 times was pure
+  waste; the quadratic and cubic forms are the same arithmetic de Casteljau
+  does without rebuilding a list per sample. All three are exact — pinned
+  against a generic de Casteljau by test.
+- **A work budget for high-degree segments.** de Casteljau is one lerp per
+  control-point pair per sample, so cost is quadratic in the degree. 120
+  segments of 10+ control points — 0.2% of them, one at 146 points — were
+  65% of all bezier time, and that one 146-point art slider took 240ms by
+  itself. `_BEZIER_LERP_BUDGET` caps it. Over 115,968 sliders the cap moves
+  **one** of them by more than 0.01 diameters, at most 0.059.
+
+What is left is inherent: parse is 2.0x and classify 2.1x, and both are
+mostly real curve arithmetic that the old code simply did not do. Verified
+against the pre-port implementation over 115,968 sliders — 46,847 endpoints
+move, none by more than 0.059 diameters, against the 0.251-diameter *mean*
+error of the control-polygon walk in the table above.
 
 ### Things checked against the osu! sources and deliberately NOT done
 
