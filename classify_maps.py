@@ -185,6 +185,25 @@ def parse_osu_file(path):
     return parse_osu_bytes(raw, display_name=path, path=path)
 
 
+def _section(text, name):
+    """
+    The body of one `[Section]`, or None.
+
+    A `re.search(r"\[Name\](.*?)(\[|$)", text, re.S)` does the same job, but
+    the non-greedy `.*?` retries its terminator at every character of the
+    section - so reading [HitObjects] costs a backtrack per byte of the
+    largest part of the file. Over 400 real difficulties the two section
+    regexes cost 0.507s against 0.016s for this, and the gap grows with
+    object count, i.e. worst on the maps that are already slowest to parse.
+    """
+    start = text.find("[" + name + "]")
+    if start < 0:
+        return None
+    start += len(name) + 2
+    end = text.find("[", start)
+    return text[start:end] if end >= 0 else text[start:]
+
+
 def parse_osu_bytes(raw, display_name, path=None):
     md5 = hashlib.md5(raw).hexdigest()
     text = raw.decode("utf-8", errors="ignore")
@@ -198,13 +217,23 @@ def parse_osu_bytes(raw, display_name, path=None):
     od_m = re.search(r"^OverallDifficulty:(.*)$", text, re.M)
     ar_m = re.search(r"^ApproachRate:(.*)$", text, re.M)
 
-    mode = int(mode_m.group(1).strip()) if mode_m else 0
+    # Guarded like every other numeric header field below. Unguarded, a
+    # blank or malformed value raised out of here and the scan paths' own
+    # `except Exception` recorded the whole difficulty as a corrupt file
+    # instead of falling back to the default the field already has.
+    try:
+        mode = int(mode_m.group(1).strip()) if mode_m else 0
+    except ValueError:
+        mode = 0
     if mode != 0:
         return None  # only classic osu!standard for now (bursts/streams are a std concept)
 
     title = title_m.group(1).strip() if title_m else display_name
     diff_name = diff_m.group(1).strip() if diff_m else "?"
-    cs = float(cs_m.group(1).strip()) if cs_m else 4.0
+    try:
+        cs = float(cs_m.group(1).strip()) if cs_m else 4.0
+    except ValueError:
+        cs = 4.0
     try:
         od = float(od_m.group(1).strip()) if od_m else 5.0
     except ValueError:
@@ -225,11 +254,11 @@ def parse_osu_bytes(raw, display_name, path=None):
     #   negative -> inherited, sets slider velocity as -100/beatLength
     # Slider velocity is needed to work out how long a slider lasts, which
     # feeds the movement-time term of the jump metric.
-    tp_section = re.search(r"\[TimingPoints\](.*?)(\[|$)", text, re.S)
+    tp_section = _section(text, "TimingPoints")
     timing_points = []
     sv_points = []
     if tp_section:
-        for line in tp_section.group(1).splitlines():
+        for line in tp_section.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -249,10 +278,10 @@ def parse_osu_bytes(raw, display_name, path=None):
     timing_points.sort()
     sv_points.sort()
 
-    ho_section = re.search(r"\[HitObjects\](.*?)(\[|$)", text, re.S)
+    ho_section = _section(text, "HitObjects")
     objs = []
     if ho_section:
-        for line in ho_section.group(1).splitlines():
+        for line in ho_section.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -286,12 +315,19 @@ def parse_osu_bytes(raw, display_name, path=None):
             objs.append((float(t), end_t, x, y, ex, ey))
     objs.sort(key=lambda o: o[0])
 
+    # The tempo the map spends the most TIME at, not whichever one happens to
+    # be written first. A map opening on a half-tempo intro names that intro
+    # in timing_points[0], and reporting it puts a number in report.csv that
+    # the song is only briefly at - the same trap dominant_beat_ms() was
+    # written for on the notation side.
+    #
     # A malformed/corrupt map can carry a beatLength near zero (subnormal
     # float, no exception at division - IEEE754 divide overflow just returns
     # inf). round(inf) later crashes the CSV write with "cannot convert float
     # infinity to integer", so clamp here at the source rather than only
     # guarding every downstream consumer.
-    bpm = 60000.0 / timing_points[0][1] if timing_points else 0.0
+    beat = dominant_beat_ms(objs, timing_points)
+    bpm = 60000.0 / beat if beat else 0.0
     if not math.isfinite(bpm):
         bpm = 0.0
 
@@ -637,9 +673,15 @@ def _arc_point_at_length(pts, length):
     user's), and flattening them at the 0.1px tolerance osu! uses is by far
     the largest single cost in parsing a map.
 
-    This is also strictly MORE accurate than the walk it replaces: the walk
-    lands on a chord between two flattened samples, which cuts the corner by
-    up to the flattening tolerance, while this lands on the arc itself.
+    It is worth being exact about what this is and is not more accurate than.
+    It lands on the true arc; the walk lands on a chord between two flattened
+    samples, cutting the corner by up to the flattening tolerance. But osu!
+    itself measures a slider's declared length along ITS OWN flattened path
+    (SliderPath.calculateLength), so the polyline is the behaviour being
+    reproduced and this diverges from it rather than converging on it. The
+    divergence is bounded by _CIRCULAR_ARC_TOLERANCE - measured at 0.0049
+    diameters at worst over 115,968 real sliders, against a hit circle of
+    1.0 - which is why the trade is worth it. It is not free.
 
     Returns None - deferring to the polyline - in the two cases where the
     closed form would not be answering the same question:
@@ -1020,16 +1062,46 @@ def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
 
     Three conditions - one from the timing points, two from the notes:
 
-      1. The NOTATED TEMPO exceeds max_plausible_bpm. Decisive, and read off
-         the timing points rather than the notes on purpose: notation is a
-         property of the MAPSET, so every difficulty in it must get the same
-         answer. Content alone does not do that. Across the eight difficulties
-         of "Flowering Night Fever" (a real 290 BPM map) the quiet ones carry
-         no 1/4 at all, so they look exactly like doubled notation while their
-         harder siblings do not - three of the eight flipped, inflating their
-         burst counts. A tempo bound is shared by construction.
+      1. The NOTATED TEMPO exceeds max_plausible_bpm.
 
-         Which timing point that tempo comes from matters: it is the one the
+         This one is unavoidable rather than merely convenient, and it is
+         worth being blunt about why, because a hard threshold on BPM looks
+         like exactly the kind of thing this file otherwise refuses to do.
+
+         An honest 320 BPM map and a 160 BPM map notated at 320 CONTAIN THE
+         SAME NOTES. Doubling the written tempo moves every layer up one
+         name - the real 1/2 backbone is written as 1/1, the real 1/4 as 1/2
+         - but not one timestamp moves. There is no content signal to find,
+         because the content is identical; the only thing that differs
+         between the two files is the number in the timing point. So the
+         tempo has to decide, and no amount of cleverness about the notes
+         will replace it.
+
+         What the content conditions below DO buy is protection in the other
+         direction, and they carry most of the weight. Surveyed over 1,501
+         real difficulties, 117 notated above 240 BPM: of the five above 300,
+         four are rejected by content alone - "Acid Rain [Aspire]" (340) has
+         a 23% notated 1/4 layer, "IMMORTAL" (340) has almost no 1/2, "KOODA"
+         (358) has neither - and only one folds. Meanwhile the 300 BPM stream
+         maps ("Power Up [300 BPM MAD STREAM]", 72% notated 1/4) would be
+         rejected on content even if the bound were lower.
+
+         Where the bound genuinely earns its place is the 240-300 band that
+         content cannot defend: "Setsuna Trip" is a real 290 BPM map whose
+         notated 1/2 is 50% of its gaps at 103ms and which carries no 1/4 at
+         all. That is indistinguishable, from the notes, from a doubled 145.
+         Fold it and half the map's ordinary tapping becomes bursts.
+
+         The remaining known weakness is that this is decided PER DIFFICULTY
+         while notation belongs to the MAPSET. Across the eight difficulties
+         of "Flowering Night Fever" (a real 290 BPM map) the quiet ones carry
+         no 1/4 at all and so look doubled while their harder siblings do
+         not. A tempo bound is at least shared by construction, which is why
+         it is here; resolving notation once per mapset would let content
+         decide properly, and is the real fix. classify_diff() never sees a
+         diff's siblings, so that is a scan-architecture change.
+
+         Which timing point the tempo comes from matters: it is the one the
          map spends the most time under, not the first one in the file. See
          dominant_beat_ms() - a map opening on a half-tempo intro names the
          intro's beat first, and reading that would miss the doubling.
@@ -1321,11 +1393,20 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # has no meaningful velocity to measure, so it's excluded the same way
     # rather than letting the 1ms floor manufacture a jump out of it.
     #
+    # A ZERO gap - two objects sharing a timestamp - is excluded for the same
+    # reason and one more. There is no interval to tap and no time to move,
+    # so neither the rhythm nor the velocity of such a transition means
+    # anything. Left in, it also cleared every speed gate by being trivially
+    # under all of them: five circles on one timestamp came out as a
+    # five-note burst and the map as "Bursts". 2B maps and converts carry
+    # simultaneous objects at otherwise ordinary density, so is_junk_diff
+    # does not catch them.
+    #
     # This set is the denominator every coverage figure is measured against,
     # and - since the run classification below partitions it - the thing that
     # makes those figures comparable to each other.
     eligible = [i for i, (tap_gap, _, _, overlapping) in enumerate(transitions)
-                if tap_gap <= jump_gap_cap_ms and not overlapping]
+                if 0 < tap_gap <= jump_gap_cap_ms and not overlapping]
     counted_gaps = len(eligible)
 
     # --- run building: fast AND rhythmically consistent ---------------------
@@ -1333,7 +1414,9 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     cur = []
     cur_sum = 0.0
     for idx, (tap_gap, _, _, _) in enumerate(transitions):
-        if tap_gap > max_gap_ms:
+        # A zero gap breaks the run rather than joining it - see the
+        # eligibility comment above. It is a boundary, not run content.
+        if tap_gap <= 0 or tap_gap > max_gap_ms:
             if cur:
                 raw_runs.append(cur)
             cur, cur_sum = [], 0.0
@@ -2471,6 +2554,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
     import subprocess
     import tempfile
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     def log(msg):
         if log_cb:
@@ -2571,23 +2655,50 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     results = []
     errors = []
-    for i, (full, ranked_status, star_rating, online_id) in enumerate(entries):
-        if cancel_event is not None and cancel_event.is_set():
-            raise ScanCancelled()
-        wait_if_paused(pause_event, cancel_event)
+
+    def _read(entry):
         try:
-            diff = parse_osu_file(full)
-            if not is_junk_diff(diff):
-                diff.ranked_status = ranked_status
-                diff.star_rating = star_rating
-                diff.online_id = online_id
-                results.append(emit(diff))
-        except Exception as e:
-            errors.append((full, str(e)))
-        if progress_cb and (i + 1) % 25 == 0:
-            progress_cb(i + 1, len(entries))
-        if log_cb and (i + 1) % 5000 == 0:
-            log(f"  ... {i + 1}/{len(entries)} parsed")
+            return parse_osu_file(entry[0]), None
+        except Exception as exc:
+            return None, str(exc)
+
+    # Same thread pool, and for the same reason, as scan_stable_db and
+    # scan_folder - see the long comment on SCAN_READ_WORKERS. The helper
+    # front-loads the PATH lookup into one subprocess call, but the parse
+    # below is still N python-level open()/read()s, and those are I/O-latency
+    # bound exactly like the other two paths. This one was left serial when
+    # they were converted, which made the lazer fast path the slowest of the
+    # three per file despite its name.
+    #
+    # Bounded windows so cancel and pause stay responsive, and results,
+    # errors and on_parsed all stay on this thread: on_parsed classifies and
+    # mutates caller-owned state, and it raises ScanCancelled on cancel,
+    # which must unwind rather than be caught as a per-file error.
+    pool = ThreadPoolExecutor(max_workers=SCAN_READ_WORKERS)
+    window = SCAN_READ_WORKERS * 4
+    i = 0
+    try:
+        for start in range(0, len(entries), window):
+            batch = entries[start:start + window]
+            for entry, (diff, err) in zip(batch, pool.map(_read, batch)):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ScanCancelled()
+                wait_if_paused(pause_event, cancel_event)
+                full, ranked_status, star_rating, online_id = entry
+                if err is not None:
+                    errors.append((full, err))
+                elif not is_junk_diff(diff):
+                    diff.ranked_status = ranked_status
+                    diff.star_rating = star_rating
+                    diff.online_id = online_id
+                    results.append(emit(diff))
+                i += 1
+                if progress_cb and i % 25 == 0:
+                    progress_cb(i, len(entries))
+                if log_cb and i % 5000 == 0:
+                    log(f"  ... {i}/{len(entries)} parsed")
+    finally:
+        pool.shutdown(wait=False)
 
     if progress_cb:
         progress_cb(len(entries), len(entries))
@@ -2980,29 +3091,35 @@ def derive_collections(diffs):
     map - a small secondary pattern doesn't change what the map fundamentally
     is.
 
-      - Streams            : has any genuine stream run (10+ notes, tight/
-                              fast). Cutstreams (a stream with a minority of
-                              wider-spaced notes) count as streams here too,
-                              not a separate category - a cutstream is still
-                              a stream.
-      - Bursts             : has burst run(s), no streams, and burst note
-                              coverage is greater than or equal to jump
-                              coverage of the map.
-      - Jumps with bursts  : has jumps AND bursts, no streams, but JUMP
-                              coverage is greater than burst coverage - the
-                              map is still fundamentally a jump map, bursts
-                              are secondary.
-      - Jumps (no bursts)  : jump-heavy, no bursts or streams at all.
-      - Misc               : none of the above (low-density / normal play).
+    The rules themselves live in category_of() and are described there; what
+    follows is a summary of what each collection means, not a second copy of
+    the logic.
 
-    Bursts vs. Jumps is decided by comparing how much of the map each
-    pattern actually covers (burst note count / total notes vs. jump_pct),
-    not just whether a burst run exists at all - a map that's 90% jumps
-    with one small incidental burst thrown in is still fundamentally a jump
-    map, not a burst map. This mirrors how the osu! community actually
-    talks about maps - "this is a stream map" even if it has a jump
-    section, but a map isn't relabeled a "burst map" just because it has
-    one short burst somewhere in an otherwise pure jump map.
+      - Streams            : streams cover more of the map than anything
+                              else present. Cutstreams (a stream interrupted
+                              by a skipped beat) count as streams here, not
+                              as a separate category - a cutstream is still
+                              a stream.
+      - Hybrid             : streams AND jumps, in comparable amounts and in
+                              DIFFERENT PARTS of the map. Decided from
+                              sections rather than coverage, because "jumps
+                              then streams" and "both mixed throughout"
+                              average to identical coverage.
+      - Bursts             : bursts cover more of the map than the jumps or
+                              streams in it do.
+      - Jumps with bursts  : jumps cover the most, and there are bursts
+                              alongside them - secondary content, not the
+                              map's character.
+      - Jumps (no bursts)  : jumps cover the most and there are no bursts.
+      - Misc               : nothing cleared its own presence bar (low
+                              density / normal play).
+
+    All three patterns are measured on ONE basis - share of gameplay
+    transitions, over the same denominator - so category_of() ranks them in a
+    single contest rather than a chain of pairwise comparisons where the
+    order decided as much as the evidence. Only patterns that cleared their
+    own presence bar are entered, so a map is never handed to whichever
+    pattern was marginally less absent than the others.
     """
     groups = {label: [] for label in CATEGORIES}
     for d in diffs:

@@ -257,11 +257,59 @@ with the answers unchanged or better:
   itself. `_BEZIER_LERP_BUDGET` caps it. Over 115,968 sliders the cap moves
   **one** of them by more than 0.01 diameters, at most 0.059.
 
-What is left is inherent: parse is 2.0x and classify 2.1x, and both are
-mostly real curve arithmetic that the old code simply did not do. Verified
+A fourth change is not about curves at all: the `[HitObjects]` and
+`[TimingPoints]` bodies were pulled out with a non-greedy `re.S` search whose
+`.*?` retries its terminator at every character of the largest part of the
+file. `_section()` does it with `str.find` and a slice: 0.507s to 0.016s over
+the same 400 difficulties, ~11% of parse, agreeing line for line (only
+trailing whitespace differs).
+
+Together these land at **113 diffs/sec against 199 for the pre-port code** -
+1.76x rather than 3.3x. What is left is inherent: real curve arithmetic the
+old code simply did not do. Verified
 against the pre-port implementation over 115,968 sliders — 46,847 endpoints
 move, none by more than 0.059 diameters, against the 0.251-diameter *mean*
 error of the control-polygon walk in the table above.
+
+### Doubled-BPM notation: why a hard tempo threshold is unavoidable
+
+`looks_like_doubled_notation()` refuses to fold unless the notated tempo
+exceeds `max_plausible_bpm` (300). A hard BPM threshold looks like exactly
+the kind of thing the rest of this file refuses to do, so:
+
+**An honest 320 BPM map and a 160 BPM map notated at 320 contain the same
+notes.** Doubling the written tempo renames every layer - the real 1/2
+backbone becomes a written 1/1, the real 1/4 becomes a written 1/2 - but not
+one timestamp moves. There is no content signal to find, because the content
+is identical. The only difference between the two files is the number in the
+timing point, so that number has to decide.
+
+The content conditions still carry most of the weight, in the other
+direction. Surveyed over 1,501 real difficulties, 117 notated above 240 BPM;
+of the five above 300, four are rejected on content alone:
+
+| map | notated | 1/1 | 1/2 | 1/4 | folded? |
+|---|---:|---:|---:|---:|---|
+| KOODA [Dicky stiffy uh] | 358 | 24% | 0% | 0% | no - no 1/2 layer |
+| Acid Rain [Aspire] | 340 | 21% | 32% | 23% | no - real 1/4 layer |
+| IMMORTAL [Eva Phonk] | 340 | 67% | 6% | 0% | no - 1/2 too sparse |
+| Super-Fast-Internet-san [vrooom] | 320 | 33% | 50% | 6% | yes |
+| Power Up [300 BPM MAD STREAM] | 300 | 17% | 0% | 72% | no - 72% real 1/4 |
+
+Where the bound earns its place is the 240-300 band, which content cannot
+defend. "Setsuna Trip" is a real 290 BPM map whose notated 1/2 is 50% of its
+gaps at 103ms, with no 1/4 at all - from the notes alone that is
+indistinguishable from a doubled 145. Fold it and half the map's ordinary
+tapping becomes bursts.
+
+**The known weakness** is that this is decided per DIFFICULTY while notation
+belongs to the MAPSET. Across the eight difficulties of "Flowering Night
+Fever" (a real 290 BPM map) the quiet ones carry no 1/4 and so look doubled
+while their harder siblings do not. A tempo bound is at least shared by
+construction, which is why it is here. Resolving notation once per mapset
+would let content decide properly and is the real fix - `classify_diff` never
+sees a diff's siblings, so that is a scan-architecture change, not a
+threshold change.
 
 ### Things checked against the osu! sources and deliberately NOT done
 

@@ -30,6 +30,9 @@ HEADER = (
 )
 
 
+NL = chr(10)
+
+
 def build(lines, cs=4, bl=300.0, extra=""):
     text = HEADER.format(cs=cs, bl=bl, extra=extra) + "\n".join(lines)
     return cm.parse_osu_bytes(text.encode(), "test")
@@ -266,6 +269,70 @@ def test_bezier_sampling_stays_dense_on_a_long_slider():
     assert cm._bezier_sample_count(long_poly) == 2000 // 8 + 8
     short_poly = [(0.0, 0.0), (100.0, 0.0)]
     assert cm._bezier_sample_count(short_poly) == 100 // 8 + 8
+
+
+def test_simultaneous_notes_are_not_a_burst():
+    # Two objects on the same millisecond have no interval to tap and no time
+    # to move, so the transition between them is not gameplay. Left in, it
+    # cleared every speed gate by being trivially under all of them - zero is
+    # under max_gap_ms, under burst_max_gap_ms, and under any snap - and the
+    # consistency check was skipped because the running mean was zero too.
+    # Five circles on one timestamp came out as a five-note burst.
+    same = [f"{100 + i * 8},100,1000,1,0" for i in range(5)]
+    filler = [f"100,100,{4000 + i * 500},1,0" for i in range(8)]
+    d = classify(same + filler)
+    assert not d.has_bursts
+    assert d.burst_count == 0
+    assert cm.category_of(d) != "Bursts"
+
+
+def test_a_zero_gap_breaks_a_run_rather_than_joining_it():
+    # A real run either side of a pile of simultaneous notes stays two runs.
+    # If the zero gap were merely skipped rather than treated as a boundary,
+    # the two would be spliced into one longer run that never existed.
+    run_a = circles(6, t0=1000, step=80)
+    stack = ["300,300,2000,1,0", "300,300,2000,1,0"]
+    run_b = circles(6, t0=3000, step=80)
+    d = classify(run_a + stack + run_b)
+    assert d.max_burst_len <= 6, "the two runs must not be spliced together"
+
+
+def test_a_malformed_header_field_falls_back_instead_of_dropping_the_map():
+    # CircleSize and Mode used to be parsed without the try/except every
+    # other numeric header field has, so a blank value raised out of
+    # parse_osu_bytes and the scan paths' own `except Exception` recorded the
+    # whole difficulty as a corrupt file.
+    lines = circles(16)
+    text = HEADER.format(cs="", bl=300.0, extra="") + NL.join(lines)
+    d = cm.parse_osu_bytes(text.encode(), "test")
+    assert d is not None and d.circle_size == 4.0
+
+    text = text.replace("Mode: 0", "Mode:")
+    d = cm.parse_osu_bytes(text.encode(), "test")
+    assert d is not None, "a blank Mode should read as osu!standard, not raise"
+
+
+def test_reported_bpm_is_the_tempo_the_map_spends_longest_at():
+    # bpm came from timing_points[0], so a map opening on a half-tempo intro
+    # reported the intro's tempo in report.csv - the number a user eyeballs
+    # when auditing a verdict.
+    notes = [f"100,100,{1000 + i * 150},1,0" for i in range(30)]
+    d = build(notes, bl=300.0, extra="500,150.0,4,2,0,60,1,0")
+    assert round(d.bpm) == 400, f"expected the dominant 400, got {d.bpm}"
+
+
+def test_section_bodies_match_what_the_old_regex_captured():
+    # _section() replaced a non-greedy re.S search that backtracked once per
+    # byte of the hit-object body. The bodies must still split into the same
+    # lines - the only permitted difference is trailing whitespace.
+    import re as _re
+    text = HEADER.format(cs=4, bl=300.0, extra="") + NL.join(circles(5)) + NL
+    for name in ("TimingPoints", "HitObjects"):
+        m = _re.search(r"\[" + name + r"\](.*?)(\[|$)", text, _re.S)
+        old = m.group(1) if m else None
+        new = cm._section(text, name)
+        assert (old or "").splitlines() == (new or "").splitlines()
+    assert cm._section(text, "NotASection") is None
 
 
 def test_corrupt_timing_does_not_suppress_every_run():
@@ -861,13 +928,18 @@ def test_overlapping_slider_tail_is_not_a_manufactured_jump():
     wide = [f"{100 + (i % 2) * 300},100,{1000 + i * 200},1,0" for i in range(60)]
     base = classify(wide)
 
+    # Placed after the `wide` block, one ordinary 200ms step past its last
+    # note, so the transition INTO the slider is counted like any other and
+    # nothing shares a timestamp with it - two objects on the same
+    # millisecond are excluded in their own right, which would make the
+    # arithmetic below measure something else.
     overlap_pair = [
         # 300px path, 300ms/beat, SliderMultiplier 1.4 -> ~643ms duration,
-        # tail near (400,100) at t~5643.
-        "100,100,5000,2,0,L|400:100,1,300",
-        # Starts at t=5100 - long before the slider's own computed end - and
+        # tail near (400,100) at t~13643.
+        "100,100,13000,2,0,L|400:100,1,300",
+        # Starts at t=13100 - long before the slider's own computed end - and
         # far from its tail (424px away, vs. a ~73px hit-circle diameter).
-        "100,400,5100,1,0",
+        "100,400,13100,1,0",
     ]
     with_overlap = classify(wide + overlap_pair)
 
