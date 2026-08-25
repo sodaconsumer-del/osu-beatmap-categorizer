@@ -335,6 +335,83 @@ def test_section_bodies_match_what_the_old_regex_captured():
     assert cm._section(text, "NotASection") is None
 
 
+# --- notation is resolved over the mapset, not the difficulty ---------------
+
+def test_a_quiet_diff_inherits_its_siblings_notation():
+    # The case set-level resolution exists for. A quiet difficulty carries no
+    # 1/4 at all, which is exactly the signature the doubled test looks for,
+    # so on its own it reads as doubled while its busy sibling - carrying a
+    # real 1/4 layer at the same tempo - plainly does not. Pooled, the set's
+    # 1/4 layer is there and both read as honest.
+    filler = [f"100,100,{6000 + i * 400},1,0" for i in range(6)]
+    # 400 BPM notated (150ms beat). The busy diff has a real 1/4 layer.
+    busy = build(circles(30, t0=1000, step=37) + filler, bl=150.0)
+    # The quiet one is all notated 1/2 (75ms), no 1/4 anywhere.
+    quiet = build(circles(30, t0=1000, step=75) + filler, bl=150.0)
+
+    assert cm.looks_like_doubled_notation(quiet.objs, quiet.timing_points,
+                                          105.0, 0.25, 300.0),         "the quiet fixture must read as doubled alone - otherwise this tests nothing"
+    assert not cm.looks_like_doubled_notation(busy.objs, busy.timing_points,
+                                              105.0, 0.25, 300.0)
+
+    evs = [cm.notation_evidence(d.objs, d.timing_points, 105.0)
+           for d in (busy, quiet)]
+    assert cm.resolve_set_notation(evs) == "honest",         "the sibling's 1/4 layer should settle it for the whole set"
+
+
+def test_pooled_evidence_still_finds_a_genuinely_doubled_set():
+    # Pooling must not simply dilute every verdict to "honest". A set where
+    # no difficulty carries a 1/4 layer, at a tempo no song is really at,
+    # still reads as doubled once pooled.
+    filler = [f"100,100,{6000 + i * 400},1,0" for i in range(6)]
+    diffs = [build(circles(n, t0=1000, step=75) + filler, bl=150.0)
+             for n in (20, 30)]
+    evs = [cm.notation_evidence(d.objs, d.timing_points, 105.0) for d in diffs]
+    assert cm.resolve_set_notation(evs) == "doubled"
+
+
+def test_resolve_set_notation_prefers_halved_and_handles_nothing():
+    # Halved wins over doubled, matching the per-difficulty order - a map
+    # cannot be both, and folding twice is not a thing.
+    filler = [f"100,100,{6000 + i * 400},1,0" for i in range(6)]
+    halved = build(circles(30, t0=1000, step=127) + filler, bl=508.47)
+    ev = cm.notation_evidence(halved.objs, halved.timing_points, 105.0)
+    assert cm.resolve_set_notation([ev]) == "halved"
+    assert cm.resolve_set_notation([]) == "honest"
+
+
+def test_classify_diff_takes_a_notation_verdict_it_is_given():
+    # The parameter is how a set-level answer reaches classify_diff. Passing
+    # it must actually override what the difficulty would decide alone, in
+    # both directions, or the pooling above changes nothing.
+    filler = [f"100,100,{6000 + i * 400},1,0" for i in range(7)]
+    lines = circles(3, step=75, dx=8) + filler
+    d = build(lines, bl=150.0)          # reads as doubled on its own
+    assert cm.classify_diff(d, **cm.DEFAULT_PARAMS).has_bursts
+
+    forced = build(lines, bl=150.0)
+    cm.classify_diff(forced, notation="honest", **cm.DEFAULT_PARAMS)
+    assert not forced.has_bursts,         "told the set is honest, the 75ms run is a 1/2 and not a burst"
+
+    # None means "decide from this difficulty alone" - the default, and what
+    # every direct caller and every other test relies on.
+    same = build(lines, bl=150.0)
+    cm.classify_diff(same, notation=None, **cm.DEFAULT_PARAMS)
+    assert same.has_bursts
+
+
+def test_a_map_with_no_set_id_is_classified_alone():
+    # Unsubmitted maps all write BeatmapSetID:-1, so it is not an identity -
+    # pooling them would mix unrelated maps' notation evidence together.
+    lines = circles(16)
+    text = HEADER.format(cs=4, bl=300.0, extra="") + NL.join(lines)
+    assert cm.parse_osu_bytes(text.encode(), "t").set_id is None
+    with_id = text.replace("[Difficulty]", "BeatmapSetID:4242" + NL + NL + "[Difficulty]")
+    assert cm.parse_osu_bytes(with_id.encode(), "t").set_id == 4242
+    unsubmitted = text.replace("[Difficulty]", "BeatmapSetID:-1" + NL + NL + "[Difficulty]")
+    assert cm.parse_osu_bytes(unsubmitted.encode(), "t").set_id is None
+
+
 def test_corrupt_timing_does_not_suppress_every_run():
     # A subnormal beatLength would make `beat * burst_beat_fraction_max`
     # smaller than any real gap, silently rejecting every run in the map.

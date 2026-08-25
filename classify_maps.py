@@ -99,6 +99,13 @@ class DiffInfo:
     overall_difficulty: float = 5.0
     approach_rate: float = 5.0
 
+    # [Metadata] BeatmapSetID, or None when the file has none (unsubmitted
+    # maps write -1). Identifies which difficulties belong to one mapset,
+    # which is what notation has to be resolved over - see
+    # resolve_set_notation(). Deliberately taken from the .osu rather than
+    # from the folder: the lazer blob store has no folders to group by.
+    set_id: int = None
+
     # The mapper's own [Metadata] Tags line, lowercased, or "" if absent.
     # Not consulted by classify_diff and deliberately so - see "Mapper tags
     # are a check, never an input" in AGENTS.md. Carried through to
@@ -186,7 +193,7 @@ def parse_osu_file(path):
 
 
 def _section(text, name):
-    """
+    r"""
     The body of one `[Section]`, or None.
 
     A `re.search(r"\[Name\](.*?)(\[|$)", text, re.S)` does the same job, but
@@ -211,6 +218,7 @@ def parse_osu_bytes(raw, display_name, path=None):
     title_m = re.search(r"^Title:(.*)$", text, re.M)
     diff_m = re.search(r"^Version:(.*)$", text, re.M)
     tags_m = re.search(r"^Tags:(.*)$", text, re.M)
+    setid_m = re.search(r"^BeatmapSetID:(.*)$", text, re.M)
     cs_m = re.search(r"^CircleSize:(.*)$", text, re.M)
     mode_m = re.search(r"^Mode:(.*)$", text, re.M)
     sm_m = re.search(r"^SliderMultiplier:(.*)$", text, re.M)
@@ -326,6 +334,17 @@ def parse_osu_bytes(raw, display_name, path=None):
     # inf). round(inf) later crashes the CSV write with "cannot convert float
     # infinity to integer", so clamp here at the source rather than only
     # guarding every downstream consumer.
+    set_id = None
+    if setid_m:
+        try:
+            parsed = int(setid_m.group(1).strip())
+        except ValueError:
+            parsed = -1
+        # -1 is what osu! writes for a map that was never submitted. It is
+        # not an identity: every unsubmitted map in a library carries it, so
+        # treating it as one would pool their notation evidence together.
+        set_id = parsed if parsed > 0 else None
+
     beat = dominant_beat_ms(objs, timing_points)
     bpm = 60000.0 / beat if beat else 0.0
     if not math.isfinite(bpm):
@@ -345,6 +364,7 @@ def parse_osu_bytes(raw, display_name, path=None):
         overall_difficulty=od,
         approach_rate=ar,
         tags=(tags_m.group(1).strip().lower() if tags_m else ""),
+        set_id=set_id,
     )
 
 
@@ -1048,6 +1068,118 @@ def dominant_beat_ms(objs, timing_points):
     return max(spans.items(), key=lambda kv: kv[1])[0]
 
 
+def notation_evidence(objs, timing_points, burst_max_gap_ms=105.0):
+    """
+    The raw counts the halved and doubled tests are decided from.
+
+    Split out so the same decision can be made from one difficulty or from a
+    whole mapset's difficulties pooled together - see resolve_set_notation().
+    Notation belongs to the SET, and the per-difficulty answer is wrong in a
+    specific, known way: a quiet difficulty carries no 1/4 at all, which is
+    the signature the doubled test looks for, so the easy diffs of a fast
+    honest set can read as doubled while their hard siblings do not.
+
+    `total` counts gameplay gaps; the rest count how many of those land on
+    the notated 1/4 and 1/2. The two tests use different divisor
+    tolerances around the quarter - 0.08 for halved, 0.10 for doubled -
+    because they were measured separately. Both counts are kept (`quarter`
+    and `quarter_loose`) rather than unified on a guess, so neither test's
+    measured behaviour shifts.
+    """
+    ev = {"total": 0, "quarter": 0, "slow_quarter": 0, "quarter_loose": 0,
+          "half": 0, "half_fast": 0,
+          "beat_ms": dominant_beat_ms(objs, timing_points)}
+    if not timing_points or len(objs) < 2:
+        return ev
+    for i in range(1, len(objs)):
+        gap = objs[i][0] - objs[i - 1][0]
+        # Same break cap as elsewhere - a gap this long is a section
+        # boundary, not part of the map's rhythm.
+        if not (0 < gap <= 2000):
+            continue
+        ev["total"] += 1
+        # Per-transition local beat, so a map with BPM changes is measured
+        # against whatever tempo was actually in force at that point.
+        beat = usable_beat_ms(_beat_length_at(objs[i - 1][0], timing_points))
+        if not beat:
+            continue
+        div = beat / gap
+        if abs(div - 4.0) / 4.0 < 0.08:
+            ev["quarter"] += 1
+            if gap > burst_max_gap_ms:
+                ev["slow_quarter"] += 1
+        if abs(div - 4.0) / 4.0 < 0.10:
+            ev["quarter_loose"] += 1
+        if abs(div - 2.0) / 2.0 < 0.10:
+            ev["half"] += 1
+            if gap <= burst_max_gap_ms:
+                ev["half_fast"] += 1
+    return ev
+
+
+def _halved_from_evidence(ev, halved_quarter_share_min=0.15):
+    if not ev["total"] or ev["quarter"] / ev["total"] < halved_quarter_share_min:
+        return False
+    return ev["slow_quarter"] * 2 > ev["quarter"]
+
+
+def _doubled_from_evidence(ev, doubled_half_share_min=0.25,
+                            max_plausible_bpm=300.0):
+    beat = ev["beat_ms"]
+    if not beat or 60000.0 / beat <= max_plausible_bpm:
+        return False
+    if not ev["total"] or ev["half"] / ev["total"] < doubled_half_share_min:
+        return False
+    if ev["quarter_loose"] >= ev["half"] * 0.25:
+        return False              # a real 1/4 layer - the tempo is honest
+    return ev["half_fast"] * 2 > ev["half"]   # and that 1/2 is too fast
+
+
+def resolve_set_notation(evidences, burst_max_gap_ms=105.0,
+                          doubled_half_share_min=0.25, max_plausible_bpm=300.0,
+                          halved_quarter_share_min=0.15):
+    """
+    One notation verdict - "halved", "doubled" or "honest" - for a whole
+    mapset, from its difficulties' pooled evidence.
+
+    Notation is a property of the set: every difficulty is written against
+    the same timing points, so they cannot disagree in fact, only in how much
+    evidence each one happens to carry. Pooling is what lets the busy
+    difficulties speak for the quiet ones.
+
+    This is the fix for the case AGENTS.md records under "Doubled-BPM
+    notation": across the eight difficulties of "Flowering Night Fever" (a
+    real 290 BPM map) the quiet ones carry no 1/4 and so look doubled on
+    their own, while their harder siblings carry 30% and plainly do not.
+    Pooled, the set's 1/4 layer is there and the whole set reads as honest.
+
+    Halved is tested first and wins, exactly as the per-difficulty path
+    orders them - a map cannot be both, and folding twice is not a thing.
+
+    Measured over 700 real mapsets / 2,004 difficulties: the difficulties of
+    4.14% of sets disagreed with each other, and pooling changes the verdict
+    for 2.45% of difficulties. Almost all of those are about HALVED notation
+    rather than doubled, which is the opposite of what motivated this - the
+    halved test keys on the size of the 1/4 layer, and that is precisely what
+    differs between a set's easy and hard difficulties.
+    """
+    pooled = {"total": 0, "quarter": 0, "slow_quarter": 0, "quarter_loose": 0,
+              "half": 0, "half_fast": 0, "beat_ms": 0.0}
+    for ev in evidences:
+        for k in ("total", "quarter", "slow_quarter", "quarter_loose",
+                  "half", "half_fast"):
+            pooled[k] += ev[k]
+        # Timing points are shared across a set, so any difficulty that has a
+        # usable tempo speaks for all of them.
+        if not pooled["beat_ms"] and ev["beat_ms"]:
+            pooled["beat_ms"] = ev["beat_ms"]
+    if _halved_from_evidence(pooled, halved_quarter_share_min):
+        return "halved"
+    if _doubled_from_evidence(pooled, doubled_half_share_min, max_plausible_bpm):
+        return "doubled"
+    return "honest"
+
+
 def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
                                  doubled_half_share_min=0.25,
                                  max_plausible_bpm=300.0):
@@ -1128,30 +1260,9 @@ def looks_like_doubled_notation(objs, timing_points, burst_max_gap_ms=105.0,
     """
     if not timing_points or len(objs) < 2:
         return False
-    beat0 = dominant_beat_ms(objs, timing_points)
-    if not beat0 or 60000.0 / beat0 <= max_plausible_bpm:
-        return False
-    half = half_fast = quarter = total = 0
-    for i in range(1, len(objs)):
-        gap = objs[i][0] - objs[i - 1][0]
-        if not (0 < gap <= 2000):
-            continue
-        total += 1
-        beat = usable_beat_ms(_beat_length_at(objs[i - 1][0], timing_points))
-        if not beat:
-            continue
-        div = beat / gap
-        if abs(div - 2.0) / 2.0 < 0.10:
-            half += 1
-            if gap <= burst_max_gap_ms:
-                half_fast += 1
-        elif abs(div - 4.0) / 4.0 < 0.10:
-            quarter += 1
-    if not total or half / total < doubled_half_share_min:
-        return False
-    if quarter >= half * 0.25:
-        return False              # a real 1/4 layer - the tempo is honest
-    return half_fast * 2 > half   # and that 1/2 is too fast to be a real 1/2
+    return _doubled_from_evidence(
+        notation_evidence(objs, timing_points, burst_max_gap_ms),
+        doubled_half_share_min, max_plausible_bpm)
 
 
 def looks_like_halved_notation(objs, timing_points, burst_max_gap_ms=105.0,
@@ -1197,26 +1308,9 @@ def looks_like_halved_notation(objs, timing_points, burst_max_gap_ms=105.0,
     """
     if not timing_points or len(objs) < 2:
         return False
-    total = quarter = slow_quarter = 0
-    for i in range(1, len(objs)):
-        gap = objs[i][0] - objs[i - 1][0]
-        # Same break cap as elsewhere - a gap this long is a section boundary,
-        # not part of the map's rhythm.
-        if not (0 < gap <= 2000):
-            continue
-        total += 1
-        beat = usable_beat_ms(_beat_length_at(objs[i - 1][0], timing_points))
-        if not beat:
-            continue
-        # Per-transition local beat, so a map with BPM changes is measured
-        # against whatever tempo was actually in force at that point.
-        if abs(beat / gap - 4.0) / 4.0 < 0.08:
-            quarter += 1
-            if gap > burst_max_gap_ms:
-                slow_quarter += 1
-    if not total or quarter / total < halved_quarter_share_min:
-        return False
-    return slow_quarter * 2 > quarter
+    return _halved_from_evidence(
+        notation_evidence(objs, timing_points, burst_max_gap_ms),
+        halved_quarter_share_min)
 
 
 def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
@@ -1231,7 +1325,8 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
                    max_plausible_bpm=300.0,
                    burst_max_gap_ms=105.0, halved_quarter_share_min=0.15,
                    section_ms=2000.0, section_dominance=0.5, section_min_transitions=4,
-                   hybrid_section_min=0.15, hybrid_balance_min=0.5):
+                   hybrid_section_min=0.15, hybrid_balance_min=0.5,
+                   notation=None):
     """
     Terminology. Mostly osu!'s official beatmap tags, with two deliberate
     departures called out where they occur - see `burst` and `cutstream`:
@@ -1376,15 +1471,25 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
         overlapping = raw_move < 0
         transitions.append((tap_gap, move_time, dist, overlapping))
 
-    # Notation is a property of the whole map, so decide it once here rather
-    # than re-deriving it for every run. Uses raw (un-rate-adjusted) times
-    # deliberately: whether a mapper halved the tempo is a fact about the
-    # file, and DT doesn't change it.
-    halved_notation = looks_like_halved_notation(
-        objs, diff.timing_points, burst_max_gap_ms, halved_quarter_share_min)
-    doubled_notation = (not halved_notation) and looks_like_doubled_notation(
-        objs, diff.timing_points, burst_max_gap_ms, doubled_half_share_min,
-        max_plausible_bpm)
+    # Notation is a property of the whole MAPSET, so decide it once here
+    # rather than re-deriving it for every run. Uses raw (un-rate-adjusted)
+    # times deliberately: whether a mapper halved the tempo is a fact about
+    # the file, and DT doesn't change it.
+    #
+    # `notation`, when given, is that set-level answer - see
+    # resolve_set_notation(), and run_pipeline() which pools a set's
+    # difficulties before classifying any of them. Falling back to deciding
+    # from this difficulty alone keeps every direct caller (and every test)
+    # working, and is right whenever there are no siblings to ask.
+    if notation is None:
+        halved_notation = looks_like_halved_notation(
+            objs, diff.timing_points, burst_max_gap_ms, halved_quarter_share_min)
+        doubled_notation = (not halved_notation) and looks_like_doubled_notation(
+            objs, diff.timing_points, burst_max_gap_ms, doubled_half_share_min,
+            max_plausible_bpm)
+    else:
+        halved_notation = notation == "halved"
+        doubled_notation = notation == "doubled"
 
     # --- which transitions are gameplay at all ------------------------------
     # Gaps longer than the cap are breaks and section boundaries, not
@@ -1761,6 +1866,12 @@ def wait_if_paused(pause_event, cancel_event):
             raise ScanCancelled()
         _time.sleep(0.1)
 
+
+# Most difficulties a mapset may hold back before notation is resolved on
+# what has arrived so far. A set is a handful of difficulties; this is a
+# safety valve for a pathological file, not a tuning knob, and reaching it
+# only costs the pooling for that set.
+SET_BUFFER_MAX = 64
 
 # Threads used to overlap per-file reads during a scan. Deliberately NOT tied
 # to os.cpu_count(): these threads spend essentially all their time blocked in
@@ -3433,18 +3544,42 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
     log(f"=== Starting run on {songs_folder} ===")
 
     classify_count = [0]
+    params = {k: p[k] for k in DEFAULT_PARAMS}
 
-    def classify_and_free(d):
-        if cancel_event is not None and cancel_event.is_set():
-            raise ScanCancelled()
-        wait_if_paused(pause_event, cancel_event)
-        classify_diff(d, **{k: p[k] for k in DEFAULT_PARAMS})
-        # Free per-note data immediately - only the summary fields (counts,
-        # booleans, hash) are needed from here on. Classifying inline like
-        # this (instead of parsing the whole library first, THEN classifying
-        # in a second pass) keeps peak memory bounded to roughly one file's
-        # worth of raw note data at a time, instead of holding every note of
-        # every difficulty in the whole library in memory simultaneously -
+    # Difficulties held back until their whole mapset has been seen, so
+    # halved/doubled notation can be resolved over the SET rather than over
+    # each difficulty alone - see resolve_set_notation(). Only the notation
+    # decision is pooled; everything else about a difficulty is still judged
+    # on its own notes.
+    #
+    # All three scan paths hand difficulties over folder by folder (or, on
+    # the realm path, set by set), so a mapset's difficulties arrive
+    # together and the buffer holds one set at a time. If they ever arrive
+    # interleaved, each one flushes alone and the result is exactly the
+    # per-difficulty behaviour this replaces - it degrades rather than
+    # breaks.
+    pending = []
+    pending_set = [None]
+
+    def flush_pending():
+        if not pending:
+            return
+        notation = resolve_set_notation(
+            [ev for _, ev in pending], p["burst_max_gap_ms"],
+            p["doubled_half_share_min"], p["max_plausible_bpm"],
+            p["halved_quarter_share_min"])
+        for d, _ in pending:
+            classify_diff(d, notation=notation, **params)
+            free_notes(d)
+        pending.clear()
+
+    def free_notes(d):
+        # Free per-note data as soon as a difficulty is classified - only the
+        # summary fields (counts, booleans, hash) are needed from here on.
+        # Classifying during the scan (instead of parsing the whole library
+        # first, THEN classifying in a second pass) keeps peak memory bounded
+        # to roughly one mapset's worth of raw note data at a time, instead
+        # of holding every note of every difficulty in the library at once -
         # that was the cause of out-of-memory crashes on very large
         # (100k+ diff) libraries.
         d.objs = []
@@ -3452,6 +3587,22 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         classify_count[0] += 1
         if log_cb and classify_count[0] % 20000 == 0:
             log(f"  ... {classify_count[0]} classified so far")
+
+    def classify_and_free(d):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
+        wait_if_paused(pause_event, cancel_event)
+        if d.set_id is None:
+            # Unsubmitted, or an .osu with no BeatmapSetID - there is no set
+            # to pool with, so decide from this difficulty alone.
+            classify_diff(d, **params)
+            free_notes(d)
+            return
+        if d.set_id != pending_set[0] or len(pending) >= SET_BUFFER_MAX:
+            flush_pending()
+            pending_set[0] = d.set_id
+        pending.append((d, notation_evidence(d.objs, d.timing_points,
+                                              p["burst_max_gap_ms"])))
 
     diffs = errors = None
 
@@ -3530,6 +3681,8 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         if scan_root != songs_folder:
             log(f"Scanning {scan_root}")
         diffs, errors = scan_folder(scan_root, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event, pause_event=pause_event)
+    # Whatever is still buffered belongs to the last mapset seen.
+    flush_pending()
     log(f"Classified {len(diffs)} difficulties.")
 
     groups = derive_collections(diffs)

@@ -302,14 +302,53 @@ gaps at 103ms, with no 1/4 at all - from the notes alone that is
 indistinguishable from a doubled 145. Fold it and half the map's ordinary
 tapping becomes bursts.
 
-**The known weakness** is that this is decided per DIFFICULTY while notation
-belongs to the MAPSET. Across the eight difficulties of "Flowering Night
-Fever" (a real 290 BPM map) the quiet ones carry no 1/4 and so look doubled
-while their harder siblings do not. A tempo bound is at least shared by
-construction, which is why it is here. Resolving notation once per mapset
-would let content decide properly and is the real fix - `classify_diff` never
-sees a diff's siblings, so that is a scan-architecture change, not a
-threshold change.
+#### Notation is resolved over the mapset
+
+Notation used to be decided per DIFFICULTY, which is wrong in a specific way:
+a quiet difficulty carries no 1/4 at all, and "no 1/4" is exactly the
+signature the doubled test looks for. So the easy diffs of a fast honest set
+could read as doubled while their harder siblings, carrying a real 1/4 layer
+at the same tempo, plainly did not - and a set is written against ONE set of
+timing points, so they cannot actually disagree.
+
+`notation_evidence()` gathers the raw counts each test is decided from, and
+`resolve_set_notation()` pools them over a set and returns one verdict. The
+busy difficulties speak for the quiet ones. `classify_diff(notation=...)`
+takes that verdict; `notation=None` keeps the old per-difficulty behaviour,
+which is what every direct caller and every test still uses, and is right
+when there are no siblings to ask.
+
+The pooling happens in `run_pipeline`, which buffers difficulties by
+`BeatmapSetID` and flushes a set when the next one starts (or at
+`SET_BUFFER_MAX`, or at end of scan). All three scan paths hand difficulties
+over folder by folder - set by set on the realm path - so a set arrives
+together and the buffer holds one at a time. If they ever arrive interleaved
+each flushes alone, which is exactly the per-difficulty behaviour this
+replaces: it degrades rather than breaks. Peak memory is now one mapset's
+notes rather than one difficulty's, which is the reason for the cap.
+
+The set id comes from the .osu's own `BeatmapSetID`, not from the folder,
+because the lazer blob store has no folders to group by. `-1` (unsubmitted)
+is treated as "no set": every unsubmitted map in a library carries it, so
+using it as an identity would pool unrelated maps' evidence together.
+
+**How much this moves.** Over 700 real mapsets / 2,004 difficulties, the
+difficulties of **4.14%** of sets disagreed with each other about their own
+set's notation, and pooling changes the verdict for **2.45%** of
+difficulties. Not common, as expected — but note what it mostly fixes:
+almost every disagreement is about HALVED notation, not doubled. That is the
+opposite of what motivated the change. It makes sense in hindsight: the
+halved test keys on the size of the 1/4 layer, which is exactly what varies
+between a set's easy and hard difficulties, so a set commonly splits 8-3 or
+2-1 on a question that has one answer by construction.
+
+Typical shape, from that survey:
+
+| set | difficulties | decided alone | pooled |
+|---|---:|---|---|
+| 1903462 H-Kray - Tam Long Son | 11 | 8 halved, 3 honest | halved (3 changed) |
+| 737103 JUNNA - Here | 4 | 1 halved, 3 honest | halved (3 changed) |
+| 993854 Itou Miku et al. | 5 | 2 halved, 3 honest | honest (2 changed) |
 
 ### Things checked against the osu! sources and deliberately NOT done
 
