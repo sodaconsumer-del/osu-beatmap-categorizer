@@ -1103,14 +1103,19 @@ def notation_evidence(objs, timing_points, burst_max_gap_ms=105.0):
         beat = usable_beat_ms(_beat_length_at(objs[i - 1][0], timing_points))
         if not beat:
             continue
+        # Bounds rather than abs()/tolerance arithmetic, and one range test
+        # for the great majority of gaps that sit near neither divisor: this
+        # runs once per gap of every difficulty in a library. The numbers are
+        # the same - 0.10 of 4 is 3.6..4.4, 0.08 of 4 is 3.68..4.32, 0.10 of
+        # 2 is 1.8..2.2 - and the two divisor windows do not overlap.
         div = beat / gap
-        if abs(div - 4.0) / 4.0 < 0.08:
-            ev["quarter"] += 1
-            if gap > burst_max_gap_ms:
-                ev["slow_quarter"] += 1
-        if abs(div - 4.0) / 4.0 < 0.10:
+        if 3.6 < div < 4.4:
             ev["quarter_loose"] += 1
-        if abs(div - 2.0) / 2.0 < 0.10:
+            if 3.68 < div < 4.32:
+                ev["quarter"] += 1
+                if gap > burst_max_gap_ms:
+                    ev["slow_quarter"] += 1
+        elif 1.8 < div < 2.2:
             ev["half"] += 1
             if gap <= burst_max_gap_ms:
                 ev["half_fast"] += 1
@@ -1482,11 +1487,13 @@ def classify_diff(diff: DiffInfo, max_gap_ms=140.0, gap_consistency_tol=0.18,
     # from this difficulty alone keeps every direct caller (and every test)
     # working, and is right whenever there are no siblings to ask.
     if notation is None:
-        halved_notation = looks_like_halved_notation(
-            objs, diff.timing_points, burst_max_gap_ms, halved_quarter_share_min)
-        doubled_notation = (not halved_notation) and looks_like_doubled_notation(
-            objs, diff.timing_points, burst_max_gap_ms, doubled_half_share_min,
-            max_plausible_bpm)
+        # One pass over the notes, both questions asked of it. Calling the
+        # two public detectors here instead would walk every gap twice, and
+        # each walk now gathers both tests' counters anyway.
+        ev = notation_evidence(objs, diff.timing_points, burst_max_gap_ms)
+        halved_notation = _halved_from_evidence(ev, halved_quarter_share_min)
+        doubled_notation = (not halved_notation) and _doubled_from_evidence(
+            ev, doubled_half_share_min, max_plausible_bpm)
     else:
         halved_notation = notation == "halved"
         doubled_notation = notation == "doubled"

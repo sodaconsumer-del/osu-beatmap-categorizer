@@ -264,8 +264,8 @@ file. `_section()` does it with `str.find` and a slice: 0.507s to 0.016s over
 the same 400 difficulties, ~11% of parse, agreeing line for line (only
 trailing whitespace differs).
 
-Together these land at **113 diffs/sec against 199 for the pre-port code** -
-1.76x rather than 3.3x. What is left is inherent: real curve arithmetic the
+Together these land at **109 diffs/sec against 198 for the pre-port code** -
+1.8x rather than 3.3x. What is left is inherent: real curve arithmetic the
 old code simply did not do. Verified
 against the pre-port implementation over 115,968 sliders — 46,847 endpoints
 move, none by more than 0.059 diameters, against the 0.251-diameter *mean*
