@@ -995,8 +995,74 @@ def test_split_puts_loved_on_the_unranked_side():
             self.ranked_status = status
     groups = {"Streams": [FakeDiff("ranked"), FakeDiff("loved")]}
     out = cm.build_output_collections(groups, ranked_mode="split")
-    assert [d.ranked_status for d in out["Streams - Ranked"]] == ["ranked"]
-    assert [d.ranked_status for d in out["Streams - Unranked"]] == ["loved"]
+    assert [d.ranked_status for d in out[" Streams-ranked"]] == ["ranked"]
+    assert [d.ranked_status for d in out["Streams-unranked"]] == ["loved"]
+
+
+def test_split_collections_sort_every_ranked_one_to_the_top():
+    # osu! lists collections alphabetically and a space sorts before every
+    # letter, so the leading space on the ranked half is what groups them all
+    # at the top. Without it each collection sits next to its own unranked
+    # twin and the list reads as pairs of near-identical names.
+    names = [cm.split_collection_name(c, r)
+             for c in cm.CATEGORIES + [cm.COMBINED_JUMPS_LABEL]
+             for r in (True, False)]
+    ordered = sorted(names)
+    half = len(ordered) // 2
+    assert all(n.startswith(" ") for n in ordered[:half]),         "the ranked half should sort above everything else"
+    assert not any(n.startswith(" ") for n in ordered[half:])
+    assert all(n.strip().endswith("-ranked") for n in ordered[:half])
+    assert all(n.endswith("-unranked") for n in ordered[half:])
+
+
+def test_split_collection_names_did_not_get_longer():
+    # A split name is the longest thing this tool writes into collection.db,
+    # and the game's name field has a limit. The shortening exists to buy
+    # room, so it must never cost any.
+    for category in cm.CATEGORIES + [cm.COMBINED_JUMPS_LABEL]:
+        for ranked, suffix in ((True, "Ranked"), (False, "Unranked")):
+            was = f"{category} - {suffix}"
+            now = cm.split_collection_name(category, ranked)
+            assert len(now) <= len(was),                 f"{now!r} ({len(now)}) is longer than {was!r} ({len(was)})"
+
+
+def test_both_split_paths_produce_the_same_names():
+    # build_output_collections works on DiffInfo objects and
+    # collection_from_csv on tuples read back from a report.csv. They cannot
+    # share the code that splits, so they can drift - and a rebuild that
+    # renames every collection is exactly the kind of drift nobody notices
+    # until the game shows two of everything.
+    import csv as _csv
+    import shutil
+    import tempfile
+
+    class FakeDiff:
+        def __init__(self, status):
+            self.ranked_status = status
+            self.version_hash = status
+    live = cm.build_output_collections(
+        {"Jumps (no bursts)": [FakeDiff("ranked"), FakeDiff("pending")]},
+        ranked_mode="split")
+
+    # The CSV path re-hashes the files it names, so they have to exist.
+    tmp = tempfile.mkdtemp()
+    maps = []
+    for name, status in (("a.osu", "ranked"), ("b.osu", "pending")):
+        full = os.path.join(tmp, name)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write("osu file format v14\n")
+        maps.append((full, status))
+    csv_path = os.path.join(tmp, "report.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["title", "diff_name", "category", "ranked_status",
+                    "star_rating", "path"])
+        for full, status in maps:
+            w.writerow(["t", "d", "Jumps (no bursts)", status, "5.0", full])
+    out_db = os.path.join(tmp, "collection.db")
+    result = cm.collection_from_csv(csv_path, out_db, ranked_mode="split")
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert set(result["groups"]) == set(live),         f"{sorted(result['groups'])} != {sorted(live)}"
 
 
 # --- one transition, one label ---------------------------------------------
@@ -1367,8 +1433,8 @@ def test_combined_jumps_is_split_by_ranked_status_like_any_other():
         "Jumps (no bursts)": [_JumpDiff("jn1", "ranked")],
     }
     out = cm.build_output_collections(groups, ranked_mode="split", combine_jumps=True)
-    assert [d.name for d in out["Jumps - Ranked"]] == ["jb1", "jn1"]
-    assert [d.name for d in out["Jumps - Unranked"]] == ["jb2"]
+    assert [d.name for d in out[" Jumps-ranked"]] == ["jb1", "jn1"]
+    assert [d.name for d in out["Jumps-unranked"]] == ["jb2"]
 
 
 def test_combined_jumps_is_absent_when_there_are_no_jump_maps():
@@ -1566,6 +1632,7 @@ def test_a_near_miss_is_told_apart_from_a_missed_detection():
 
 def test_the_report_csv_carries_tags_so_the_check_can_be_rerun():
     import csv as _csv
+    import shutil
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:

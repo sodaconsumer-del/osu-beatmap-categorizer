@@ -449,7 +449,11 @@ class ClassifierGUI(tk.Tk):
                   text="Ranked status comes from the game's own database - osu!.db on stable, "
                        "client.realm on lazer. Pointing at a bare folder of .osu/.osz files instead "
                        "(a BeatmapExporter export, or lazer's files/ folder on its own) has no "
-                       "database to read, so ranked status is unknown there.",
+                       "database to read, so ranked status is unknown there.\n"
+                       "Splitting names the halves \" Streams-ranked\" and \"Streams-unranked\". "
+                       "The leading space is deliberate: osu! sorts collections alphabetically, so "
+                       "it groups every ranked collection at the top of the list instead of "
+                       "separating each one from its siblings by its own unranked twin.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Star rating filter ---

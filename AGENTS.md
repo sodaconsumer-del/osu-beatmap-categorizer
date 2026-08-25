@@ -597,7 +597,7 @@ filtering and **before** ranked handling. That ordering is deliberate:
 unchecking a jump category means "I don't want these maps", so they must not
 reappear inside the combined collection by the back door; and running before
 the ranked step means `ranked_mode="split"` splits `Jumps` into
-`Jumps - Ranked`/`Jumps - Unranked` like every other collection, for free.
+` Jumps-ranked`/`Jumps-unranked` like every other collection, for free.
 
 The `--from-csv` rebuild carries its own copy of this (it works on
 `(md5, status, stars)` tuples read back from the CSV rather than `DiffInfo`

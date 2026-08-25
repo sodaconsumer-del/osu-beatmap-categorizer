@@ -2721,6 +2721,41 @@ CATEGORIES = ["Streams", "Hybrid", "Bursts", "Jumps with bursts", "Jumps (no bur
 JUMP_CATEGORIES = ("Jumps with bursts", "Jumps (no bursts)")
 COMBINED_JUMPS_LABEL = "Jumps"
 
+# Collection names for ranked_mode="split", which are their own naming
+# problem and not just a category name with a suffix bolted on.
+#
+# The LEADING SPACE on the ranked half is deliberate and load-bearing. osu!
+# lists collections alphabetically, and a space sorts before every letter, so
+# every ranked collection groups at the top of the list instead of each one
+# being separated from its siblings by its own unranked twin. Reported from
+# in-game use: without it the list reads as pairs of near-identical names and
+# is hard to scan.
+#
+# The names are also shortened - hyphens instead of " (no bursts) - ", lower
+# case suffix - because a split name is the longest thing this tool writes
+# and the game's own name field has a limit. "Jumps (no bursts) - Unranked"
+# was 28 characters; "Jumps-no-bursts-unranked" is 24.
+SPLIT_LABEL_SHORT = {
+    "Streams": "Streams",
+    "Hybrid": "Hybrid",
+    "Bursts": "Bursts",
+    "Jumps with bursts": "Jumps-with-bursts",
+    "Jumps (no bursts)": "Jumps-no-bursts",
+    "Misc": "Misc",
+    COMBINED_JUMPS_LABEL: "Jumps",
+}
+
+
+def split_collection_name(label, ranked):
+    """
+    What one half of a split category is called in the collection list.
+
+    Falls back to the label itself for anything not in SPLIT_LABEL_SHORT, so
+    an unrecognised category still gets a usable name rather than a KeyError.
+    """
+    short = SPLIT_LABEL_SHORT.get(label, label)
+    return f" {short}-ranked" if ranked else f"{short}-unranked"
+
 # Which osu! online statuses count as "ranked" for filtering and splitting.
 #
 # Ranked and Approved are the two that award pp. Loved and Qualified do NOT:
@@ -2994,8 +3029,9 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
       - "all_together" : ignore ranked status entirely (default)
       - "ranked_only"  : drop any diff that isn't ranked/approved/qualified/loved
       - "unranked_only": drop any diff that IS ranked/approved/qualified/loved
-      - "split"         : each category becomes two, e.g. "Streams - Ranked" /
-                          "Streams - Unranked"
+      - "split"         : each category becomes two, e.g. " Streams-ranked" /
+                          "Streams-unranked" - see split_collection_name()
+                          for the leading space and the shortening
 
     combine_jumps adds an EXTRA "Jumps" collection holding every diff from
     both jump categories, without removing either of them - so a jumps+bursts
@@ -3046,10 +3082,13 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
     if combine_jumps:
         combined = [d for label in JUMP_CATEGORIES for d in groups.get(label, [])]
         if combined:
-            # Rebuilt in order rather than appended so the combined collection
-            # sits with the jump categories it summarises instead of after
-            # Misc - collection.db preserves insertion order and osu! shows
-            # them in that order.
+            # Rebuilt in order rather than appended so the combined
+            # collection sits with the jump categories it summarises rather
+            # than after Misc. This only affects the order inside
+            # collection.db; osu! itself lists collections alphabetically
+            # (which is what the leading space in split_collection_name()
+            # exploits), so treat this as tidiness in the file rather than
+            # something the player will see.
             rebuilt = {}
             for label, members in groups.items():
                 rebuilt[label] = members
@@ -3077,9 +3116,9 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
             ranked = [d for d in members if is_ranked(d.ranked_status)]
             unranked = [d for d in members if not is_ranked(d.ranked_status)]
             if ranked:
-                result[f"{label} - Ranked"] = ranked
+                result[split_collection_name(label, True)] = ranked
             if unranked:
-                result[f"{label} - Unranked"] = unranked
+                result[split_collection_name(label, False)] = unranked
         return result
     return groups
 
@@ -3261,7 +3300,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
       - "all_together" (default): ranked status ignored, one collection per category
       - "ranked_only": only ranked/approved/loved/qualified diffs are included
       - "unranked_only": only pending/WIP/graveyard diffs are included
-      - "split": two collections per category, e.g. "Streams - Ranked" / "Streams - Unranked"
+      - "split": two collections per category, e.g. " Streams-ranked" / "Streams-unranked"
     Returns a dict: {diffs, errors, groups, counts}
     """
     p = dict(DEFAULT_PARAMS)
@@ -3610,9 +3649,9 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
                 ranked = [h for h, s, _ in entries if is_ranked(s)]
                 unranked = [h for h, s, _ in entries if not is_ranked(s)]
                 if ranked:
-                    split_groups[f"{label} - Ranked"] = ranked
+                    split_groups[split_collection_name(label, True)] = ranked
                 if unranked:
-                    split_groups[f"{label} - Unranked"] = unranked
+                    split_groups[split_collection_name(label, False)] = unranked
             groups = split_groups
 
     if ranked_mode != "split":
@@ -3738,7 +3777,9 @@ def main():
                      default="all_together",
                      help="How ranked status factors into collections - only meaningful when ranked "
                           "status is available (currently only the osu!lazer realm fast path provides it). "
-                          "'split' makes separate 'X - Ranked' / 'X - Unranked' collections per category.")
+                          "'split' makes separate ' X-ranked' / 'X-unranked' collections per category. "
+                          "The ranked name starts with a space on purpose - osu! sorts collections "
+                          "alphabetically, so that groups every ranked collection at the top.")
     ap.add_argument("--min-star", type=float, default=None,
                      help="Only include diffs with star rating >= this value (decimals OK, e.g. 4.5). "
                           "Only meaningful when star rating is available (osu!lazer realm fast path only).")
