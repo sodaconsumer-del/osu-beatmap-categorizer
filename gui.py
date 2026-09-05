@@ -368,14 +368,11 @@ class ClassifierGUI(tk.Tk):
 
         hint = ttk.Label(
             frame_in,
-            text="stable: your osu! install folder (the one with osu!.db and Songs/ in it, not "
-                 "Songs/ itself) - reads osu!.db directly for a fast scan, or falls back to walking "
-                 "Songs/ if it can't.\n"
-                 "lazer: point at your osu! data folder (e.g. %appdata%\\osu on Windows, containing "
-                 "client.realm and files/) - uses a fast direct-read path if available, or falls back to "
-                 "scanning files/ directly otherwise. No export needed either way.\n"
-                 "You can also point it at a BeatmapExporter export folder if you'd rather work from that; "
-                 ".osz files are read directly either way.",
+            text="stable: your osu! install folder - the one with osu!.db and Songs/ in it, "
+                 "not Songs/ itself.\n"
+                 "lazer: your osu! data folder (%appdata%\\osu on Windows), the one with "
+                 "client.realm in it.\n"
+                 "A BeatmapExporter export folder works too. No export needed for either game.",
             style="Muted.TLabel", justify="left", wraplength=680,
         )
         hint.pack(fill="x", padx=10, pady=(0, 8))
@@ -398,7 +395,7 @@ class ClassifierGUI(tk.Tk):
         self.write_db_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="Write collection.db", variable=self.write_db_var).pack(side="left", padx=(0, 20))
         self.write_csv_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="Write CSV report (recommended - audit before trusting the collection.db)",
+        ttk.Checkbutton(row1, text="Write CSV report (recommended)",
                          variable=self.write_csv_var).pack(side="left")
 
         # --- Category selection ---
@@ -424,10 +421,8 @@ class ClassifierGUI(tk.Tk):
         ttk.Checkbutton(row_cj, text='Also add one combined "Jumps" collection',
                          variable=self.combine_jumps_var).pack(side="left")
         ttk.Label(frame_cat,
-                  text='Writes an extra "Jumps" collection holding every jump map, on top of the two '
-                       "above rather than instead of them - so a map with jumps and bursts shows up in "
-                       '"Jumps with bursts" AND in "Jumps". Nothing is reclassified and report.csv still '
-                       "records the specific category; this only changes how the collections are grouped.",
+                  text='An extra "Jumps" collection holding every jump map, as well as the two '
+                       "above rather than instead of them.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Ranked status handling ---
@@ -446,14 +441,11 @@ class ClassifierGUI(tk.Tk):
             ttk.Radiobutton(row_ranked, text=label, variable=self.ranked_mode_var, value=value).pack(
                 side="left", padx=(0, 14))
         ttk.Label(frame_ranked,
-                  text="Ranked status comes from the game's own database - osu!.db on stable, "
-                       "client.realm on lazer. Pointing at a bare folder of .osu/.osz files instead "
-                       "(a BeatmapExporter export, or lazer's files/ folder on its own) has no "
-                       "database to read, so ranked status is unknown there.\n"
+                  text="Needs the game's own database, so a bare folder of .osu/.osz files "
+                       "has no ranked status to read.\n"
                        "Splitting names the halves \" Streams-ranked\" and \"Streams-unranked\". "
-                       "The leading space is deliberate: osu! sorts collections alphabetically, so "
-                       "it groups every ranked collection at the top of the list instead of "
-                       "separating each one from its siblings by its own unranked twin.",
+                       "The leading space is deliberate - it keeps every ranked collection "
+                       "together at the top of osu!'s alphabetical list.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Star rating filter ---
@@ -468,9 +460,8 @@ class ClassifierGUI(tk.Tk):
         self.max_star_var = tk.StringVar(value="")
         ttk.Entry(row_star, textvariable=self.max_star_var, width=8).pack(side="left", padx=(4, 4))
         ttk.Label(frame_star,
-                  text="Leave blank for no limit. Decimals OK (e.g. Max Star: 6.5). Star ratings come from "
-                       "the same database as ranked status, so a filter here matches nothing when "
-                       "scanning a bare folder of files.",
+                  text="Leave blank for no limit. Decimals OK (e.g. Max Star: 6.5). Needs the same "
+                       "database as ranked status.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- Detection sensitivity + advanced thresholds ---
@@ -498,9 +489,8 @@ class ClassifierGUI(tk.Tk):
         self.custom_sens_label.pack(anchor="w", padx=10, pady=(2, 0))
 
         ttk.Label(frame_adv,
-                  text="Balanced is the measured default. Stricter and Looser are deliberate trades "
-                       "for wanting fewer or more maps flagged - they are not better guesses, and "
-                       "they only move five of the settings below.",
+                  text="Stricter and Looser flag fewer or more maps. They move five of the "
+                       "settings below.",
                   style="Muted.TLabel", wraplength=680, justify="left").pack(
             anchor="w", padx=10, pady=(2, 6))
 
@@ -529,23 +519,14 @@ class ClassifierGUI(tk.Tk):
                  "as a fraction of one beat per note. 0.4 accepts 1/4 and 1/3 snap and rejects 1/2, "
                  "which is what stops a fast map's ordinary tapping from reading as bursts."),
                 ("burst_max_gap_ms", "Slowest tapping that can still be a burst",
-                 "milliseconds per note. 105 is about a 143 BPM stream. A slow song's honest 1/4 "
-                 "(120ms at 125 BPM) is a real 1/4 and still not a burst - it isn't fast enough. "
-                 "Streams are not affected by this."),
+                 "milliseconds per note. 105 is about a 143 BPM stream. Streams are not affected."),
                 ("max_plausible_bpm", "Above this BPM, read the tempo as doubled",
-                 "300. Some songs are written at double their real tempo (360 for a 180 BPM song), "
-                 "which makes real 1/4 bursts look like ordinary 1/2 tapping. Taken from the timing "
-                 "points rather than the notes so every difficulty in a mapset agrees."),
+                 "300. Some songs are written at double their real tempo - 360 for a 180 BPM song."),
                 ("doubled_half_share_min", "When 1/2 is this much of a map, read it as doubled",
-                 "0.25 = 25% of note gaps. The mirror of the halved check: some songs are written at "
-                 "double their real tempo (360 for a 180 BPM song), which makes genuine 1/4 bursts "
-                 "look like ordinary 1/2 tapping. The giveaway is that the notated 1/4 is missing "
-                 "entirely - it would be a real 1/8."),
+                 "0.25 = 25% of note gaps, alongside the BPM check above."),
                 ("halved_quarter_share_min", "When 1/4 is this much of a map, read it as halved",
-                 "0.15 = 15% of note gaps. Some songs are written at half their real tempo (130 for a "
-                 "260 BPM song), which makes ordinary 1/2 tapping look like 1/4. The notes give it "
-                 "away: a real map uses 1/4 for bursts only, so a 1/4 layer this large - and too slow "
-                 "to be a burst - is really the 1/2 backbone."),
+                 "0.15 = 15% of note gaps. Some songs are written at half their real tempo - "
+                 "130 for a 260 BPM song."),
             ]),
             ("Run length - burst vs stream", [
                 ("burst_min", "Shortest run that counts as a burst",
@@ -562,37 +543,31 @@ class ClassifierGUI(tk.Tk):
                 ("run_wide_fraction_max", "How much of a run may be jump-spaced",
                  "0.4 = up to 40% of its notes, before the whole run is called a jump pattern."),
                 ("mean_diam_ratio_max", "Average spacing limit across a whole run",
-                 "hit-circle diameters. Catches jump patterns that dodge the check above by chance."),
+                 "hit-circle diameters."),
                 ("jump_velocity_ratio", "How fast the cursor must travel to count as a jump",
                  "hit-circle diameters per 100ms, required on top of the spacing test above."),
             ]),
             ("How much of a map a pattern must cover to own it", [
                 ("jump_pct_threshold", "Share of a map that must be jumps",
                  "% of note-to-note transitions."),
-                ("stream_pct_threshold", "Share of a map that must be streams",
-                 "% of notes. Stops one short run in a long jump map from claiming the whole map."),
+                ("stream_pct_threshold", "Share of a map that must be streams", "% of notes."),
                 ("jump_min_transitions", "Fewest notes before the jump share means anything",
                  'a 30-note map being "20% jumps" is noise, not a finding.'),
                 ("jump_gap_cap_ms", "Gap that counts as a break rather than gameplay",
-                 "milliseconds. Breaks are left out of the percentages entirely."),
+                 "milliseconds. Breaks are left out of the percentages."),
             ]),
             ("Sections - where in the map a pattern lives", [
                 ("section_ms", "Length of one section",
-                 "milliseconds. About two bars at 200 BPM. Sections are how the Hybrid category "
-                 "tells 'jumps then streams' apart from 'both mixed evenly throughout' - coverage "
-                 "alone averages those to the same numbers."),
+                 "milliseconds. About two bars at 200 BPM."),
                 ("section_dominance", "How much of a section a pattern must hold to own it",
                  "0.5 = half its notes. A section is owned by at most one pattern."),
                 ("hybrid_section_min", "Sections each side needs for \"Hybrid\"",
                  "0.15 = streams must own 15% of the map's sections and jumps another 15%, before "
                  "the map is called a mix of the two rather than one or the other."),
                 ("hybrid_balance_min", "How balanced that mix must be",
-                 "0.5 = the smaller side must own at least half as many sections as the larger. "
-                 "Without it, a map with 61% jump sections and 19% stream sections counts as a "
-                 "\"mix\" when it is plainly a jump map with a stream section in it."),
+                 "0.5 = the smaller side must own at least half as many sections as the larger."),
                 ("section_min_transitions", "Fewest notes for a section to count at all",
-                 "stops a map's sparse tail, or a couple of notes either side of a break, "
-                 "registering as full sections and skewing the proportions."),
+                 "notes. Keeps a map's sparse tail from registering as a full section."),
             ]),
             ("Cut streams - a stream with a skipped beat", [
                 ("cut_max_multiple", "Biggest skipped-beat gap still inside one stream",

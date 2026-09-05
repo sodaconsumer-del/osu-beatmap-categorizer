@@ -2174,8 +2174,7 @@ def scan_folder(root, progress_cb=None, log_cb=None, on_parsed=None, cancel_even
             log(f"  ... {done - len(osu_paths)}/{len(osz_paths)} .osz archives read")
 
     if peek_candidates:
-        log(f"Scanning {len(peek_candidates)} extensionless files for beatmap data "
-            f"(this is where a lazer files/ folder spends most of its time)...")
+        log(f"Scanning {len(peek_candidates)} extensionless files for beatmap data...")
     t_peek_start = time.time()
     matched = 0
 
@@ -2548,8 +2547,7 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
             log_cb(msg)
 
     t0 = time.time()
-    log(f"Found osu!.db - reading the beatmap list from it instead of walking {songs_dir} "
-        f"(much faster, and skips non-osu!standard difficulties without opening them).")
+    log("Found osu!.db - reading the beatmap list from it.")
     try:
         # Read every mode, then filter. The folder names of the non-standard
         # entries are still wanted: a folder holding only mania difficulties
@@ -2658,17 +2656,14 @@ def scan_stable_db(db_path, songs_dir, progress_cb=None, log_cb=None, on_parsed=
             log(f"Couldn't check {songs_dir} for maps osu!.db hasn't indexed ({e}) - "
                 f"skipping that step.")
         if extra:
-            log(f"Recovered {extra} difficulties from {songs_dir} that osu!.db has "
-                f"never indexed - most likely added since osu! last ran (an "
-                f"external downloader, say). They have no ranked status or star "
-                f"rating, because that is what the db would have carried.")
+            log(f"Recovered {extra} difficulties osu!.db hasn't indexed. "
+                f"These have no ranked status or star rating.")
 
         if progress_cb:
             progress_cb(len(entries), len(entries))
         log(f"Stable scan complete in {time.time() - t0:.1f}s. {len(results)} difficulties classified.")
         if missing:
-            log(f"{missing} files listed in osu!.db are no longer on disk (deleted outside osu!, "
-                f"or the db is stale because osu! hasn't been closed since).")
+            log(f"{missing} files listed in osu!.db are no longer on disk.")
         if errors:
             log(f"{len(errors)} files failed to parse.")
     finally:
@@ -2702,8 +2697,7 @@ def _scan_unindexed_folders(songs_dir, indexed_folders, results, errors, log,
                  and os.path.isdir(os.path.join(songs_dir, n))]
     if not unindexed:
         return 0
-    log(f"{len(unindexed)} folders in {songs_dir} are not in osu!.db - checking "
-        f"them for difficulties the db pass could not have seen.")
+    log(f"Checking {len(unindexed)} folders that aren't in osu!.db.")
 
     paths = []
     for name in unindexed:
@@ -2811,11 +2805,10 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
 
     helper = helper_path or default_realm_reader_path()
     if not helper:
-        log("realm-reader helper not found - falling back to filesystem scan of files/ "
-            "(this works fine, just slower on large libraries).")
+        log("realm-reader helper not found - scanning files/ instead (slower).")
         return None
 
-    log(f"Found client.realm - trying fast path via realm-reader ({helper})...")
+    log(f"Found client.realm - running realm-reader ({helper})...")
     with tempfile.NamedTemporaryFile(mode="r", suffix=".txt", delete=False, encoding="utf-8") as tmp:
         out_path = tmp.name
 
@@ -2832,10 +2825,8 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
         proc = subprocess.run([helper, realm_path, out_path], capture_output=True, text=True,
                                timeout=REALM_READER_TIMEOUT)
     except subprocess.TimeoutExpired:
-        log(f"realm-reader didn't finish within {REALM_READER_TIMEOUT}s - falling back to filesystem scan. "
-            "This is often antivirus scanning a freshly-built/downloaded exe on first run rather than a "
-            "real hang; if it keeps happening, try adding an exclusion for the app's folder, or just let "
-            "the fallback scan run (it works, just slower).")
+        log(f"realm-reader didn't finish within {REALM_READER_TIMEOUT}s - scanning files/ instead. "
+            "If it keeps happening, try an antivirus exclusion for the app's folder.")
         return None
     except Exception as e:
         log(f"realm-reader failed to run ({e}) - falling back to filesystem scan.")
@@ -2891,7 +2882,7 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
         log("realm-reader found no beatmap paths - falling back to filesystem scan.")
         return None
 
-    log(f"realm-reader resolved {len(entries)} .osu files directly - parsing them now (no filesystem walk needed).")
+    log(f"realm-reader resolved {len(entries)} .osu files - parsing them now.")
 
     def emit(diff):
         if on_parsed:
@@ -3427,8 +3418,7 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
     if min_star is not None or max_star is not None:
         any_known = any(d.star_rating is not None for members in groups.values() for d in members)
         if not any_known:
-            log("Note: star rating isn't available for this scan (only the osu!lazer realm fast path "
-                "provides it) - nothing will match this star rating filter.")
+            log("Note: this scan has no star ratings, so the star filter matches nothing.")
 
         def in_range(d):
             if d.star_rating is None:
@@ -3465,8 +3455,7 @@ def build_output_collections(groups, include_categories=None, ranked_mode="all_t
 
     any_known = any(d.ranked_status is not None for members in groups.values() for d in members)
     if not any_known:
-        log("Note: ranked status isn't available for this scan (only the osu!lazer realm fast path "
-            "provides it) - all diffs are being treated as unranked for this filter/split.")
+        log("Note: this scan has no ranked status, so everything counts as unranked.")
 
     if ranked_mode == "ranked_only":
         return {label: [d for d in members if is_ranked(d.ranked_status)] for label, members in groups.items()}
@@ -3756,8 +3745,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
     candidates = [(songs_folder, None)]
     if is_files_subdir:
-        candidates.append((parent, f"Detected you're pointed at a files/ subfolder - looking for "
-                                    f"client.realm in the parent folder ({parent})."))
+        candidates.append((parent, f"That's a files/ subfolder - checking {parent} instead."))
     redirected = resolve_lazer_storage(songs_folder)
     if redirected != songs_folder:
         candidates.append((redirected, None))
@@ -3771,7 +3759,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
             if note:
                 log(note)
             if candidate != songs_folder:
-                log(f"Using lazer data folder {candidate} (found client.realm there).")
+                log(f"Using lazer data folder {candidate}.")
             realm_data_dir = candidate
             break
 
@@ -3780,8 +3768,7 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
         if fast_result is not None:
             diffs, errors = fast_result
     else:
-        log("No client.realm found (not pointed at a lazer data folder or files/ subfolder) - "
-            "skipping the realm fast path.")
+        log("No client.realm found - skipping the lazer fast path.")
 
     # osu!stable fast path. Same idea as the lazer realm path: take the file
     # list from the game's own database rather than walking the disk. On a
@@ -4006,8 +3993,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
     if min_star is not None or max_star is not None:
         any_known = any(sr is not None for entries in groups.values() for _, _, sr in entries)
         if not any_known:
-            log("Note: star rating isn't available in this CSV (only present when the original scan "
-                "used the osu!lazer realm fast path) - nothing will match this star rating filter.")
+            log("Note: this CSV has no star ratings, so the star filter matches nothing.")
 
         def in_range(entry):
             _, _, sr = entry
@@ -4040,8 +4026,7 @@ def collection_from_csv(csv_path, output_db, log_cb=None, include_categories=Non
     if ranked_mode != "all_together":
         any_known = any(status is not None for entries in groups.values() for _, status, _ in entries)
         if not any_known:
-            log("Note: ranked status isn't available in this CSV (only present when the original scan "
-                "used the osu!lazer realm fast path) - all diffs are being treated as unranked for this filter/split.")
+            log("Note: this CSV has no ranked status, so everything counts as unranked.")
 
         if ranked_mode == "ranked_only":
             groups = {label: [(h, s, sr) for h, s, sr in entries if is_ranked(s)] for label, entries in groups.items()}
@@ -4229,11 +4214,9 @@ def main():
     )
 
     if not args.no_db:
-        print("\nNote: each diff is classified by its DOMINANT pattern - a stream map with a jump")
-        print("section is still a stream map. Jumps vs. Bursts is decided by which one actually")
-        print("covers more of the map, not just whether a burst run exists at all.")
-        print("Back up your existing collection.db before replacing it, or merge with a tool")
-        print("like Piotrekol's CollectionManager rather than overwriting directly.")
+        print("\nEach diff is filed under its DOMINANT pattern, not every pattern it contains.")
+        print("Back up your collection.db before replacing it, or merge with a tool like")
+        print("Piotrekol's CollectionManager.")
 
 
 if __name__ == "__main__":

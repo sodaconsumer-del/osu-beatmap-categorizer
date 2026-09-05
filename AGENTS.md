@@ -1327,6 +1327,17 @@ the slow path.
 
 - Comments explain *why*, especially where a line looks wrong without
   history. Several of the gotchas above exist as comments at their site.
+- **User-facing text does NOT.** Log lines, GUI hints and the CLI epilogue
+  say what is happening and what the user can do about it - never why the
+  code is built the way it is. "Found osu!.db - reading the beatmap list
+  from it", not "...instead of walking Songs/ (much faster, and skips
+  non-osu!standard difficulties without opening them)". Nobody picking a
+  folder needs the scan-path rationale, and a wall of it makes the app look
+  more complicated than it is. Explain a setting only where the setting
+  itself is genuinely confusing - the threshold panel earns a line each, the
+  leading space in `" Streams-ranked"` earns one because it looks like a
+  bug. Everything else is one clause or nothing. The reasoning belongs in
+  this file and in the comments.
 - Commit messages: what changed, why, and the evidence. Measured numbers beat
   adjectives.
 - Don't commit build output. `.gitignore` covers `bin/`, `obj/`,
