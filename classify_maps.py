@@ -953,6 +953,14 @@ def is_junk_diff(diff):
 # Past this the file is describing something no song does, and the honest
 # answer is that its tempo is unknown rather than absurdly fast.
 MIN_PLAUSIBLE_BEAT_MS = 100.0
+# osu!'s own upper bound: TimingControlPoint clamps BeatLength to 6..60000ms
+# (osu.Game/Beatmaps/ControlPoints/TimingControlPoint.cs), so 60000 - one beat
+# per minute - is the slowest thing the game will hold. Real files go past it:
+# "Camellia - crystallized [Girl's C11H15NO2]" carries an uninherited point of
+# 6e+298 alongside the 1e-298 points used to hide sliders, and without a bound
+# that value passed every finiteness check, won the tempo vote by covering an
+# astronomical span, and reported the map at 1e-294 BPM.
+MAX_PLAUSIBLE_BEAT_MS = 60000.0
 
 
 def usable_beat_ms(beat_ms):
@@ -961,11 +969,18 @@ def usable_beat_ms(beat_ms):
 
     Callers skip any snap test rather than measure against a number that isn't
     a tempo. A subnormal or negative beatLength is the parse-level corruption
-    test_tiny_beat_length_does_not_produce_infinite_bpm covers; anything under
-    MIN_PLAUSIBLE_BEAT_MS is a "tempo" no song has, so the safe reading is
-    that the timing data is junk - not that every run in the map is too slow.
+    test_tiny_beat_length_does_not_produce_infinite_bpm covers; anything
+    outside MIN_PLAUSIBLE_BEAT_MS..MAX_PLAUSIBLE_BEAT_MS is a "tempo" no song
+    has, so the safe reading is that the timing data is junk - not that every
+    run in the map is too slow.
+
+    osu! clamps such a value into range rather than rejecting it. Dropping it
+    is the better answer here: osu! needs *a* number to scroll the editor
+    with, and this needs to know whether the file states a tempo at all.
     """
-    if not math.isfinite(beat_ms) or beat_ms < MIN_PLAUSIBLE_BEAT_MS:
+    if not math.isfinite(beat_ms):
+        return 0.0
+    if beat_ms < MIN_PLAUSIBLE_BEAT_MS or beat_ms > MAX_PLAUSIBLE_BEAT_MS:
         return 0.0
     return beat_ms
 
@@ -1033,6 +1048,89 @@ def section_pattern_counts(objs, eligible, label, section_ms=2000.0,
     return active, streams, bursts, jumps
 
 
+def beat_spans_ms(objs, timing_points):
+    """
+    How long the map spends under each beat length, as {beat_ms: duration_ms}.
+
+    This is a port of osu!'s own `GetMostCommonBeatLength`
+    (`osu.Game/Beatmaps/Beatmap.cs`), which is the routine that decides the
+    BPM the game itself displays for a map. Matching it matters because the
+    number is also what `report.csv` reports, and a tool that disagrees with
+    song select about a map's tempo is simply wrong about it.
+
+    Three details are the game's, not ours, and all three were originally
+    missing here:
+
+      - **Beat lengths are grouped to 1e-3 ms.** `.osu` files store a beat
+        length as a long decimal (322.58064516129), and a map re-timed in the
+        editor can carry the same tempo written a hair differently at
+        different points. Grouping the raw floats splits that tempo's vote
+        between two keys, so a shorter span can win. osu! rounds for exactly
+        this reason and says so.
+      - **A timing point after the last object covers no time.** Maps that
+        are timed for a whole song but only mapped part of it - and
+        compilation/marathon sets especially - carry points out in the
+        unmapped tail; counting those spans lets a tempo nothing is mapped at
+        speak for the map.
+      - **The first timing point's span starts at 0, not at its own offset.**
+        osu-stable forced this and lazer reproduces it deliberately, so a map
+        that opens with a long unmapped intro credits that intro to its first
+        point.
+
+    Measured over 5,422 real difficulties, the three together move the
+    reported tempo on 16 of them (0.30%) - some by a factor of two, e.g.
+    "Katja Krasavice - Doggy" read 224 BPM where osu! says 112. None of the
+    16 changed a halved/doubled notation verdict, so this is a fix to the
+    number we report rather than a change to classification.
+
+    `usable_beat_ms()` filtering happens FIRST, and is ours rather than
+    osu!'s: a subnormal or otherwise impossible beat length is dropped
+    outright instead of being allowed to win by covering time. osu! clamps
+    such a value into range (`TimingControlPoint` bounds `BeatLength` to
+    6..60000ms) and would hand back a tempo no song has.
+
+    The other departure is `lastTime`: osu! takes the maximum END time over
+    every object, this takes the last object's START time. See the comment at
+    the assignment - a computed slider end is not always a real time, and a
+    tempo vote one object can steer is worse than one that stops a slider
+    early.
+    """
+    if not timing_points:
+        return {}
+    points = []
+    for t, bl in timing_points:
+        beat = usable_beat_ms(bl)
+        if beat:
+            points.append((t, beat))
+    if not points:
+        return {}
+    # osu! ends the last span at the last object's END time; this uses its
+    # START time. The difference is one slider's duration, and it can only
+    # matter for a timing point that begins inside the final slider - but a
+    # computed slider end is not always a real time. The same map that
+    # motivated MAX_PLAUSIBLE_BEAT_MS has a final slider whose own timing
+    # point makes it 2e+298ms long, and letting that set the end of the
+    # timeline hands the last timing point an unbeatable span. One slider of
+    # fidelity is not worth a tempo vote a single object can steer.
+    last = objs[-1][0] if objs else points[-1][0]
+    spans = {}
+    for idx, (t, beat) in enumerate(points):
+        if t > last:
+            # Past the end of the map: covers no gameplay, so it gets no say.
+            span = 0.0
+        else:
+            start = 0.0 if idx == 0 else t
+            end = points[idx + 1][0] if idx + 1 < len(points) else last
+            span = max(end - start, 0.0)
+        # Recorded even at zero, not skipped. osu! does the same, and it is
+        # what a map whose timing all sits past its last object depends on:
+        # every span is zero there, and dropping them would leave the map
+        # with no tempo at all rather than with the one it names.
+        key = round(beat * 1000) / 1000
+        spans[key] = spans.get(key, 0.0) + span
+    return spans
+
+
 def dominant_beat_ms(objs, timing_points):
     """
     The beat length the map spends the most TIME under, or 0.0 if unknown.
@@ -1050,22 +1148,27 @@ def dominant_beat_ms(objs, timing_points):
     between a set's quiet and busy diffs while its timing spans do not. The
     one diff-dependent input is where the last span ends, which is taken from
     the final object - close enough between siblings covering the same song.
+
+    See beat_spans_ms() for the span arithmetic, which is osu!'s own.
     """
-    if not timing_points:
-        return 0.0
-    end = max(objs[-1][0] if objs else 0.0, timing_points[-1][0])
-    spans = {}
-    for idx, (t, bl) in enumerate(timing_points):
-        beat = usable_beat_ms(bl)
-        if not beat:
-            continue
-        nxt = timing_points[idx + 1][0] if idx + 1 < len(timing_points) else end
-        span = nxt - t
-        if span > 0:
-            spans[beat] = spans.get(beat, 0.0) + span
+    return dominant_of_spans(beat_spans_ms(objs, timing_points))
+
+
+def dominant_of_spans(spans):
+    """
+    The beat length holding the most time in a {beat_ms: duration_ms} map.
+
+    Ties break toward the SLOWER beat rather than toward whichever key the
+    dict happens to hold first. Insertion order is deterministic within one
+    difficulty but not across a pooled mapset (see resolve_set_notation),
+    and the only consumer that cares - the doubled test's tempo bound -
+    fires on fast tempos, so an arbitrary tie-break there could fold a set
+    one way or the other depending on the order its difficulties were
+    scanned in. Slower-wins is the reading that does not invent a fold.
+    """
     if not spans:
         return 0.0
-    return max(spans.items(), key=lambda kv: kv[1])[0]
+    return max(spans.items(), key=lambda kv: (kv[1], kv[0]))[0]
 
 
 def notation_evidence(objs, timing_points, burst_max_gap_ms=105.0):
@@ -1086,9 +1189,13 @@ def notation_evidence(objs, timing_points, burst_max_gap_ms=105.0):
     and `quarter_loose`) rather than unified on a guess, so neither test's
     measured behaviour shifts.
     """
+    # beat_spans is carried alongside beat_ms so a mapset can pool the tempo
+    # the same way one difficulty does - by duration. See resolve_set_notation.
+    spans = beat_spans_ms(objs, timing_points)
     ev = {"total": 0, "quarter": 0, "slow_quarter": 0, "quarter_loose": 0,
           "half": 0, "half_fast": 0,
-          "beat_ms": dominant_beat_ms(objs, timing_points)}
+          "beat_spans": spans,
+          "beat_ms": dominant_of_spans(spans)}
     if not timing_points or len(objs) < 2:
         return ev
     for i in range(1, len(objs)):
@@ -1170,14 +1277,34 @@ def resolve_set_notation(evidences, burst_max_gap_ms=105.0,
     """
     pooled = {"total": 0, "quarter": 0, "slow_quarter": 0, "quarter_loose": 0,
               "half": 0, "half_fast": 0, "beat_ms": 0.0}
+    # The set's tempo is pooled by DURATION, the same rule one difficulty uses
+    # on its own timing points - a difficulty that covers the song twice over
+    # gets twice the say, and the answer does not depend on the order the
+    # difficulties were scanned in.
+    #
+    # It used to be "whichever difficulty was seen first and had a usable
+    # tempo", on the reasoning that a set shares its timing points. That is
+    # usually true and then the two agree - but the difficulties of 7.09% of
+    # multi-difficulty sets (417 of 5,879 measured on a real library) report
+    # different dominant tempos, because a compilation names a different song
+    # per difficulty and a rate-edit pack ("1.4x (312bpm)") retimes each one.
+    # For 1 set in 5,879 the pooled verdict actually flipped on which
+    # difficulty came first, which is a scan-order dependency rather than a
+    # judgement about the map.
+    pooled_spans = {}
+    fallback_beat = 0.0
     for ev in evidences:
         for k in ("total", "quarter", "slow_quarter", "quarter_loose",
                   "half", "half_fast"):
             pooled[k] += ev[k]
-        # Timing points are shared across a set, so any difficulty that has a
-        # usable tempo speaks for all of them.
-        if not pooled["beat_ms"] and ev["beat_ms"]:
-            pooled["beat_ms"] = ev["beat_ms"]
+        for beat, span in (ev.get("beat_spans") or {}).items():
+            pooled_spans[beat] = pooled_spans.get(beat, 0.0) + span
+        # Hand-built evidence dicts (tests, older callers) may carry only the
+        # summary tempo. Keep the slowest of those as a fallback, so they are
+        # still order-independent.
+        if ev["beat_ms"] and not ev.get("beat_spans"):
+            fallback_beat = max(fallback_beat, ev["beat_ms"])
+    pooled["beat_ms"] = dominant_of_spans(pooled_spans) or fallback_beat
     if _halved_from_evidence(pooled, halved_quarter_share_min):
         return "halved"
     if _doubled_from_evidence(pooled, doubled_half_share_min, max_plausible_bpm):

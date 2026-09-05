@@ -350,6 +350,146 @@ Typical shape, from that survey:
 | 737103 JUNNA - Here | 4 | 1 halved, 3 honest | halved (3 changed) |
 | 993854 Itou Miku et al. | 5 | 2 halved, 3 honest | honest (2 changed) |
 
+#### The tempo itself is osu!'s `GetMostCommonBeatLength`
+
+`beat_spans_ms()` is a port of `Beatmap.GetMostCommonBeatLength`
+(`osu.Game/Beatmaps/Beatmap.cs`) - the routine the game uses to decide the
+BPM it shows in song select. `dominant_beat_ms()` is its argmax, and it feeds
+two things: `report.csv`'s `bpm` column, and the tempo bound in
+`_doubled_from_evidence()`. Matching the game matters for the first at least:
+a tool that disagrees with song select about a map's tempo is simply wrong
+about it.
+
+Three details are the game's, not ours, and all three were originally
+missing:
+
+- **Beat lengths are grouped to 1e-3 ms.** A `.osu` stores a beat length as
+  a long decimal (`322.58064516129`) and a re-timed map can carry the same
+  tempo written a hair differently at different points. Grouping the raw
+  floats splits that tempo's vote across two keys and lets a shorter span
+  win. osu! rounds for exactly this reason and says so in a comment.
+- **A timing point past the last object covers no time.** Crossfade and
+  compilation maps are timed for a whole audio file but mapped over part of
+  it. `3rd Solo Album Nacollection!! 2 XFD [Insane]` is 188 BPM across every
+  note it has and read as 141, because four timing points out in the unmapped
+  tail covered more audio than the mapped section did.
+- **The first timing point's span starts at 0, not at its own offset.**
+  osu-stable forced this and lazer reproduces it deliberately, so a long
+  unmapped intro counts toward the tempo the map opens on.
+  `Katja Krasavice - Doggy` is 112 BPM from 36s and 224 BPM from 79s: osu!
+  calls it a 112 BPM map and this called it 224.
+
+Two departures are deliberate:
+
+- **`usable_beat_ms()` filters before any of it.** osu! *clamps* an
+  out-of-range beat length (`TimingControlPoint` bounds `BeatLength` to
+  6..60000ms); this drops it, because osu! needs *a* number to scroll the
+  editor with and this needs to know whether the file states a tempo at all.
+  The upper bound is new and is not decorative: `Camellia - crystallized
+  [Girl's C11H15NO2]` carries an uninherited `6E+298` next to the `1E-298`
+  points that hide its sliders, and unbounded it passed every finiteness
+  check, won the vote by covering an astronomical span, and reported the map
+  at 1e-294 BPM.
+- **The last span ends at the last object's START, where osu! uses its end
+  time.** That is one slider's worth of fidelity, and it buys immunity to a
+  slider end that isn't a real time - the same `crystallized` diff has a
+  final slider whose own timing point makes it 2e+298 ms long, which would
+  otherwise hand the last timing point an unbeatable span. A tempo vote a
+  single object can steer is worse than a tempo vote that stops one slider
+  early.
+
+**Effect, measured old vs new over the user's 49,455-difficulty osu!stable
+library: 212 difficulties (0.429%) report a different tempo, 0 mapsets change
+their notation verdict and 0 difficulties change category.** So this is a fix
+to the number reported, not a change to classification - which is also why it
+is safe.
+
+#### The set's tempo is pooled by duration, not taken from the first difficulty
+
+`resolve_set_notation()` used to take the pooled `beat_ms` from whichever
+difficulty came first and had a usable tempo, on the reasoning that a set
+shares its timing points. Usually true - but the difficulties of **7.09% of
+real multi-difficulty sets (417 of 5,879)** report different dominant tempos,
+because a compilation names a different song per difficulty and a rate-edit
+pack (`1.4x (312bpm)`) retimes each one. For **1 set in 5,879** the pooled
+verdict actually flipped on which difficulty happened to be scanned first,
+which is a scan-order dependency rather than a judgement about the map.
+
+`notation_evidence()` now carries the whole `{beat_ms: duration}` map, and
+pooling sums it - the same rule one difficulty already uses on its own timing
+points, so a difficulty that covers the song twice over gets twice the say.
+`dominant_of_spans()` breaks ties toward the SLOWER beat rather than toward
+whatever the dict holds first, since the only consumer that cares is the
+doubled test's tempo bound and slower-wins is the reading that does not
+invent a fold.
+
+The rest of the pooled counters were already tempo-relative - `quarter` and
+`half` are counted against each transition's own local beat - so they pool
+correctly across difficulties at different tempos. `beat_ms` was the one
+absolute quantity in there, and the one that needed this.
+
+#### Map names are a free ground truth for the tempo
+
+A surprising number of difficulties state their own BPM in the title or
+difficulty name (`[SHRED 300BPM]`, `[501bpm see tinh (gwb)]`,
+`[240BPM cute song]`). Over the user's stable library **1,650 difficulties do
+and are parseable, and 1,462 of them (88.6%) match the tempo we report
+exactly.** That is worth knowing about because it needs no network, no API
+and no hand-labelling, and unlike mapper `Tags:` it is a *number*, so
+agreement is exact rather than a judgement.
+
+Every non-match is explained, and none of them is a defect:
+
+| ratio (ours / stated) | n | what it is |
+|---|---:|---|
+| 1.0 | 1,462 | agreement |
+| 2/3 | 142 | the name states a **1/6 stream BPM**, which is 1.5x the song tempo |
+| 1/3 | 11 | one meme jump pack whose names state a pattern speed, not a tempo |
+| 1/2 | 9 | genuinely **halved** notation - 5 of the 9 detected, see below |
+| other | 26 | names where the number is an AR/OD/rate, or part of a song title |
+
+The nine halved ones are the only test of `looks_like_halved_notation()`
+against evidence the mapper wrote down. Five are caught (the four
+`Conspiracy of Silence [240..270BPM cute song]` diffs and
+`Finger Control Training [230 bpm 3 notes / bleed]`). Of the four misses,
+two (`Stream Practice Maps [SuperPretzel (240 bpm)]`) sit at a 0.14 notated-
+1/4 share against the 0.15 floor and pool with a large compilation set, one
+(`Last Exit To Brooklyn GAMMA [SHRED 300BPM]`) has essentially nothing
+snapped to the notated grid at all so there is no evidence to read, and one
+is a meme map (`777 [777 BPM MADNESS!!!!!]`). Moving a threshold to catch two
+of them would be fitting to four maps; they are recorded here so nobody
+re-derives the check from scratch.
+
+#### The halved fold was checked for over-firing and is not over-firing
+
+`looks_like_halved_notation()` reduces in practice to "notated BPM below ~143
+AND the notated 1/4 is at least 15% of the gaps" - condition 2
+(`slow_quarter`) is a near-step function at
+`60000 / (4 * burst_max_gap_ms)` = 142.9 BPM, because at a fixed tempo every
+notated 1/4 gap is the same length. It fires on **9.1% of difficulties** (323
+of 3,532 sampled), and within those it moves Hybrid 24 -> 0 and Streams
+38 -> 4. That looks alarming, and the obvious worry is that it is eating
+genuine slow stream maps - the residual risk this file already names.
+
+It is not. Over 6,258 difficulties, **zero** are both tagged
+`stream`/`streams`/`deathstream`/`stamina` by their mapper and read as
+halved, while 83 halved difficulties are tagged `jump`. The maps it lands on
+are montagem/phonk jump sets - `MONTAGEM BATCHI`, `Ciki Ciki Bam Bam` - which
+is exactly the population it was written for.
+
+Two ideas for a "safer" halved test were measured and dropped:
+
+- **Spacing of the notated 1/4 layer.** The theory is that a halved map's 1/4
+  is really its jump-spaced 1/2 backbone, where a real slow stream is tight.
+  It does not separate: `Chug Jug` is 85% tight and genuinely halved, and
+  `BATCHI [Amats' Hard]` is 100% tight, while `Ciki Ciki Bam Bam` runs from
+  0% to 100% tight across one set. The hard difficulties are wide and the
+  easy ones are tight, which is why notation is pooled over the set in the
+  first place.
+- **Run length on the notated 1/4 layer.** Same outcome - the two populations
+  overlap completely (longest 1/4 run 3-15 notes for known-halved maps,
+  5-18 for the maps the fold demotes).
+
 ### Things checked against the osu! sources and deliberately NOT done
 
 Each of these was implemented far enough to measure, then dropped. Don't
@@ -836,7 +976,7 @@ CLI-overridable (`--max-gap-ms`, `--burst-min`, etc.) and GUI-editable:
 | `section_min_transitions` | 4 | fewest notes for a section to be counted at all |
 | `hybrid_section_min` | 0.15 | share of sections streams must own AND jumps must own for **Hybrid** |
 | `hybrid_balance_min` | 0.5 | how balanced that mix must be — smaller side / larger side |
-| `halved_quarter_share_min` | 0.15 | share of note gaps on the notated 1/4 before that layer counts as the map's backbone rather than accents — one of two content signals for halved-BPM authoring. No BPM threshold is involved |
+| `halved_quarter_share_min` | 0.15 | share of note gaps on the notated 1/4 before that layer counts as the map's backbone rather than accents — one of two content signals for halved-BPM authoring. No BPM threshold is *written*, but the other condition is one in effect: see "The halved fold was checked for over-firing" |
 
 Plus `burst_promote_stream_len` (12, not in `DEFAULT_PARAMS` — it's a
 `category_of()` parameter, not a `classify_diff()` one, since it operates on
@@ -1137,6 +1277,16 @@ the slow path.
 
 ## Known limitations
 
+- **A slider's computed end time can be garbage, and nothing bounds it.**
+  `_slider_end()` divides by the beat length in force, so an uninherited
+  point of `1E-298` (a real trick for hiding sliders — see
+  `Camellia - crystallized [Girl's C11H15NO2]`) yields an end time of
+  2e+298 ms. `beat_spans_ms()` sidesteps it by taking the end of the
+  timeline from the last object's start instead, and `usable_beat_ms()`
+  bounds the tempo side, but the value itself is still in `DiffInfo.objs`
+  and still feeds `move_time` and the spacing walk. It has not been chased
+  because it lives in the slider path; if it is ever fixed, the deliberate
+  departure in `beat_spans_ms()` can be reverted to osu!'s end-time rule.
 - **Custom stable Songs location isn't detected.** `find_stable_db()` only
   looks for `Songs/` sitting next to `osu!.db`. A user who moved their Songs
   folder via `BeatmapDirectory` in `osu!.<user>.cfg` gets silently routed to

@@ -260,6 +260,96 @@ def test_dominant_beat_is_the_one_the_map_spends_longest_at():
     assert cm.dominant_beat_ms(d.objs, d.timing_points) == 300.0
 
 
+def test_dominant_beat_ignores_timing_points_past_the_last_object():
+    # A crossfade/compilation map is timed for the whole audio but mapped
+    # over the first song only. Counting the spans out in the unmapped tail
+    # lets a tempo nothing is mapped at speak for the map: real case,
+    # "3rd Solo Album Nacollection!! 2 XFD [Insane]", 188 BPM over its notes,
+    # reported as 141 because four later timing points covered more audio
+    # than the mapped section did. osu!'s own GetMostCommonBeatLength gives a
+    # point past the last object a duration of zero.
+    d = build(circles(10, t0=0, step=300), bl=300.0,
+              extra="4000,150.0,4,2,0,60,1,0\n"
+                    "9000,150.0,4,2,0,60,1,0\n"
+                    "60000,200.0,4,2,0,60,1,0")
+    assert d.objs[-1][0] == 2700.0
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 300.0
+
+
+def test_the_first_timing_point_covers_the_map_from_its_start():
+    # osu-stable forced the first control point to start at time 0 and lazer
+    # reproduces it deliberately, so a long unmapped intro counts toward the
+    # tempo the map opens on rather than toward nothing. Real case:
+    # "Katja Krasavice - Doggy", 112 BPM from 36s and 224 BPM from 79s, which
+    # osu! calls a 112 BPM map and this called 224.
+    text = (
+        "osu file format v14\n\n[General]\nMode: 0\n\n"
+        "[Metadata]\nTitle:Test\nVersion:Test\n\n"
+        "[Difficulty]\nCircleSize:4\nSliderMultiplier:1.4\n\n"
+        "[TimingPoints]\n40000,500.0,4,2,0,60,1,0\n70000,250.0,4,2,0,60,1,0\n\n"
+        "[HitObjects]\n"
+        + NL.join(f"100,100,{55000 + i * 250},1,0" for i in range(100))
+    )
+    d = cm.parse_osu_bytes(text.encode(), "test")
+    # 500ms covers 0..55000, not 40000..55000; 250ms covers 55000..79750.
+    # Measured from its own offset the opening tempo loses 15000 to 24750.
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 500.0
+
+
+def test_beat_lengths_written_a_hair_apart_are_one_tempo():
+    # .osu stores a beat length as a long decimal, and a re-timed map can
+    # carry the same tempo written slightly differently at different points.
+    # Grouping the raw floats splits that tempo's vote between two keys and
+    # lets a shorter span win. osu! rounds to 1e-3 ms for exactly this.
+    #
+    # Three spans of 1000ms on one tempo written three ways, against a single
+    # 1400ms span on another. Grouped, 322.581 wins 3000 to 1400; ungrouped,
+    # each 322.58... key holds only 1000 and the 400 beats all three.
+    d = build(circles(23, t0=0, step=200), bl=322.58064516129,
+              extra="1000,322.580645161291,4,2,0,60,1,0" + NL +
+                    "2000,322.58064516130,4,2,0,60,1,0" + NL +
+                    "3000,400.0,4,2,0,60,1,0")
+    assert d.objs[-1][0] == 4400.0
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 322.581
+
+
+def test_an_impossible_beat_length_is_not_a_tempo():
+    # usable_beat_ms bounds both ends. The upper bound is osu!'s own:
+    # TimingControlPoint clamps BeatLength to 6..60000ms. Real files go past
+    # it - "Camellia - crystallized [Girl's C11H15NO2]" carries an
+    # uninherited 6e+298 next to the 1e-298 points that hide its sliders -
+    # and unbounded it passed every finiteness check, won the tempo vote by
+    # covering an astronomical span, and reported the map at 1e-294 BPM.
+    assert cm.usable_beat_ms(6e298) == 0.0
+    assert cm.usable_beat_ms(60000.0) == 60000.0
+    # The impossible point covers 4700ms of the map against the real
+    # tempo's 1000ms, so unbounded it wins outright.
+    d = build(circles(20, t0=0, step=300), bl=344.827586206897,
+              extra="1000,6e+298,4,2,0,60,1,0")
+    assert round(cm.dominant_beat_ms(d.objs, d.timing_points), 3) == 344.828
+    assert round(d.bpm) == 174
+
+
+def test_set_notation_tempo_does_not_depend_on_difficulty_order():
+    # The pooled tempo used to be "whichever difficulty came first and had a
+    # usable one". The difficulties of 7.09% of real multi-difficulty sets
+    # disagree about their dominant tempo - a compilation names a different
+    # song per difficulty, a rate-edit pack retimes each one - so that made
+    # the verdict depend on scan order. Pooling by duration is the same rule
+    # one difficulty already uses on its own timing points.
+    #
+    # One difficulty is a short 400 BPM doubled map; the other is four times
+    # as long at 200 BPM. The set reads the same either way round.
+    fast = build(circles(3, step=75, dx=8)
+                 + [f"100,100,{4000 + i * 500},1,0" for i in range(7)],
+                 bl=150.0)
+    slow = build([f"100,100,{i * 300},1,0" for i in range(120)], bl=300.0)
+    evs = [cm.notation_evidence(d.objs, d.timing_points, 105.0)
+           for d in (fast, slow)]
+    assert cm.resolve_set_notation(evs) == cm.resolve_set_notation(evs[::-1])
+    assert cm.resolve_set_notation(evs) == "honest"
+
+
 def test_bezier_sampling_stays_dense_on_a_long_slider():
     # The sample count is one per 8px of control polygon; the ceiling is a
     # guard against a pathological polygon, not part of the rule. A 128 cap
