@@ -135,11 +135,30 @@ would leave Cancel doing nothing for ~4 seconds.
 
 ## Gotchas that cost real time
 
-**`storage.ini` redirects lazer's data folder.** When a user moves their lazer
-library, `%APPDATA%\osu` is left behind as a stub with no `client.realm` and a
-near-empty `files/`. Only a `storage.ini` naming the real location. Missing
-this looks exactly like "the realm reader is broken" — the scan finds nothing
-and reports zero maps. `resolve_lazer_storage()` follows it.
+**`storage.ini` redirects lazer's data folder, and it outranks the folder it
+sits in.** When a user moves their lazer library, the old data folder is left
+behind with a `storage.ini` naming the real location — and, on a current
+lazer, **with a leftover `client.realm` of its own**. That leftover is an
+empty realm (65,536 bytes, one placeholder difficulty) beside a `files/`
+holding three files. It is not the user's library.
+
+This entry used to say the stub had *no* `client.realm`, and
+`resolve_realm_data_dir()` was ordered accordingly: try the folder the user
+named, and only consult `storage.ini` if that folder had no realm. On a
+current install that is backwards. `%APPDATA%\osu` is both the default
+location and what the GUI's "Use lazer data folder" button offers, so it is
+exactly the folder a user with a moved library picks — and the scan ran
+realm-reader against the stub, reported one .osu file, and came back with
+**zero difficulties and no error at all**. Nothing downstream could rescue
+it: the fallback walks the stub's `files/`, which has three files in it.
+
+Reproduced on the user's own install (real library at `D:\osu-lazer`):
+pointing at `%APPDATA%\osu` gave 1 file before and 63,189 after.
+
+So the redirect is tried FIRST, for the named folder and for its parent, and
+the folder itself is the fallback. A `storage.ini` pointing somewhere that
+doesn't exist is still ignored (`resolve_lazer_storage()` checks), so a stale
+redirect can't lose a realm sitting right next to it.
 
 **`Beatmap.Hash` is SHA-256, `Beatmap.MD5Hash` is MD5.** In lazer's realm, the
 content-addressed `files/` store is keyed by SHA-256, and `Beatmap.Hash`
@@ -1316,6 +1335,14 @@ the slow path.
   API `online_id`s with known categories). There's no bundled ground truth,
   so "does this threshold change help" can only be answered by whoever has
   labels on hand.
+- **A source checkout has no realm-reader at all.** Every build output
+  location is gitignored, so `git clone && python gui.py` silently gets the
+  slow filesystem scan. Build it with
+  `dotnet publish realm-reader/RealmReader.csproj -c Release -r win-x64 --self-contained true -o realm-reader-dist`.
+  `default_realm_reader_path()` searches `realm-reader-dist/`,
+  `realm-reader/publish/`, `realm-reader/bin/Release/net8.0/win-x64/` and the
+  release layout's `realm-reader/`, so any of the usual `dotnet build` or
+  `dotnet publish` destinations is found.
 - **`realm-reader` is prebuilt and can lag the Python.** Column counts in its
   tab-separated output have grown twice (added `online_id`, before that
   `star_rating`). Every consumer (`scan_lazer_realm`) checks `len(parts)`

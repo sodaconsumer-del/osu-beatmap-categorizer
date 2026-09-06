@@ -16,6 +16,7 @@ Run with:  python test_classify.py
 
 import math
 import os
+import tempfile
 
 import classify_maps as cm
 
@@ -2169,6 +2170,77 @@ def _main():
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 
+
+
+
+# --- picking the lazer data folder ----------------------------------------
+
+def _lazer_folder(root, name, realm=True, storage_target=None):
+    """A fake lazer data folder: optional client.realm, optional storage.ini."""
+    d = os.path.join(root, name)
+    os.makedirs(os.path.join(d, "files"), exist_ok=True)
+    if realm:
+        with open(os.path.join(d, "client.realm"), "wb") as f:
+            f.write(b"\0" * 16)
+    if storage_target is not None:
+        with open(os.path.join(d, "storage.ini"), "w", encoding="utf-8") as f:
+            f.write("FullPath = %s%s" % (storage_target, NL))
+    return d
+
+
+def test_storage_ini_beats_a_leftover_realm_in_the_folder_it_points_from():
+    # When a lazer library is moved to another drive, lazer leaves the old
+    # folder in place with a storage.ini naming the new one AND a leftover
+    # client.realm of its own. That leftover is an empty realm, not the
+    # library - so the redirect has to win, or realm-reader reads the stub,
+    # reports one placeholder difficulty, and the whole scan comes back
+    # empty with no error at all.
+    with tempfile.TemporaryDirectory() as root:
+        real = _lazer_folder(root, "real")
+        stub = _lazer_folder(root, "stub", realm=True, storage_target=real)
+        chosen, note = cm.resolve_realm_data_dir(stub)
+        assert chosen == real, chosen
+        assert note and real in note
+
+
+def test_a_folder_with_no_redirect_is_used_as_given():
+    with tempfile.TemporaryDirectory() as root:
+        plain = _lazer_folder(root, "plain")
+        chosen, note = cm.resolve_realm_data_dir(plain)
+        assert chosen == plain
+        assert note is None
+
+
+def test_a_dead_storage_ini_redirect_falls_back_to_the_folder():
+    # resolve_lazer_storage() refuses a target that isn't there, so a stale
+    # redirect must not lose the realm sitting right next to it.
+    with tempfile.TemporaryDirectory() as root:
+        stub = _lazer_folder(root, "stub", realm=True,
+                             storage_target=os.path.join(root, "gone"))
+        chosen, _ = cm.resolve_realm_data_dir(stub)
+        assert chosen == stub
+
+
+def test_pointing_at_the_files_subfolder_finds_the_realm_above_it():
+    with tempfile.TemporaryDirectory() as root:
+        data = _lazer_folder(root, "data")
+        chosen, note = cm.resolve_realm_data_dir(os.path.join(data, "files"))
+        assert chosen == data
+        assert note and "files/" in note
+
+
+def test_a_files_subfolder_of_a_stub_still_follows_the_redirect():
+    with tempfile.TemporaryDirectory() as root:
+        real = _lazer_folder(root, "real")
+        stub = _lazer_folder(root, "stub", realm=True, storage_target=real)
+        chosen, _ = cm.resolve_realm_data_dir(os.path.join(stub, "files"))
+        assert chosen == real
+
+
+def test_no_realm_anywhere_means_no_fast_path():
+    with tempfile.TemporaryDirectory() as root:
+        bare = _lazer_folder(root, "bare", realm=False)
+        assert cm.resolve_realm_data_dir(bare) == (None, None)
 
 if __name__ == "__main__":
     raise SystemExit(_main())

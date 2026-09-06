@@ -2770,6 +2770,11 @@ def default_realm_reader_path():
             # Program.cs under those same DLLs, so the documented build sends
             # them here instead (and .gitignore knows about it).
             os.path.join(d, "realm-reader-dist", exe_name),
+            # `dotnet publish -o realm-reader/publish` is the other thing
+            # people type, and .gitignore already covers it. Cheap to look
+            # in, and the alternative is a helper that is built and still
+            # reported as missing.
+            os.path.join(d, "realm-reader", "publish", exe_name),
             # A plain `dotnet build` leaves it here, which saves anyone
             # hacking on the helper from having to publish just to test.
             os.path.join(d, "realm-reader", "bin", "Release", "net8.0", "win-x64", exe_name),
@@ -2838,8 +2843,16 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
             log(proc.stderr.strip())
         return None
 
+    # On failure the whole of stderr is printed above, because a schema
+    # mismatch is exactly what it is there to explain. On SUCCESS most of it
+    # is a dump of every class and property name in the realm - diagnostics
+    # for that failure case, and meaningless to someone who just wants their
+    # collections. Keep only the lines that say something happened.
     if proc.stderr:
-        log(proc.stderr.strip())
+        kept = [ln for ln in proc.stderr.splitlines()
+                if ("resolved" in ln or "not found" in ln) and "processed" not in ln]
+        for ln in kept:
+            log(ln.strip())
     log(f"realm-reader finished in {time.time() - t_start:.1f}s.")
 
     try:
@@ -3619,6 +3632,60 @@ INT_PARAMS = ("burst_min", "burst_max", "stream_min", "jump_min_transitions",
               "section_min_transitions")
 
 
+def resolve_realm_data_dir(songs_folder):
+    """
+    The lazer data folder to read `client.realm` from, given whatever folder
+    the user pointed at. Returns (path, note) - `note` is a line worth
+    logging when the answer isn't the folder they named - or (None, None).
+
+    Candidates, in priority order: the storage.ini redirect target of the
+    folder given, then the folder itself, then the same pair for its parent
+    (pointing at files/ is a very natural thing to do).
+
+    A REDIRECT BEATS THE FOLDER IT IS WRITTEN IN, and that ordering is the
+    whole point. When a lazer library is moved to another drive, lazer leaves
+    the old folder in place with a storage.ini naming the new one - AND with
+    a leftover client.realm of its own. That leftover is an empty realm
+    (65,536 bytes, one placeholder difficulty), not the user's library. The
+    lazer default location is both where a moved library leaves that stub and
+    what the GUI's "Use lazer data folder" button offers, so it is exactly
+    the folder someone with a moved library picks.
+
+    Trying the folder before its redirect meant that leftover won:
+    realm-reader ran against it, reported one .osu file, and the whole scan
+    came back with zero difficulties and no error. Nothing downstream could
+    recover either, because the stub's files/ folder holds three files, so
+    the fallback filesystem scan found nothing to fall back to.
+
+    AGENTS.md used to record that the stub had NO client.realm, which is
+    where the old ordering came from. That was true of the lazer version it
+    was measured on and is not true of a current install.
+    """
+    normed = os.path.normpath(songs_folder)
+    parent = os.path.dirname(normed)
+    is_files_subdir = os.path.basename(normed).lower() == "files"
+
+    candidates = []
+    redirected = resolve_lazer_storage(songs_folder)
+    if redirected != songs_folder:
+        candidates.append((redirected,
+                           f"Using lazer data folder {redirected} (storage.ini redirect)."))
+    candidates.append((songs_folder, None))
+    if is_files_subdir:
+        redirected_parent = resolve_lazer_storage(parent)
+        if redirected_parent != parent:
+            candidates.append((redirected_parent,
+                               f"Using lazer data folder {redirected_parent} "
+                               f"(storage.ini redirect from the parent of that files/ folder)."))
+        candidates.append((parent,
+                           f"Using lazer data folder {parent} (you pointed at its files/)."))
+
+    for candidate, note in candidates:
+        if os.path.isfile(os.path.join(candidate, "client.realm")):
+            return candidate, note
+    return None, None
+
+
 def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
                   params=None, progress_cb=None, log_cb=None, cancel_event=None,
                   include_categories=None, ranked_mode="all_together",
@@ -3729,41 +3796,10 @@ def run_pipeline(songs_folder, output=None, csv_path=None, write_db=True,
 
     diffs = errors = None
 
-    # Figure out where client.realm actually is: either the given folder
-    # directly, or one level up if the given folder is itself a files/
-    # subfolder (a very natural thing to point at, so worth handling rather
-    # than silently skipping the fast path with no explanation).
-    # Candidate data folders to look for client.realm in, in priority order:
-    # the folder given, that folder's parent (if we were handed a files/
-    # subfolder, a very natural thing to point at), and the storage.ini
-    # redirect target of either (lazer leaves a stub behind when the library
-    # has been moved to another drive - see resolve_lazer_storage).
-    realm_data_dir = None
-    normed = os.path.normpath(songs_folder)
-    parent = os.path.dirname(normed)
-    is_files_subdir = os.path.basename(normed).lower() == "files"
-
-    candidates = [(songs_folder, None)]
-    if is_files_subdir:
-        candidates.append((parent, f"That's a files/ subfolder - checking {parent} instead."))
-    redirected = resolve_lazer_storage(songs_folder)
-    if redirected != songs_folder:
-        candidates.append((redirected, None))
-    if is_files_subdir:
-        redirected_parent = resolve_lazer_storage(parent)
-        if redirected_parent != parent:
-            candidates.append((redirected_parent, None))
-
-    for candidate, note in candidates:
-        if os.path.isfile(os.path.join(candidate, "client.realm")):
-            if note:
-                log(note)
-            if candidate != songs_folder:
-                log(f"Using lazer data folder {candidate}.")
-            realm_data_dir = candidate
-            break
-
+    realm_data_dir, realm_note = resolve_realm_data_dir(songs_folder)
     if realm_data_dir:
+        if realm_note:
+            log(realm_note)
         fast_result = scan_lazer_realm(realm_data_dir, progress_cb=progress_cb, log_cb=log_cb, on_parsed=classify_and_free, cancel_event=cancel_event, pause_event=pause_event)
         if fast_result is not None:
             diffs, errors = fast_result
