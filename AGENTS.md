@@ -437,10 +437,16 @@ which is a scan-order dependency rather than a judgement about the map.
 `notation_evidence()` now carries the whole `{beat_ms: duration}` map, and
 pooling sums it - the same rule one difficulty already uses on its own timing
 points, so a difficulty that covers the song twice over gets twice the say.
-`dominant_of_spans()` breaks ties toward the SLOWER beat rather than toward
-whatever the dict holds first, since the only consumer that cares is the
-doubled test's tempo bound and slower-wins is the reading that does not
-invent a fold.
+Pooling uses `pooled_tempo_ms()` rather than `dominant_of_spans()`, and the
+two differ only in how they break a duration tie. `dominant_of_spans()` gives
+a tie to the key inserted first, which for one difficulty is the earliest
+timing point - osu!'s answer, since `OrderByDescending` is a stable sort and
+Python's `max()` keeps its first maximum for the same reason. Insertion order
+across a pooled SET is just the order its difficulties were scanned in, which
+is not a fact about the music, so `pooled_tempo_ms()` gives a tie to the
+slower beat instead: order-independent, and the reading that does not invent
+a fold, since the only consumer is the doubled test's tempo bound and that
+fires on fast tempos.
 
 The rest of the pooled counters were already tempo-relative - `quarter` and
 `half` are counted against each transition's own local beat - so they pool

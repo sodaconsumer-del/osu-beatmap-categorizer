@@ -1158,13 +1158,32 @@ def dominant_of_spans(spans):
     """
     The beat length holding the most time in a {beat_ms: duration_ms} map.
 
-    Ties break toward the SLOWER beat rather than toward whichever key the
-    dict happens to hold first. Insertion order is deterministic within one
-    difficulty but not across a pooled mapset (see resolve_set_notation),
-    and the only consumer that cares - the doubled test's tempo bound -
-    fires on fast tempos, so an arbitrary tie-break there could fold a set
-    one way or the other depending on the order its difficulties were
-    scanned in. Slower-wins is the reading that does not invent a fold.
+    Ties go to the key inserted FIRST, which for a map built by
+    beat_spans_ms() is the earliest timing point. That is osu!'s answer:
+    GetMostCommonBeatLength picks with `.OrderByDescending(duration)
+    .FirstOrDefault()`, and LINQ's OrderByDescending is a stable sort, so an
+    equal-duration tie there falls to whichever group it met first. Python's
+    max() keeps the first maximum for the same reason, and dicts preserve
+    insertion order, so this matches without any extra work - but it does
+    depend on the caller building `spans` in timing-point order, which is
+    why pooling a whole mapset uses pooled_tempo_ms() instead.
+    """
+    if not spans:
+        return 0.0
+    return max(spans.items(), key=lambda kv: kv[1])[0]
+
+
+def pooled_tempo_ms(spans):
+    """
+    The same question asked of a whole MAPSET's pooled spans, where the
+    osu!-faithful tie rule above cannot be used.
+
+    Insertion order across a pooled set is the order its difficulties were
+    scanned in, which is not a fact about the music. Ties therefore break
+    toward the SLOWER beat instead. The only consumer is the doubled test's
+    tempo bound, which fires on fast tempos, so slower-wins is the reading
+    that does not invent a fold - and, unlike insertion order, it gives the
+    same answer whichever difficulty the scan reached first.
     """
     if not spans:
         return 0.0
@@ -1304,7 +1323,7 @@ def resolve_set_notation(evidences, burst_max_gap_ms=105.0,
         # still order-independent.
         if ev["beat_ms"] and not ev.get("beat_spans"):
             fallback_beat = max(fallback_beat, ev["beat_ms"])
-    pooled["beat_ms"] = dominant_of_spans(pooled_spans) or fallback_beat
+    pooled["beat_ms"] = pooled_tempo_ms(pooled_spans) or fallback_beat
     if _halved_from_evidence(pooled, halved_quarter_share_min):
         return "halved"
     if _doubled_from_evidence(pooled, doubled_half_share_min, max_plausible_bpm):
@@ -2743,6 +2762,15 @@ def _scan_unindexed_folders(songs_dir, indexed_folders, results, errors, log,
     return added
 
 
+# realm-reader's own diagnostics, printed on every successful run. Matched by
+# name so that a line it has NOT seen before - in particular any of the
+# "couldn't read ..." warnings it emits while still exiting 0 - reaches the
+# user rather than being filtered out for not looking familiar enough.
+_REALM_READER_NOISE = re.compile(
+    r"realm-reader: (schema contains |processed \d+ beatmap sets|"
+    r"\S+ properties: )")
+
+
 def default_realm_reader_path():
     """
     Looks for the compiled realm-reader helper next to this script (source
@@ -2844,15 +2872,31 @@ def scan_lazer_realm(data_dir, progress_cb=None, log_cb=None, on_parsed=None, he
         return None
 
     # On failure the whole of stderr is printed above, because a schema
-    # mismatch is exactly what it is there to explain. On SUCCESS most of it
-    # is a dump of every class and property name in the realm - diagnostics
-    # for that failure case, and meaningless to someone who just wants their
-    # collections. Keep only the lines that say something happened.
+    # mismatch is exactly what it is there to explain. On SUCCESS two kinds
+    # of line come back and they need opposite treatment, so this drops the
+    # known-noisy ones by name rather than keeping a chosen few:
+    #
+    #   - Noise: a dump of every class name in the realm, a dump of the
+    #     property names of four of them, and a progress tick every 5000
+    #     sets. All of it is diagnostic material for the failure case, and
+    #     meaningless to someone who just wants their collections.
+    #   - NOT noise: realm-reader can fail PARTIALLY and still exit 0 -
+    #     "couldn't read Hash/StarRating on a Beatmap", "couldn't read
+    #     Beatmap class at all", "couldn't read .Files on BeatmapSet",
+    #     "couldn't read Filename/File.Hash on a file entry". Each means the
+    #     realm schema has moved under us and some of the answer is missing:
+    #     star ratings silently blank, or sets skipped entirely. Those are
+    #     the only warning anyone gets, since the returncode is 0 and the
+    #     branch above never runs. An earlier version of this filter kept
+    #     only lines containing "resolved" or "not found" and threw all four
+    #     away, which turned a schema break into a scan that quietly
+    #     returned less than it should have.
     if proc.stderr:
-        kept = [ln for ln in proc.stderr.splitlines()
-                if ("resolved" in ln or "not found" in ln) and "processed" not in ln]
-        for ln in kept:
-            log(ln.strip())
+        for ln in proc.stderr.splitlines():
+            ln = ln.strip()
+            if not ln or _REALM_READER_NOISE.search(ln):
+                continue
+            log(ln)
     log(f"realm-reader finished in {time.time() - t_start:.1f}s.")
 
     try:

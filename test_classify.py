@@ -2173,6 +2173,60 @@ def _main():
 
 
 
+
+def test_a_tempo_tie_goes_to_the_earlier_timing_point_like_osu():
+    # Two tempos covering exactly 5000ms each. osu!'s GetMostCommonBeatLength
+    # picks with OrderByDescending(duration).FirstOrDefault(), and LINQ's
+    # OrderByDescending is a stable sort, so an equal-duration tie falls to
+    # whichever group it met first - the earliest timing point. Breaking the
+    # tie any other way reports a BPM song select disagrees with.
+    d = build([f"100,100,{i * 1000},1,0" for i in range(11)], bl=300.0,
+              extra="5000,400.0,4,2,0,60,1,0")
+    spans = cm.beat_spans_ms(d.objs, d.timing_points)
+    assert spans == {300.0: 5000.0, 400.0: 5000.0}, spans
+    assert cm.dominant_beat_ms(d.objs, d.timing_points) == 300.0
+    # A whole mapset cannot use that rule: insertion order there is the order
+    # the difficulties were scanned in, which is not a fact about the music.
+    # It breaks ties toward the slower beat instead, which is the reading
+    # that does not invent a doubled-notation fold - and gives one answer
+    # whichever way round the difficulties arrived.
+    assert cm.pooled_tempo_ms(spans) == 400.0
+    assert cm.pooled_tempo_ms(dict(reversed(list(spans.items())))) == 400.0
+
+
+def test_realm_reader_warnings_survive_the_log_noise_filter():
+    # realm-reader can fail PARTIALLY and still exit 0, in which case these
+    # are the only warning anyone gets - the returncode branch that prints
+    # all of stderr never runs. An earlier filter kept only lines containing
+    # "resolved" or "not found" and threw every one of them away, turning a
+    # realm schema break into a scan that quietly returned less than it
+    # should have.
+    warnings = [
+        "realm-reader: couldn't read Hash/StarRating on a Beatmap (x) - "
+        "star rating won't be available.",
+        "realm-reader: couldn't read Beatmap class at all (x) - "
+        "star rating won't be available.",
+        "realm-reader: couldn't read .Files on BeatmapSet (x) - "
+        "skipping affected sets.",
+        "realm-reader: couldn't read Filename/File.Hash on a file entry (x) - "
+        "skipping affected entries.",
+        "realm-reader: loaded star ratings for 63080 difficulties.",
+        "realm-reader: resolved 63189 .osu file paths "
+        "(0 referenced but not found on disk).",
+    ]
+    for line in warnings:
+        assert not cm._REALM_READER_NOISE.search(line), line
+    # ... while the per-run diagnostic dumps stay out of the user's log.
+    noise = [
+        "realm-reader: schema contains 15 classes: Beatmap, BeatmapCollection",
+        "realm-reader: BeatmapSet properties: ID, OnlineID, DateAdded",
+        "realm-reader: RealmNamedFileUsage properties: File, Filename",
+        "realm-reader: processed 5000 beatmap sets so far...",
+    ]
+    for line in noise:
+        assert cm._REALM_READER_NOISE.search(line), line
+
+
 # --- picking the lazer data folder ----------------------------------------
 
 def _lazer_folder(root, name, realm=True, storage_target=None):
