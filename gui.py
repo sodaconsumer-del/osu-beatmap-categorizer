@@ -27,7 +27,7 @@ from tkinter import ttk, filedialog, messagebox
 import classify_maps as cm
 
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.2.1"
 
 # Where the theme preference is remembered. Deliberately in the user's home
 # directory rather than next to the executable: people drop this in Program
